@@ -1,11 +1,13 @@
-# Push a tag like v3.18 -> builds the APK and publishes it as a GitHub Release.
+# Push to main (or run manually) -> builds the APK and publishes release v<versionName>, creating the tag.
+# Skips if that release already exists, so bump versionName in app/build.gradle for each update.
 # The in-app "Check for update" reads that release.
-# One-time setup: add repo secret DEBUG_KEYSTORE_B64 = base64 of the keystore your installed app is signed with
-# (default: ~/.android/debug.keystore), so updates install over the existing app.
+# One-time setup: repo secret DEBUG_KEYSTORE_B64 = base64 of the signing keystore (keep it the same forever so updates install).
 name: release
 on:
   push:
-    tags: ['v*']
+    branches: [main]
+    paths: ['app/**', '.github/workflows/release.yml']
+  workflow_dispatch:
 permissions:
   contents: write
 jobs:
@@ -23,13 +25,21 @@ jobs:
         run: |
           if [ -z "$KS" ]; then echo "::error::Missing secret DEBUG_KEYSTORE_B64"; exit 1; fi
           mkdir -p ~/.android && echo "$KS" | base64 -d > ~/.android/debug.keystore
-      - name: Check tag matches versionName
+      - name: Version and skip check
+        id: v
+        env: { GH_TOKEN: '${{ github.token }}' }
         run: |
           v=$(grep -oP "versionName '\K[^']+" app/build.gradle)
-          [ "v$v" = "${GITHUB_REF_NAME}" ] || { echo "::error::tag ${GITHUB_REF_NAME} != versionName $v"; exit 1; }
-      - run: chmod +x gradlew && ./gradlew assembleDebug --no-daemon -q
-      - run: cp app/build/outputs/apk/debug/app-debug.apk DaysLeft-${GITHUB_REF_NAME}.apk
-      - uses: softprops/action-gh-release@v2
+          echo "tag=v$v" >> $GITHUB_OUTPUT
+          if gh release view "v$v" >/dev/null 2>&1; then echo "skip=true" >> $GITHUB_OUTPUT; else echo "skip=false" >> $GITHUB_OUTPUT; fi
+      - if: steps.v.outputs.skip == 'false'
+        run: chmod +x gradlew && ./gradlew assembleDebug --no-daemon -q
+      - if: steps.v.outputs.skip == 'false'
+        run: cp app/build/outputs/apk/debug/app-debug.apk DaysLeft-${{ steps.v.outputs.tag }}.apk
+      - if: steps.v.outputs.skip == 'false'
+        uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ steps.v.outputs.tag }}
+          target_commitish: ${{ github.sha }}
           files: DaysLeft-*.apk
           generate_release_notes: true
