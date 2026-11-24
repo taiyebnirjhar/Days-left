@@ -1067,18 +1067,59 @@ public class MainActivity extends Activity {
                 startActivity(new Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(Settings.EXTRA_APP_PACKAGE, getPackageName()))), lp(-1, -2, 0, 0, 0, 10));
         c.addView(row("Battery: don't restrict", "Keeps the countdown running in the background", null, v ->
                 startActivity(new Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:" + getPackageName())))), lp(-1, -2, 0, 0, 0, 10));
+        c.addView(updateRow(), lp(-1, -2, 0, 0, 0, 10));
         c.addView(row("Replay tour", null, null, v -> showTour()), lp(-1, -2, 0, 0, 0, 10));
         c.addView(row("Debug log", "Crashes, timings and what the app did. Copy it and send it to me", null, v -> showLog()), lp(-1, -2, 0, 0, 0, 10));
 
         c.addView(label("Experimental"));
         c.addView(switchRow("Android 16 status-bar chip", "Only some phones show it. Samsung usually doesn't", Store.flag(this, "chip", false), v -> { Store.setFlag(this, "chip", v); sync(); }), lp(-1, -2, 0, 0, 0, 10));
 
-        TextView ver = tv("Days Left 3.17", 12, SUB, false);
+        TextView ver = tv("Days Left " + Updater.installedVersion(this), 12, SUB, false);
         ver.setGravity(Gravity.CENTER);
         c.addView(ver, lp(-1, -2, 0, 20, 0, 0));
         sv.addView(c);
         page.addView(sv, new LinearLayout.LayoutParams(-1, 0, 1f));
         root.addView(page, new FrameLayout.LayoutParams(-1, -1));
+    }
+
+    // ====================== in-app update ======================
+    LinearLayout updateRow() {
+        LinearLayout r = row("Check for update", "Installed: " + Updater.installedVersion(this), null, null);
+        TextView sub = (TextView) ((LinearLayout) r.getChildAt(0)).getChildAt(1);
+        boolean[] busy = {false};
+        r.setOnClickListener(v -> {
+            if (busy[0]) return;
+            busy[0] = true;
+            sub.setText("Checking…");
+            Updater.check(this, (n, err) -> {
+                busy[0] = false;
+                if (err != null) { sub.setText(err); return; }
+                if (n == null) { sub.setText("You're on the latest version (" + Updater.installedVersion(this) + ")"); return; }
+                sub.setText("Version " + n.version + " is available");
+                confirmUpdate(n, sub, busy);
+            });
+        });
+        return r;
+    }
+
+    void confirmUpdate(Updater.Info n, TextView sub, boolean[] busy) {
+        String msg = "Version " + n.version + " (" + (n.size / 1048576 + 1) + " MB)" + (n.notes.isEmpty() ? "" : "\n\n" + n.notes);
+        new android.app.AlertDialog.Builder(this).setTitle("Update available").setMessage(msg)
+                .setNegativeButton("Later", null)
+                .setPositiveButton("Update now", (d, w) -> {
+                    if (Build.VERSION.SDK_INT >= 26 && !getPackageManager().canRequestPackageInstalls()) {
+                        Toast.makeText(this, "Allow installs from Days Left, then tap Update again", Toast.LENGTH_LONG).show();
+                        startActivity(new Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:" + getPackageName())));
+                        return;
+                    }
+                    busy[0] = true;
+                    sub.setText("Downloading… 0%");
+                    Updater.install(this, n, (got, total) -> sub.setText("Downloading… " + (total > 0 ? got * 100 / total + "%" : got / 1024 + " KB")),
+                            (ok, err) -> {
+                                busy[0] = false;
+                                sub.setText(ok ? "Downloaded. Confirm the install on the next screen" : "Failed: " + err);
+                            });
+                }).show();
     }
 
     // ====================== debug log ======================
