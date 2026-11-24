@@ -12,7 +12,7 @@ import android.os.PowerManager;
 import java.util.*;
 
 /**
- * Listens to the whole audiobook once, in 30 second pieces, and lines every piece up with the book.
+ * Lines the audiobook up with the book by listening to short samples (see SyncPlanner), not the whole thing.
  * Runs as a foreground service so it keeps going with the screen off. Safe to stop: it resumes where it left off.
  */
 public class SyncService extends Service {
@@ -119,26 +119,27 @@ public class SyncService extends Service {
             mr.setDataSource(this, Uri.parse(it.audio));
             totalSec = Long.parseLong(mr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)) / 1000.0;
             mr.release();
-            double done = doneFor(this, id);
             Alignment prior = Alignment.load(BookText.alignFile(this, id));
-            int lastPos = 0;
-            boolean wide = true;
-            if (prior.size() > 0 && done > 0) { lastPos = Math.max(0, prior.wordAtTime(prior.lastTime())); wide = false; }
-            doneSec = done; startedFrom = done; startedMs = System.currentTimeMillis();
-            Dbg.i("Sync", "start item " + id + ", model " + (Whisper.which(this) == 0 ? "accurate" : "faster") + ", audio " + (int) totalSec + " s, resuming at " + (int) done + " s, book words " + bi.count() + ", " + (wide ? "searching whole book" : "following from word " + lastPos));
-            long tStart = Dbg.now();
-            int fails = 0;
-            long lastNote = 0;
-            while (done < totalSec - 1 && !cancel) {
+            double here = Player.pos();   // start where the user is listening: usable within one short clip
+            SyncPlanner pl = new SyncPlanner(totalSec, here, bi.count(), prior.words(), prior.times());
+            doneSec = totalSec - pl.unresolved(); startedFrom = doneSec; startedMs = System.currentTimeMillis();
+            Dbg.i("Sync", "start item " + id + ", model " + (Whisper.which(this) == 0 ? "accurate" : "faster") + ", audio " + (int) totalSec + " s, from " + (int) here + " s, known anchors " + pl.anchorCount() + ", book words " + bi.count());
+            long lastNote = 0, listened = 0;
+            int probes = 0;
+            SyncPlanner.Req r = null;
+            while (!cancel && (r = pl.next()) != null) {
                 if (lowBattery()) { error = "The battery is low. Plug in and it carries on when you open the book."; break; }
                 long t0 = Dbg.now();
-                float[] pcm = AudioClip.decode(this, it.audio, done, CHUNK);
+                float[] pcm = AudioClip.decode(this, it.audio, r.start, r.len);
                 long msDec = Dbg.ms(t0);
+                Aligner.Out o = null;
+                long msTr = 0, msAl = 0;
+                int heard = 0;
                 if (pcm.length >= 16000 * 3) {
                     long t1 = Dbg.now();
                     String raw = Whisper.transcribeSegs(this, pcm);
-                    long msTr = Dbg.ms(t1);
-                    if (cancel) { Dbg.i("Sync", "piece at " + (int) done + " s abandoned after " + msTr + " ms (stopped)"); break; }
+                    msTr = Dbg.ms(t1);
+                    if (cancel) { Dbg.i("Sync", "piece at " + (int) r.start + " s abandoned after " + msTr + " ms (stopped)"); break; }
                     if (raw == null) throw new Exception("speech model failed");
                     ArrayList<String> tw = new ArrayList<>();
                     ArrayList<Double> tt = new ArrayList<>();
@@ -148,22 +149,21 @@ public class SyncService extends Service {
                         double s0, s1;
                         try { s0 = Double.parseDouble(p[0]); s1 = Double.parseDouble(p[1]); } catch (Exception e) { continue; }
                         List<String> ws = PageMatcher.words(p[2]);
-                        for (int k = 0; k < ws.size(); k++) { tw.add(ws.get(k)); tt.add(done + s0 + (k + 0.5) / ws.size() * Math.max(0.2, s1 - s0)); }
+                        for (int k = 0; k < ws.size(); k++) { tw.add(ws.get(k)); tt.add(r.start + s0 + (k + 0.5) / ws.size() * Math.max(0.2, s1 - s0)); }
                     }
                     double[] times = new double[tt.size()];
                     for (int k = 0; k < times.length; k++) times[k] = tt.get(k);
-                    int lo = wide ? 0 : Math.max(0, lastPos - 50), hi = wide ? bi.count() : lastPos + 3000;
+                    heard = times.length;
                     long t2 = Dbg.now();
-                    Aligner.Out o = al.align(tw.toArray(new String[0]), times, lo, hi);
-                    Dbg.p("Sync", "piece " + (int) done + "-" + (int) (done + CHUNK) + " s", t0, "decode " + msDec + " ms, listen " + msTr + " ms (" + String.format(Locale.US, "%.2f", pcm.length / 16000.0 / Math.max(1, msTr) * 1000) + "x real time), align " + Dbg.ms(t2) + " ms, heard " + tw.size() + " words, matched " + (o == null ? 0 : o.pos.length) + (o == null ? " (no match, fails " + (fails + 1) + ")" : ", votes " + o.votes) + ", window " + lo + ".." + hi);
-                    if (o != null) {
-                        Alignment.append(BookText.alignFile(this, id), o.pos, o.time);
-                        lastPos = o.end; wide = false; fails = 0;
-                    } else if (++fails >= 4) wide = true;   // lost the place (an intro, skipped part): look at the whole book again
+                    o = al.align(tw.toArray(new String[0]), times, r.lo, r.hi);
+                    msAl = Dbg.ms(t2);
+                    if (o != null) Alignment.append(BookText.alignFile(this, id), o.pos, o.time);
                 }
-                done += CHUNK;
-                doneSec = Math.min(done, totalSec);
-                Store.sp(this).edit().putFloat("syncDone_" + id, (float) done).apply();
+                int kept = pl.feed(r, o);
+                probes++; listened += (long) r.len;
+                doneSec = Math.max(0, Math.min(totalSec, totalSec - pl.unresolved()));
+                Dbg.p("Sync", "probe " + probes + " (" + r.why + ") at " + (int) r.start + "+" + (int) r.len + " s", t0, "decode " + msDec + " ms, listen " + msTr + " ms (" + String.format(Locale.US, "%.1f", r.len * 1000.0 / Math.max(1, msTr)) + "x real time), align " + msAl + " ms, heard " + heard + " words, " + (o == null ? "no match" : "matched " + o.pos.length + ", votes " + o.votes) + ", kept " + kept + ", window " + r.lo + ".." + r.hi);
+                Store.sp(this).edit().putFloat("syncDone_" + id, (float) doneSec).apply();
                 long now = System.currentTimeMillis();
                 if (now - lastNote > 4000) {
                     lastNote = now;
@@ -171,7 +171,13 @@ public class SyncService extends Service {
                     nm.notify(7100, note(pct + "%" + (eta >= 0 ? " · about " + (eta >= 60 ? (eta / 60) + " h " + (eta % 60) + " min" : eta + " min") + " left" : ""), pct, false));
                 }
             }
-            if (!cancel && done >= totalSec - 1) { complete = true; Store.sp(this).edit().putBoolean("syncFull_" + id, true).putBoolean("syncWant_" + id, false).apply(); }
+            Dbg.i("Sync", "listened to " + listened + " s of " + (int) totalSec + " s in " + probes + " probes (" + (listened * 100 / Math.max(1, (long) totalSec)) + "%)");
+            if (!cancel && r == null) {
+                if (pl.lost && error.isEmpty()) error = "Lost the place in the audio. Pin a page, then start the sync again.";
+                else if (!pl.lost) complete = true;
+                if (complete) doneSec = totalSec;
+                Store.sp(this).edit().putFloat("syncDone_" + id, (float) doneSec).putBoolean("syncFull_" + id, complete).putBoolean("syncWant_" + id, false).apply();
+            }
         } catch (Exception e) {
             error = String.valueOf(e.getMessage());
             Dbg.e("Sync", "failed", e);

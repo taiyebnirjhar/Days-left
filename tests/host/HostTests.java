@@ -95,12 +95,18 @@ public class HostTests {
         eq("align too short", new Aligner(bi).align(new String[]{"a", "b"}, new double[]{0, 1}, 0, 10), null);
 
         List<int[]> pw = new ArrayList<>(); List<Double> pt = new ArrayList<>();
-        int[] wp = {0, 10, 5, 20, 30}; double[] tp = {0, 10, 12, 8, 30};
+        int[] wp = {0, 10, 500, 20, 30}; double[] tp = {0, 10, 12, 20, 30};   // the 500 is a wrong match
         for (int i = 0; i < wp.length; i++) { pw.add(new int[]{wp[i]}); pt.add(tp[i]); }
         Alignment al = Alignment.fromPoints(pw, pt);
-        eq("alignment drops non-monotonic", al.size(), 3);
+        eq("alignment drops the outlier, keeps the good points after it", al.size(), 4);
         eq("alignment timeOfWord interp", Math.round(al.timeOfWord(5)), 5L);
         eq("alignment wordAtTime", al.wordAtTime(10), 10);
+        // points arriving out of time order (backward / gap-filling sync) are sorted
+        List<int[]> pw2 = new ArrayList<>(); List<Double> pt2 = new ArrayList<>();
+        int[] w2 = {30, 0, 20, 10}; double[] t2 = {30, 0, 20, 10};
+        for (int i = 0; i < w2.length; i++) { pw2.add(new int[]{w2[i]}); pt2.add(t2[i]); }
+        eq("alignment sorts unordered points", Alignment.fromPoints(pw2, pt2).size(), 4);
+        eq("alignment interpolates across sparse gap", Math.round(Alignment.fromPoints(pw2, pt2).timeOfWord(15)), 15L);
 
         System.out.println(runs + " checks, " + fails + " failed");
         System.exit(fails == 0 ? 0 : 1);
