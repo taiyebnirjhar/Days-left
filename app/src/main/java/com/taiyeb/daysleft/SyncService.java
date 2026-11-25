@@ -23,6 +23,11 @@ public class SyncService extends Service {
     static volatile double startedFrom;
     static volatile String error = "";
     static volatile boolean cancel;
+    /** Everything around the playhead is mapped; the service is only waiting for the user to move. */
+    static volatile boolean idle;
+    static final double WINDOW = 600;   // seconds mapped either side of the playhead
+
+    static boolean winReady(Context c, int id) { return Store.sp(c).getBoolean("syncWin_" + id, false); }
 
     static final double CHUNK = 30;
     private PowerManager.WakeLock wl;
@@ -60,7 +65,7 @@ public class SyncService extends Service {
         final int id = in == null ? -1 : in.getIntExtra("id", -1);
         nm = getSystemService(NotificationManager.class);
         nm.createNotificationChannel(new NotificationChannel("sync", "Syncing audiobook", NotificationManager.IMPORTANCE_LOW));
-        running = true; cancel = false; error = ""; itemId = id;
+        running = true; cancel = false; idle = false; error = ""; itemId = id;
         Whisper.abort(false);
         Store.sp(this).edit().putBoolean("syncWant_" + id, true).apply();
         Notification n = note("Getting ready…", 0, true);
@@ -122,12 +127,33 @@ public class SyncService extends Service {
             Alignment prior = Alignment.load(BookText.alignFile(this, id));
             double here = Player.pos();   // start where the user is listening: usable within one short clip
             SyncPlanner pl = new SyncPlanner(totalSec, here, bi.count(), prior.words(), prior.times());
-            doneSec = totalSec - pl.unresolved(); startedFrom = doneSec; startedMs = System.currentTimeMillis();
+            pl.reach = WINDOW;
+            Store.sp(this).edit().putBoolean("syncWin_" + id, false).apply();
+            totalSec = pl.windowProgress()[1];   // the progress bar is about the window around the playhead
+            doneSec = pl.windowProgress()[0]; startedFrom = doneSec; startedMs = System.currentTimeMillis();
             Dbg.i("Sync", "start item " + id + ", model " + (Whisper.which(this) == 0 ? "accurate" : "faster") + ", audio " + (int) totalSec + " s, from " + (int) here + " s, known anchors " + pl.anchorCount() + ", book words " + bi.count());
             long lastNote = 0, listened = 0;
             int probes = 0;
             SyncPlanner.Req r = null;
-            while (!cancel && (r = pl.next()) != null) {
+            long idleSince = 0;
+            while (!cancel) {
+                r = pl.next();
+                if (r == null) {
+                    if (pl.lost) break;
+                    if (pl.recenter(Player.pos())) { idleSince = 0; idle = false; Dbg.i("Sync", "playhead moved to " + (int) Player.pos() + " s, mapping around it"); totalSec = pl.windowProgress()[1]; continue; }
+                    long nowMs = System.currentTimeMillis();
+                    if (idleSince == 0) {
+                        idleSince = nowMs; idle = true; doneSec = totalSec;
+                        Store.sp(this).edit().putBoolean("syncWin_" + id, true).apply();
+                        Dbg.i("Sync", "mapped around " + (int) Player.pos() + " s after listening to " + listened + " s in " + probes + " probes");
+                        nm.notify(7100, note("Ready. It follows you as you listen", 100, false));
+                    }
+                    if (!Player.isPlaying() && nowMs - idleSince > 10000) break;
+                    Thread.sleep(2000);
+                    continue;
+                }
+                if (idle) { idle = false; Store.sp(this).edit().putBoolean("syncWin_" + id, false).apply(); }
+                idleSince = 0;
                 if (lowBattery()) { error = "The battery is low. Plug in and it carries on when you open the book."; break; }
                 long t0 = Dbg.now();
                 float[] pcm = AudioClip.decode(this, it.audio, r.start, r.len);
@@ -162,6 +188,7 @@ public class SyncService extends Service {
                 int kept = pl.feed(r, o);
                 probes++; listened += (long) r.len;
                 doneSec = Math.max(0, Math.min(totalSec, totalSec - pl.unresolved()));
+                totalSec = pl.windowProgress()[1];
                 Dbg.p("Sync", "probe " + probes + " (" + r.why + ") at " + (int) r.start + "+" + (int) r.len + " s", t0, "decode " + msDec + " ms, listen " + msTr + " ms (" + String.format(Locale.US, "%.1f", r.len * 1000.0 / Math.max(1, msTr)) + "x real time), align " + msAl + " ms, heard " + heard + " words, " + (o == null ? "no match" : "matched " + o.pos.length + ", votes " + o.votes) + ", kept " + kept + ", window " + r.lo + ".." + r.hi);
                 Store.sp(this).edit().putFloat("syncDone_" + id, (float) doneSec).apply();
                 long now = System.currentTimeMillis();
@@ -171,13 +198,9 @@ public class SyncService extends Service {
                     nm.notify(7100, note(pct + "%" + (eta >= 0 ? " · about " + (eta >= 60 ? (eta / 60) + " h " + (eta % 60) + " min" : eta + " min") + " left" : ""), pct, false));
                 }
             }
-            Dbg.i("Sync", "listened to " + listened + " s of " + (int) totalSec + " s in " + probes + " probes (" + (listened * 100 / Math.max(1, (long) totalSec)) + "%)");
-            if (!cancel && r == null) {
-                if (pl.lost && error.isEmpty()) error = "Lost the place in the audio. Pin a page, then start the sync again.";
-                else if (!pl.lost) complete = true;
-                if (complete) doneSec = totalSec;
-                Store.sp(this).edit().putFloat("syncDone_" + id, (float) doneSec).putBoolean("syncFull_" + id, complete).putBoolean("syncWant_" + id, false).apply();
-            }
+            Dbg.i("Sync", "listened to " + listened + " s of " + (int) pl.total + " s in " + probes + " probes");
+            if (!cancel && pl.lost && error.isEmpty()) error = "Lost the place in the audio. Pin a page, then start the sync again.";
+            if (!cancel && error.isEmpty()) Store.sp(this).edit().putBoolean("syncWin_" + id, true).apply();   // wanted stays on: it resumes next time the book opens
         } catch (Exception e) {
             error = String.valueOf(e.getMessage());
             Dbg.e("Sync", "failed", e);
@@ -186,7 +209,7 @@ public class SyncService extends Service {
             Dbg.e("Sync", "failed (serious)", t);
         } finally {
             Dbg.i("Sync", (complete ? "finished" : cancel ? "stopped" : error.isEmpty() ? "ended" : "ended with error: " + error) + " at " + (int) doneSec + " of " + (int) totalSec + " s");
-            running = false;
+            running = false; idle = false;
             Whisper.abort(false);
             if (wl != null && wl.isHeld()) wl.release();
             stopForeground(true);

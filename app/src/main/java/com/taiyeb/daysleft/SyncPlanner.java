@@ -29,7 +29,8 @@ final class SyncPlanner {
         double prevT; int prevW; // kind 1/2: the anchor the prediction is measured from
     }
 
-    final double total, startSec;
+    final double total;
+    double startSec;
     final int words;
     final TreeMap<Double, Integer> anchors = new TreeMap<>();
     private double fwdCursor, bwdEnd, fwdStride, bwdStride;
@@ -37,6 +38,8 @@ final class SyncPlanner {
     private boolean fwdDone, bwdDone, turnFwd = true, seeded;
     private final Map<Long, Integer> gapTries = new HashMap<>();
     private final Set<Long> badGaps = new HashSet<>();
+    /** Only map this far (seconds) either side of the playhead; infinity = the whole book. */
+    double reach = Double.POSITIVE_INFINITY;
     /** True if it stopped before the whole book was mapped (lost the place). */
     boolean lost;
 
@@ -45,7 +48,45 @@ final class SyncPlanner {
         this.startSec = Math.max(0, Math.min(startSec, totalSec - 1));
         this.words = bookWords;
         for (int i = 0; i < pos.length; i++) anchors.put(time[i], pos[i]);
-        if (!anchors.isEmpty()) { seeded = true; fwdCursor = anchors.lastKey(); bwdEnd = anchors.firstKey(); }
+        if (!anchors.isEmpty()) { seeded = true; placeCursors(this.startSec); }
+    }
+
+    /** Put the two walking cursors at the edges of the mapped stretch that holds (or is nearest to) time t. */
+    private void placeCursors(double t) {
+        Double near = anchors.floorKey(t);
+        Double up = anchors.ceilingKey(t);
+        double c = near != null && (up == null || t - near <= up - t) ? near : up;
+        double hi = c, lo = c;
+        for (Double h = anchors.higherKey(hi); h != null && h - hi <= DENSE_GAP; h = anchors.higherKey(hi)) hi = h;
+        for (Double l = anchors.lowerKey(lo); l != null && lo - l <= DENSE_GAP; l = anchors.lowerKey(lo)) lo = l;
+        fwdCursor = hi; bwdEnd = lo;
+    }
+
+    /**
+     * The playhead moved (playing, or the user jumped). Returns true if there is new work.
+     * Far outside what is mapped: look again there; inside: just walk on from the nearest mapped edge.
+     */
+    boolean recenter(double pos) {
+        pos = Math.max(0, Math.min(pos, total - 1));
+        if (Math.abs(pos - startSec) < Math.min(reach * 0.4, 240) && seeded) return false;
+        startSec = pos;
+        fwdDone = bwdDone = false;
+        fwdFails = bwdFails = 0; fwdN = bwdN = 0; fwdStride = bwdStride = 0;
+        if (!anchors.isEmpty()) {
+            Double a = anchors.floorKey(pos), b = anchors.ceilingKey(pos);
+            boolean mapped = (a != null && pos - a <= DENSE_GAP) || (b != null && b - pos <= DENSE_GAP);
+            if (mapped) { seeded = true; placeCursors(pos); }
+            else { seeded = false; seedTry = 0; }
+        } else { seeded = false; seedTry = 0; }
+        return true;
+    }
+
+    /** {mapped seconds, window size} inside the window around the playhead; the progress the user sees. */
+    double[] windowProgress() {
+        double lo = Math.max(0, startSec - reach), hi = Math.min(total, startSec + reach);
+        double covered = 0, pt = -1;
+        for (Double t : anchors.subMap(lo, true, hi, true).keySet()) { if (pt >= 0 && t - pt <= DENSE_GAP) covered += t - pt; pt = t; }
+        return new double[]{covered, Math.max(1, hi - lo)};
     }
 
     int anchorCount() { return anchors.size(); }
@@ -61,6 +102,7 @@ final class SyncPlanner {
 
     /** Seconds of the audio that are not mapped well enough yet. */
     double unresolved() {
+        if (!Double.isInfinite(reach)) { double[] w = windowProgress(); return w[1] - Math.min(w[0], w[1]); }
         if (!seeded) return total;
         double lo = bwdDone ? 0 : anchors.firstKey(), hi = fwdDone ? total : anchors.lastKey();
         double u = lo + (total - hi);
@@ -97,9 +139,12 @@ final class SyncPlanner {
     }
 
     private Req forward() {
-        double lastT = anchors.lastKey();
-        int lastW = anchors.lastEntry().getValue();
-        if (fwdCursor >= total - 8) { fwdDone = true; return null; }
+        skipMappedAhead();
+        Map.Entry<Double, Integer> ref = anchors.floorEntry(fwdCursor);
+        if (ref == null) ref = anchors.firstEntry();
+        double lastT = ref.getKey();
+        int lastW = ref.getValue();
+        if (fwdCursor >= total - 8 || fwdCursor > startSec + reach) { fwdDone = true; return null; }
         Req r = new Req();
         r.kind = 1; r.start = fwdCursor;
         boolean dense = fwdN < 2 || fwdFails > 0;
@@ -114,9 +159,12 @@ final class SyncPlanner {
     }
 
     private Req backward() {
-        double firstT = anchors.firstKey();
-        int firstW = anchors.firstEntry().getValue();
-        if (bwdEnd <= 8) { bwdDone = true; return null; }
+        skipMappedBehind();
+        Map.Entry<Double, Integer> ref = anchors.ceilingEntry(bwdEnd);
+        if (ref == null) ref = anchors.lastEntry();
+        double firstT = ref.getKey();
+        int firstW = ref.getValue();
+        if (bwdEnd <= 8 || bwdEnd < startSec - reach) { bwdDone = true; return null; }
         Req r = new Req();
         r.kind = 2;
         boolean dense = bwdN < 2 || bwdFails > 0;
@@ -131,13 +179,30 @@ final class SyncPlanner {
         return r;
     }
 
+    /** If the cursor runs into a stretch that is already mapped, jump to its far edge instead of listening again. */
+    private void skipMappedAhead() {
+        Double n = anchors.ceilingKey(fwdCursor);
+        if (n == null || n - fwdCursor > DENSE_GAP) return;
+        double c = n;
+        for (Double h = anchors.higherKey(c); h != null && h - c <= DENSE_GAP; h = anchors.higherKey(c)) c = h;
+        fwdCursor = c;
+    }
+
+    private void skipMappedBehind() {
+        Double n = anchors.floorKey(bwdEnd);
+        if (n == null || bwdEnd - n > DENSE_GAP) return;
+        double c = n;
+        for (Double l = anchors.lowerKey(c); l != null && c - l <= DENSE_GAP; l = anchors.lowerKey(c)) c = l;
+        bwdEnd = c;
+    }
+
     private Req gap() {
         double bestD = Double.MAX_VALUE, lt = 0, rt = 0;
         int lw = 0, rw = 0;
         double pt = -1; int pw = 0;
         for (Map.Entry<Double, Integer> e : anchors.entrySet()) {
             double t = e.getKey();
-            if (pt >= 0 && t - pt > DENSE_GAP && !badGaps.contains(Math.round(pt * 10))) {
+            if (pt >= 0 && t - pt > DENSE_GAP && !badGaps.contains(Math.round(pt * 10)) && pt < startSec + reach && t > startSec - reach) {
                 double d = Math.abs((pt + t) / 2 - startSec);
                 if (d < bestD) { bestD = d; lt = pt; rt = t; lw = pw; rw = e.getValue(); }
             }
@@ -159,7 +224,7 @@ final class SyncPlanner {
         int kept = 0;
         boolean ok = o != null && o.pos.length >= (r.kind == 0 ? 5 : 3) && (r.kind != 0 || o.votes >= 6);
         if (r.kind == 0) {
-            if (ok) { kept = add(o); seeded = true; fwdCursor = anchors.lastKey(); bwdEnd = anchors.firstKey(); }
+            if (ok) { kept = add(o); seeded = true; placeCursors((o.time[0] + o.time[o.time.length - 1]) / 2); }
             return kept;
         }
         if (r.kind == 3) {
@@ -188,11 +253,11 @@ final class SyncPlanner {
         if (fwd) {
             fwdFails = 0; fwdN++;
             fwdStride = fwdN < 2 ? 0 : good ? (fwdStride == 0 ? MIN_STRIDE : Math.min(MAX_STRIDE, fwdStride * 1.6)) : Math.max(MIN_STRIDE, fwdStride / 2);
-            fwdCursor = anchors.lastKey() + fwdStride;
+            fwdCursor = (anchors.floorKey(o.time[o.time.length - 1]) == null ? o.time[o.time.length - 1] : anchors.floorKey(o.time[o.time.length - 1])) + fwdStride;
         } else {
             bwdFails = 0; bwdN++;
             bwdStride = bwdN < 2 ? 0 : good ? (bwdStride == 0 ? MIN_STRIDE : Math.min(MAX_STRIDE, bwdStride * 1.6)) : Math.max(MIN_STRIDE, bwdStride / 2);
-            bwdEnd = anchors.firstKey() - bwdStride;
+            bwdEnd = (anchors.ceilingKey(o.time[0]) == null ? o.time[0] : anchors.ceilingKey(o.time[0])) - bwdStride;
         }
         return kept;
     }

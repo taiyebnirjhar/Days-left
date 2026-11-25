@@ -482,7 +482,7 @@ public class ReaderActivity extends Activity {
 
     void updateSyncLabel() {
         if (syncIcon == null) return;
-        boolean full = SyncService.fullFor(this, item.id), run = syncing();
+        boolean run = syncing(), full = SyncService.fullFor(this, item.id) || (run ? SyncService.idle : SyncService.winReady(this, item.id));
         int pct = run || SyncService.doneFor(this, item.id) > 0 ? syncPct() : 0;
         String label = full ? "Synced" : run ? pct + "%" : pct > 0 ? "Resume " + pct + "%" : "Sync";
         if (!label.contentEquals(syncIcon.label.getText())) syncIcon.label.setText(label);
@@ -540,8 +540,11 @@ public class ReaderActivity extends Activity {
         if (stopping()) {
             setMsg("Stopping… your progress is saved.", -1);
             setBtns("Close", (Runnable) this::closePanel);
+        } else if (syncing() && SyncService.idle) {
+            setMsg("Synced around where you are listening.\n\nPlay page, Find page and the sentence highlight work here. It follows you as you play, and maps the new place within a minute or two if you jump somewhere else.", -1);
+            setBtns("Close", (Runnable) this::closePanel, "Stop", (Runnable) () -> { SyncService.stop(this); showSyncState(); });
         } else if (syncing()) {
-            setMsg("Syncing… " + syncPct() + "%" + etaText() + "\n\nYou can leave this screen or turn the screen off. It keeps going in the background and shows a notification. Stopping is safe: it continues from where it stopped.", syncPct());
+            setMsg("Syncing around your position… " + syncPct() + "%" + etaText() + "\n\nYou can leave this screen or turn the screen off. It keeps going in the background and shows a notification. Stopping is safe: it continues from where it stopped.", syncPct());
             setBtns("Hide", (Runnable) this::closePanel, "Stop", (Runnable) () -> { SyncService.stop(this); showSyncState(); });
         } else if (SyncService.fullFor(this, item.id)) {
             setMsg("This audiobook is synced.\n\nPlay page and Find page are instant now, and the sentence being read is highlighted in the book.", -1);
@@ -550,8 +553,8 @@ public class ReaderActivity extends Activity {
             boolean part = SyncService.doneFor(this, item.id) > 0;
             if (!SyncService.error.isEmpty() && !part) { /* show the reason once */ }
             setMsg((part ? "Paused at " + syncPct() + "%. It continues from there.\n\n" : "")
-                    + "This listens to the whole audiobook once and links every sentence to the book. Afterwards Play page and Find page are instant, and the sentence being read is highlighted.\n\n"
-                    + "It runs in the background, so you can use your phone normally. It takes a while, so it's best done while charging. Rough guess: Accurate 2 to 3 hours, Faster about 1 hour. The real time is shown once it starts."
+                    + "This listens to a few short samples around where you are in the audiobook and links them to the book. Then Play page and Find page are instant there, and the sentence being read is highlighted. It follows you as you play or jump.\n\n"
+                    + "Rough guess: Faster about 2 minutes, Accurate about 5 minutes. It runs in the background."
                     + (SyncService.error.isEmpty() ? "" : "\n\nLast stop: " + SyncService.error), -1);
             setBtns("Accurate", (Runnable) () -> startSync(0), "Faster", (Runnable) () -> startSync(1), "Cancel", (Runnable) this::closePanel);
         }

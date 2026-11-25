@@ -76,6 +76,7 @@ public class SyncSim {
             Aligner al = new Aligner(bi);
             double start = 0.37 * total;
             SyncPlanner p = new SyncPlanner(total, start, N, new int[0], new double[0]);
+            if (a.length > 2) p.reach = Double.parseDouble(a[2]) * 60;
             double listened = 0; int probes = 0, fails = 0;
             boolean usable = false, ext = false;
             StringBuilder log = new StringBuilder();
@@ -106,6 +107,43 @@ public class SyncSim {
             System.out.print(log);
             System.out.printf("  final: mapped %.1f%% of timeline, error median %.2f s, 95th pct %.2f s%n", ac[0], ac[1], ac[2]);
             if (ac[0] < 95 || ac[2] > 6 || p.lost) bad++;
+        }
+        // ---- follow the playhead: window mode, then play on, then jump away and back ----
+        build(7, hours, sttSpeed);
+        int[] ps = {0, N};
+        BookIndex bi2 = new BookIndex(book, ps, new float[N * 4], new byte[N]);
+        Aligner al2 = new Aligner(bi2);
+        double pos = 0.37 * total;
+        SyncPlanner fp = new SyncPlanner(total, pos, N, new int[0], new double[0]);
+        fp.reach = 600;
+        double[] moves = {pos, pos + 300, pos + 600, pos + 900, 0.8 * total, 0.8 * total + 300, pos + 905, 0.05 * total};
+        String[] what = {"start", "play 5 min", "play 10 min", "play 15 min", "JUMP to 80%", "play 5 min", "jump back to the first spot", "JUMP to 5%"};
+        double lis = 0; int pr = 0;
+        for (int m = 0; m < moves.length; m++) {
+            if (m > 0) fp.recenter(moves[m]);
+            double before = lis; int pb = pr;
+            SyncPlanner.Req r;
+            while ((r = fp.next()) != null && pr < 5000) {
+                List<String> w = new ArrayList<>(); List<Double> t = new ArrayList<>();
+                hear(r.start, r.len, w, t);
+                double[] tt = new double[t.size()]; for (int i = 0; i < tt.length; i++) tt[i] = t.get(i);
+                fp.feed(r, al2.align(w.toArray(new String[0]), tt, r.lo, r.hi));
+                lis += r.len; pr++;
+            }
+            Alignment fa = snapshot(fp);
+            // accuracy only within 5 min of the playhead
+            int ok = 0, n = 0; double worst = 0;
+            for (int k = 0; k < 400; k++) {
+                double t = moves[m] - 300 + k * 1.5;
+                if (t < 40 || t > total - 40) continue;
+                n++;
+                int wd = fa.wordAtTime(t);
+                if (wd < 0) continue;
+                double est = fa.timeOfWord(trueWordAt(t));
+                if (est >= 0) { ok++; worst = Math.max(worst, Math.abs(est - tw[trueWordAt(t)])); }
+            }
+            System.out.printf("follow: %-28s +%2d probes, +%.1f min listened (~%.1f min on phone), mapped %d%% near playhead, worst error %.1f s%n", what[m], pr - pb, (lis - before) / 60, (lis - before) / sttSpeed / 60, n == 0 ? 0 : ok * 100 / n, worst);
+            if (n > 0 && ok * 100 / n < 95) bad++;
         }
         System.out.println(bad == 0 ? "ALL SIM RUNS OK" : bad + " SIM RUNS BAD");
         System.exit(bad == 0 ? 0 : 1);
