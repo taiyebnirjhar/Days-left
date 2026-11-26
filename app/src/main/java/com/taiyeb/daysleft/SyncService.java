@@ -29,6 +29,8 @@ public class SyncService extends Service {
     static volatile int dlPct = -1;
     /** The phone is in battery saver, which slows the processor (and so the sync). */
     static volatile boolean powerSaving;
+    /** How many anchors are known (0 = still finding the place in the audio). */
+    static volatile int anchorCount;
     /** Book text reading progress (0..100) while the service is reading it, else -1. */
     static volatile int textPct = -1;
     /** The reader asks: when is this book word spoken? (-1 none). The answer appears in goalTimeOut (-1 working, -2 not found). */
@@ -142,6 +144,7 @@ public class SyncService extends Service {
         try {
             Item it = Learn.item(this, id);
             if (it == null || it.audio.isEmpty()) throw new Exception("no audio file");
+            AudioClip.warm(this, it.audio);   // opening a 10 h file takes ~10 s: do it now, while the model/book text are prepared
             if (!Whisper.hasModel(this)) {
                 // downloaded here, in the service, so it carries on when the dialog is closed or the screen is off
                 dlPct = 0;
@@ -194,8 +197,9 @@ public class SyncService extends Service {
             pl.reach = STAGES[0];
             pl.dense = true;   // fill the zone around the playhead first, with probes close enough for a sentence highlight
             idle = winReady(this, id);   // was ready last time: stays "Synced" unless new work turns up
-            totalSec = pl.windowProgress()[1];   // the progress bar is about the window around the playhead
-            doneSec = pl.windowProgress()[0]; startedFrom = doneSec; startedMs = System.currentTimeMillis();
+            anchorCount = pl.anchorCount();
+            totalSec = pl.zoneProgress()[1];   // progress = how much of the zone around the playhead is ready for a highlight
+            doneSec = pl.zoneProgress()[0]; startedFrom = doneSec; startedMs = System.currentTimeMillis();
             Dbg.i("Sync", "start item " + id + ", model " + (Whisper.which(this) == 0 ? "accurate" : "faster") + ", audio " + (int) totalSec + " s, from " + (int) here + " s, known anchors " + pl.anchorCount() + ", book words " + bi.count());
             long lastNote = 0, listened = 0;
             int probes = 0;
@@ -211,7 +215,7 @@ public class SyncService extends Service {
                     if (rc == 2) {
                         stage = 0; pl.reach = STAGES[0]; pl.dense = true; widening = false; idleSince = 0; idle = false;
                         Dbg.i("Sync", "playhead jumped to " + (int) Player.pos() + " s, mapping around it");
-                        totalSec = pl.windowProgress()[1];
+                        totalSec = pl.zoneProgress()[1]; doneSec = pl.zoneProgress()[0]; anchorCount = pl.anchorCount();
                     }
                 }
                 List<SyncPlanner.Req> batch = pl.nextBatch(3);
@@ -245,7 +249,9 @@ public class SyncService extends Service {
                 long t0 = Dbg.now();
                 // up to three short pieces go through the speech model together: one call costs the same as one piece
                 float[][] pcm = new float[batch.size()][];
-                for (int i = 0; i < pcm.length; i++) pcm[i] = AudioClip.decode(this, it.audio, batch.get(i).start, batch.get(i).len);
+                double[] dst = new double[pcm.length], dln = new double[pcm.length];
+                for (int i = 0; i < pcm.length; i++) { dst[i] = batch.get(i).start; dln[i] = batch.get(i).len; }
+                pcm = AudioClip.decodeMany(this, it.audio, dst, dln);   // the pieces are decoded side by side
                 long msDec = Dbg.ms(t0);
                 long t1 = Dbg.now();
                 String[] raws = Whisper.transcribeBatch(this, pcm);
@@ -279,8 +285,10 @@ public class SyncService extends Service {
                 Dbg.p("Sync", "call with " + batch.size() + " pieces", t0, "decode " + msDec + " ms, speech " + msTr + " ms" + sum);
                 if (goalWordReq >= 0) goalTimeOut = pl.goalTime;
                 hereWord = pl.wordNear(Player.pos());
-                doneSec = Math.max(0, Math.min(totalSec, totalSec - pl.unresolved()));
-                totalSec = pl.windowProgress()[1];
+                double[] zp = pl.zoneProgress();
+                totalSec = zp[1];
+                doneSec = Math.max(0, Math.min(zp[1], zp[0]));
+                anchorCount = pl.anchorCount();
                 Store.sp(this).edit().putFloat("syncDone_" + id, (float) doneSec).putInt("syncPct_" + id, idle ? 100 : (int) Math.min(100, doneSec * 100 / Math.max(1, totalSec))).apply();
                 long now = System.currentTimeMillis();
                 if (now - lastNote > 4000) {
@@ -300,8 +308,7 @@ public class SyncService extends Service {
             Dbg.e("Sync", "failed (serious)", t);
         } finally {
             Dbg.i("Sync", (complete ? "finished" : cancel ? "stopped" : error.isEmpty() ? "ended" : "ended with error: " + error) + " at " + (int) doneSec + " of " + (int) totalSec + " s");
-            running = false; idle = false; hereWord = -1; textPct = -1; dlPct = -1;
-            AudioClip.closeCache();
+            running = false; idle = false; hereWord = -1; textPct = -1; dlPct = -1; anchorCount = 0;
             Whisper.abort(false);
             if (wl != null && wl.isHeld()) wl.release();
             stopForeground(true);

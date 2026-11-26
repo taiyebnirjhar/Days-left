@@ -6,6 +6,11 @@ import java.io.StringWriter;
 
 /** Keeps the last crash so the app can show it next time instead of just closing. */
 public class App extends Application {
+    @Override public void onTrimMemory(int level) {
+        super.onTrimMemory(level);
+        if (level >= TRIM_MEMORY_BACKGROUND && !SyncService.running) AudioClip.closeCache();   // give the opened audio files back when the system is short of memory
+    }
+
     @Override public void onCreate() {
         super.onCreate();
         Dbg.init(this);

@@ -15,7 +15,7 @@ import java.util.*;
  *   3. Refine: halve the gaps that are still wider than DENSE_GAP, nearest to the user first.
  */
 final class SyncPlanner {
-    static final double PROBE = 9, LONG_PROBE = 9, DENSE_GAP = 90, MAX_STRIDE = 150, MIN_STRIDE = 20;
+    static double PROBE = 9, LONG_PROBE = 9, DENSE_GAP = 90, MAX_STRIDE = 150, MIN_STRIDE = 20;
     /** Highlighting a sentence needs probes close together right around the playhead: 20 s apart from 40 s behind to 150 s ahead of it (swept in tests/host/simrun.sh: 20 s keeps 0 wrong highlights and shows the first one a call sooner than 12 s), 30 s apart within 5 min, else DENSE_GAP. */
     /** A page start is only answered when the two probes around it are this close (seconds): then it is right to well under a second. */
     static final double GOAL_GAP = 25;
@@ -94,6 +94,13 @@ final class SyncPlanner {
             double old = startSec;
             startSec = pos;                       // the window follows the playhead
             int r = Math.abs(pos - old) > 1 ? 1 : 0;
+            if (pos > fwdCursor + 60 || pos < bwdEnd - 60) {
+                // jumped to another mapped stretch (Play page, a seek): the cursors still sit where we were before, so move them here
+                placeCursors(pos);
+                fwdDone = bwdDone = false;
+                fwdFails = bwdFails = 0; fwdN = bwdN = 0; fwdStride = bwdStride = 0;
+                return 1;
+            }
             if (fwdDone && fwdCursor < startSec + reach && fwdCursor < total - 8) { fwdDone = false; fwdFails = 0; r = 1; }
             if (bwdDone && bwdEnd > startSec - reach && bwdEnd > 8) { bwdDone = false; bwdFails = 0; r = 1; }
             return r;
@@ -108,6 +115,22 @@ final class SyncPlanner {
 
     /** Within this many seconds of an anchor counts as "mapped here". */
     private static final double MAX_NEAR = 200;
+    /** Gaps wider than this separate two mapped islands (a search far away): they are not bisected, that would listen to the whole audio. */
+    private static final double GAP_MAX = 300;
+
+    /**
+     * {seconds of the zone around the playhead that are ready, zone length}. "Ready" = the probes around it are close enough
+     * for a sentence highlight. This is the number the user sees as progress, so it means what it says.
+     */
+    double[] zoneProgress() {
+        double lo = Math.max(0, focus - NEAR_BEHIND), hi = Math.min(total, focus + NEAR_AHEAD);
+        double covered = 0, pt = -1;
+        for (Double t : anchors.subMap(lo - 120, true, hi + 120, true).keySet()) {
+            if (pt >= 0 && t - pt <= DENSE_NEAR + 5) covered += Math.max(0, Math.min(t, hi) - Math.max(pt, lo));
+            pt = t;
+        }
+        return new double[]{Math.min(covered, hi - lo), Math.max(1, hi - lo)};
+    }
 
     /** {mapped seconds, window size} inside the window around the playhead; the progress the user sees. */
     double[] windowProgress() {
@@ -410,7 +433,7 @@ final class SyncPlanner {
         for (Map.Entry<Double, Integer> e : anchors.entrySet()) {
             double t = e.getKey();
             boolean pauseGap = dense && pt >= 0 && t - pt > 7 && typ > 0 && (e.getValue() - pw) / (t - pt) < 0.55 * typ;   // a pause or music sits in here: look inside
-            if (pt >= 0 && (t - pt > gapLimit((pt + t) / 2) || pauseGap) && !badGaps.contains(Math.round(pt * 10)) && !inFlightGaps.contains(Math.round(pt * 10)) && pt < startSec + reach && t > startSec - reach) {
+            if (pt >= 0 && t - pt <= GAP_MAX && (t - pt > gapLimit((pt + t) / 2) || pauseGap) && !badGaps.contains(Math.round(pt * 10)) && !inFlightGaps.contains(Math.round(pt * 10)) && pt < startSec + reach && t > startSec - reach) {
                 double d = Math.abs((pt + t) / 2 - focus);
                 if (d < bestD) { bestD = d; lt = pt; rt = t; lw = pw; rw = e.getValue(); }
             }

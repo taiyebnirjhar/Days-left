@@ -67,8 +67,8 @@ class Whisper {
 
     private static void ensureCtx(Context c) {
         appCtx = c.getApplicationContext();
-        if (Store.num(appCtx, "wThrV", 0) != 2) {   // thread tuning method changed: measure again
-            android.content.SharedPreferences.Editor e = Store.sp(appCtx).edit().remove("wThr").remove("wThrN").putInt("wThrV", 2);
+        if (Store.num(appCtx, "wThrV", 0) != 3) {   // thread tuning method changed: measure again
+            android.content.SharedPreferences.Editor e = Store.sp(appCtx).edit().remove("wThr").remove("wThrN").putInt("wThrV", 3);
             for (int t : CAND) e.remove("wThrT" + t);
             e.apply();
         }
@@ -96,19 +96,21 @@ class Whisper {
     }
 
     /** Remember how long a call took with the thread count it used; each count is tried twice and the better run counts. */
-    private static void tuned(long ms) {
+    private static void tuned(long ms, double audioSec) {
         if (appCtx == null || Store.num(appCtx, "wThr", 0) > 0) return;
         int n = Store.num(appCtx, "wThrN", 0);
+        // calls differ in length (1 to 3 pieces), so compare milliseconds per second of audio, not per call
+        int per = (int) Math.max(1, Math.round(ms / Math.max(1.0, audioSec) * 10));   // ms per 10 s of audio
         String k = "wThrT" + curThreads;
         int old = Store.num(appCtx, k, 0);
-        Store.setNum(appCtx, k, old > 0 ? (int) Math.min(old, ms) : (int) Math.min(Integer.MAX_VALUE, ms));
+        Store.setNum(appCtx, k, old > 0 ? Math.min(old, per) : per);
         Store.setNum(appCtx, "wThrN", n + 1);
-        Dbg.i("Whisper", "tuning: " + curThreads + " threads took " + ms + " ms");
+        Dbg.i("Whisper", "tuning: " + curThreads + " threads, " + ms + " ms for " + (int) audioSec + " s of audio");
         if (n + 1 >= CAND.length * 2) {
             int bestT = 4; long bestMs = Long.MAX_VALUE;
             for (int t : CAND) { int v = Store.num(appCtx, "wThrT" + t, 0); if (v > 0 && v < bestMs) { bestMs = v; bestT = t; } }
             Store.setNum(appCtx, "wThr", bestT);
-            Dbg.i("Whisper", "tuning done: using " + bestT + " threads (" + bestMs + " ms per call)");
+            Dbg.i("Whisper", "tuning done: using " + bestT + " threads (" + bestMs + " ms per 10 s of audio)");
         }
     }
 
@@ -130,7 +132,7 @@ class Whisper {
         if (ctx == 0) return null;
         long t = Dbg.now();
         String r = nRunSegs(ctx, pcm, threads());
-        if (r != null && !stopping()) tuned(Dbg.ms(t));
+        if (r != null && !stopping()) tuned(Dbg.ms(t), pcm.length / 16000.0);
         return r;
     }
 
@@ -174,7 +176,7 @@ class Whisper {
         String raw = words ? nRunWords(ctx, buf, threads()) : nRunSegs(ctx, buf, threads());
         if (words) Store.sp(appCtx).edit().putBoolean("wordPending", false).commit();
         if (raw == null) return null;
-        if (!stopping()) tuned(Dbg.ms(t));
+        if (!stopping()) tuned(Dbg.ms(t), total / 16000.0);
         StringBuilder[] sb = new StringBuilder[clips.length];
         for (int i = 0; i < sb.length; i++) sb[i] = new StringBuilder();
         for (String line : raw.split("\n")) {
