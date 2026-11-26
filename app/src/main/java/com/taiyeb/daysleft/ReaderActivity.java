@@ -53,7 +53,7 @@ public class ReaderActivity extends Activity {
     boolean scrollMode;
     boolean readingText, textTried;   // the book's text is being read quietly in the background (once per opening)
     boolean locked;                 // touch lock (like VLC): the screen ignores touches until the padlock is tapped
-    Glyph lockBtn, unlockBtn;       // padlock in the top bar; the one that appears after a tap while locked
+    Glyph lockBtn, unlockBtn, rotateBtn;       // padlock in the top bar; the one that appears after a tap while locked
     final Runnable hideUnlock = () -> { if (unlockBtn != null) unlockBtn.setVisibility(View.GONE); };
     AudioManager am;
 
@@ -198,6 +198,29 @@ public class ReaderActivity extends Activity {
         }, "book-text").start();
     }
 
+    // ---- the rotate button: tap = turn the screen (upright <-> on its side) and keep it there; long-press = follow the phone again ----
+    void applyOrient(int mode) {
+        setRequestedOrientation(mode == 1 ? android.content.pm.ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+                : mode == 2 ? android.content.pm.ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+                : android.content.pm.ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED);
+        refreshRotateIcon(mode);
+    }
+
+    void setOrient(int mode) { Store.setNum(this, "rdOrient", mode); applyOrient(mode); }
+
+    void toggleOrient() {
+        boolean land = getResources().getConfiguration().orientation == android.content.res.Configuration.ORIENTATION_LANDSCAPE;
+        setOrient(land ? 1 : 2);
+        Toast.makeText(this, land ? "Upright. Long-press the icon to follow the phone." : "On its side. Long-press the icon to follow the phone.", Toast.LENGTH_SHORT).show();
+    }
+
+    void refreshRotateIcon(int mode) {
+        if (rotateBtn == null) return;
+        rotateBtn.land = getResources().getConfiguration().orientation == android.content.res.Configuration.ORIENTATION_LANDSCAPE;
+        rotateBtn.rotMode = mode;
+        rotateBtn.invalidate();
+    }
+
     /** Phone on its side: pages stacked and scrolled as one; upright: the page view with swipes. */
     int upRenderW;   // the picture width used with the phone upright
 
@@ -206,6 +229,7 @@ public class ReaderActivity extends Activity {
         boolean land = getResources().getConfiguration().orientation == android.content.res.Configuration.ORIENTATION_LANDSCAPE;
         if (land == scrollMode) return;
         scrollMode = land;
+        refreshRotateIcon(Store.num(this, "rdOrient", 0));
         if (upRenderW == 0) upRenderW = renderW;
         // pictures are shown across the whole (wide) screen: render them that wide (up to the size the renderer allows) and take new ones
         int wide = Math.max(root.getWidth(), root.getHeight());
@@ -1343,7 +1367,8 @@ public class ReaderActivity extends Activity {
         top.setPadding(dp(8), dp(26), dp(14), dp(8));
         back = new Glyph(0);
         back.setOnClickListener(v -> finish());
-        top.addView(back, new LinearLayout.LayoutParams(dp(44), dp(44)));
+        back.setPadding(dp(11), dp(11), dp(11), dp(11));
+        top.addView(back, new LinearLayout.LayoutParams(dp(40), dp(40)));
         title = new TextView(this);
         title.setText(item.title);
         title.setTextSize(16);
@@ -1353,15 +1378,21 @@ public class ReaderActivity extends Activity {
         top.addView(title, new LinearLayout.LayoutParams(0, -2, 1f));
         aa = new TextView(this);
         aa.setText("Aa");
-        aa.setTextSize(17);
+        aa.setTextSize(15);
         aa.setTypeface(Typeface.create(Typeface.SERIF, Typeface.BOLD));
         aa.setGravity(Gravity.CENTER);
         aa.setOnClickListener(v -> settings.setVisibility(settings.getVisibility() == View.VISIBLE ? View.GONE : View.VISIBLE));
         lockBtn = new Glyph(3);
         lockBtn.setOnClickListener(v -> setLocked(true));
-        lockBtn.setPadding(dp(15), dp(10), dp(15), dp(10));   // the drawn padlock is about as tall as the 'Aa' next to it
-        top.addView(lockBtn, new LinearLayout.LayoutParams(dp(48), dp(40)));
-        top.addView(aa, new LinearLayout.LayoutParams(dp(48), dp(40)));
+        lockBtn.setPadding(dp(13.5f), dp(11.5f), dp(13.5f), dp(11.5f));   // every top icon: a 40 dp box, an 18 dp drawing
+        rotateBtn = new Glyph(4);
+        rotateBtn.setPadding(dp(11), dp(11), dp(11), dp(11));
+        rotateBtn.setOnClickListener(v -> toggleOrient());
+        rotateBtn.setOnLongClickListener(v -> { setOrient(0); Toast.makeText(this, "Turning follows the phone", Toast.LENGTH_SHORT).show(); return true; });
+        top.addView(rotateBtn, new LinearLayout.LayoutParams(dp(40), dp(40)));
+        top.addView(lockBtn, new LinearLayout.LayoutParams(dp(40), dp(40)));
+        top.addView(aa, new LinearLayout.LayoutParams(dp(40), dp(40)));
+        applyOrient(Store.num(this, "rdOrient", 0));
         root.addView(top, new FrameLayout.LayoutParams(-1, -2, Gravity.TOP));
         unlockBtn = new Glyph(3);
         unlockBtn.color = 0xFFFFFFFF;
@@ -1706,6 +1737,7 @@ public class ReaderActivity extends Activity {
         aa.setTextColor(ink);
         back.color = ink; back.invalidate();
         lockBtn.color = ink; lockBtn.invalidate();
+        rotateBtn.color = ink; rotateBtn.invalidate();
         playBtn.setBackground(rr(ink, 30));
         playGlyph.color = paper; playGlyph.invalidate();
         if (audioBtn != null) { audioBtn.setTextColor(ink); audioBtn.setBackground(rr((ink & 0x00FFFFFF) | 0x1F000000, 16)); }
@@ -1807,6 +1839,8 @@ public class ReaderActivity extends Activity {
     class Glyph extends View {
         int type, color = 0xFF000000;
         boolean round;   // draws a dark disc behind the glyph (the unlock padlock must be visible on any page)
+        boolean land;    // rotate icon: the phone is on its side now
+        int rotMode;     // rotate icon: 0 follows the phone, 1 fixed upright, 2 fixed on its side
         Glyph(int t) { super(ReaderActivity.this); type = t; }
         @Override protected void onDraw(Canvas c) {
             float w = getWidth(), hh = getHeight();
@@ -1822,14 +1856,33 @@ public class ReaderActivity extends Activity {
                 c.drawArc(l + bw * 0.2f, t, r - bw * 0.2f, t + (bodyTop - t) * 2f, 180, 180, false, p);
                 c.drawLine(l + bw * 0.2f, t + (bodyTop - t), l + bw * 0.2f, bodyTop, p);
                 c.drawLine(r - bw * 0.2f, t + (bodyTop - t), r - bw * 0.2f, bodyTop, p);
-            } else if (type == 0) {
+            } else if (type == 0 || type == 4) {
+                // the top-bar icons: all drawn in the padded 18 dp square of a 40 dp box, one stroke weight, so they look the same size
+                float l = getPaddingLeft(), t = getPaddingTop(), aw = w - l - getPaddingRight(), ah = hh - t - getPaddingBottom();
                 p.setStyle(Paint.Style.STROKE);
-                p.setStrokeWidth(w * 0.085f);
+                p.setStrokeWidth(dp(2f));
                 p.setStrokeCap(Paint.Cap.ROUND);
                 p.setStrokeJoin(Paint.Join.ROUND);
-                Path path = new Path();
-                path.moveTo(w * 0.62f, hh * 0.24f); path.lineTo(w * 0.36f, hh * 0.5f); path.lineTo(w * 0.62f, hh * 0.76f);
-                c.drawPath(path, p);
+                if (type == 0) {
+                    Path path = new Path();
+                    path.moveTo(l + aw * 0.68f, t + ah * 0.06f); path.lineTo(l + aw * 0.30f, t + ah * 0.5f); path.lineTo(l + aw * 0.68f, t + ah * 0.94f);
+                    c.drawPath(path, p);
+                } else {
+                    // a phone (upright or on its side, as it is now) inside a turning arrow; filled when the turning is fixed (not following the phone)
+                    float pw2 = land ? 0.62f : 0.38f, ph2 = land ? 0.38f : 0.62f;
+                    RectF ph = new RectF(l + aw * (0.5f - pw2 / 2), t + ah * (0.5f - ph2 / 2), l + aw * (0.5f + pw2 / 2), t + ah * (0.5f + ph2 / 2));
+                    p.setStrokeWidth(dp(1.7f));
+                    if (rotMode != 0) p.setStyle(Paint.Style.FILL_AND_STROKE);
+                    c.drawRoundRect(ph, dp(2), dp(2), p);
+                    p.setStyle(Paint.Style.STROKE);
+                    float cx = l + aw / 2, cy = t + ah / 2, R = Math.min(aw, ah) * 0.5f;
+                    c.drawArc(new RectF(cx - R, cy - R, cx + R, cy + R), -75, 100, false, p);
+                    double a = Math.toRadians(25);
+                    float ex = (float) (cx + R * Math.cos(a)), ey = (float) (cy + R * Math.sin(a)), tx = (float) -Math.sin(a), ty = (float) Math.cos(a), nx = (float) Math.cos(a), ny = (float) Math.sin(a), hl = R * 0.45f;
+                    Path head = new Path();
+                    head.moveTo(ex + tx * hl * 0.5f, ey + ty * hl * 0.5f); head.lineTo(ex + nx * hl * 0.55f, ey + ny * hl * 0.55f); head.moveTo(ex + tx * hl * 0.5f, ey + ty * hl * 0.5f); head.lineTo(ex - nx * hl * 0.55f, ey - ny * hl * 0.55f);
+                    c.drawPath(head, p);
+                }
             } else if (type == 1) {
                 Path path = new Path();
                 path.moveTo(w * 0.28f, hh * 0.16f); path.lineTo(w * 0.84f, hh * 0.5f); path.lineTo(w * 0.28f, hh * 0.84f); path.close();
