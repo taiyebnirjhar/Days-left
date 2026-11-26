@@ -106,6 +106,25 @@ public class SyncSim {
             if (wa[0] < 95 || wa[1] > 10) bad++;
         }
 
+        // ---- 1b. two rings, like the service: ring +-150 s first, then widen to +-600 s (this once silently did nothing) ----
+        build(31, hours, callSec);
+        {
+            int[] ps1 = {0, N};
+            Aligner al1 = new Aligner(new BookIndex(book, ps1, new float[N * 4], new byte[N]));
+            double pos = 0.37 * total;
+            SyncPlanner p = new SyncPlanner(total, pos, N, new int[0], new double[0]);
+            p.reach = 150;
+            calls = 0; listened = 0;
+            while (step(p, al1)) if (calls > 3000) break;
+            int ringCalls = calls;
+            double[] ring = windowAcc(snapshot(p), pos);
+            p.widen(600);
+            while (step(p, al1)) if (calls > 3000) break;
+            double[] wide = windowAcc(snapshot(p), pos);
+            System.out.printf("two rings: ring +-150 s after %d calls; widened to +-600 s after %d more calls; mapped within +-600 s: %.0f%% (was %.0f%% after the ring)%n", ringCalls, calls - ringCalls, wide[0], ring[0]);
+            if (wide[0] < 95) bad++;
+        }
+
         // ---- 2. Play this page: find a far-away page from nothing (no sync data at all) ----
         Random r = new Random(11);
         int ok = 0, tests = 0, maxCalls = 0; double sumCalls = 0, worst = 0;

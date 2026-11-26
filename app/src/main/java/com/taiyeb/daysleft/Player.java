@@ -121,6 +121,10 @@ class Player {
             return;
         }
         PlaybackService.sync(app);
+        // listening on, possibly with the app in the background: the sync follows the playhead (it exits by itself when idle)
+        try {
+            if (itemId >= 0 && !SyncService.running && SyncService.wanted(app, itemId) && Whisper.hasModel(app)) SyncService.start(app, itemId);
+        } catch (Exception e) { Dbg.w("Player", "could not wake the sync: " + e); }
     }
 
     /** The player died (media error or wrong state): open the same audio again, go back to where it was, and carry on. */

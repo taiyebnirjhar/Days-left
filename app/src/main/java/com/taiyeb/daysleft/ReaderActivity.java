@@ -68,6 +68,7 @@ public class ReaderActivity extends Activity {
     int goPage;
     boolean jumpToAudio;
     double aT, aDur;
+    long lastFollowStart;
     int aState = -1, speedIdx, bottomInset, chromeBg;
     long lastSave;
     static final float[] SPEEDS = {1f, 1.25f, 1.5f, 1.75f, 2f, 0.75f};
@@ -125,6 +126,21 @@ public class ReaderActivity extends Activity {
     @Override protected void onResume() {
         super.onResume();
         immersive();
+        resumeSync();
+    }
+
+    /** Back on screen: pick up what the background service did meanwhile, and wake it if the playhead is outside the mapped area. */
+    void resumeSync() {
+        try {
+            if (item == null || !fileMode || bi == null) return;
+            if (BookText.alignFile(this, item.id).lastModified() > alReloaded) loadSyncData();
+            double t = Player.pos();
+            if (!SyncService.running && SyncService.wanted(this, item.id) && Whisper.hasModel(this)
+                    && (!SyncService.winReady(this, item.id) || al.wordAtTime(t) < 0)) {
+                Dbg.i("Sync", "back in the book at " + (int) t + " s: not mapped here, waking the sync");
+                SyncService.start(this, item.id);
+            }
+        } catch (Throwable e) { Dbg.e("Reader", "resumeSync failed", e); }
     }
 
     @Override protected void onDestroy() {
@@ -316,6 +332,13 @@ public class ReaderActivity extends Activity {
             }
         }
         if (SyncService.running && SyncService.itemId == item.id && now - alReloaded > 10000) loadSyncData();
+        // listening on: when the mapped area is running out ahead of the playhead, wake the service so it maps the next part
+        if (st == 1 && !SyncService.running && now - lastFollowStart > 60000 && bi != null && al.size() > 0
+                && SyncService.wanted(this, item.id) && Whisper.hasModel(this) && al.wordAtTime(t + 120) < 0) {
+            lastFollowStart = now;
+            Dbg.i("Sync", "playing at " + (int) t + " s, nothing mapped 2 min ahead: mapping the next part");
+            SyncService.start(this, item.id);
+        }
         updatePin();
     }
 
@@ -965,74 +988,25 @@ public class ReaderActivity extends Activity {
     void ensureText(Runnable next) {
         if (BookText.ready(this, item.id)) { next.run(); return; }
         final boolean[] cancel = fcancel;
-        setMsg("Reading the book's text… 0%", 0);
-        setBtns("Cancel", (Runnable) this::closePanel);
-        new Thread(() -> {
-            try {
-                BookIndex got = BookText.extract(this, item, pc -> ui(() -> { if (!cancel[0]) setMsg("Reading the book's text… " + pc + "%", pc); }), cancel);
-                if (BookText.looksScanned(got)) {
-                    BookText.forget(this, item.id);
-                    ui(() -> fail("This PDF is made of page pictures (a scan), so there is no text to match against."));
-                } else { loadSyncData(); ui(() -> { if (!cancel[0]) next.run(); }); }
-            } catch (Exception e) {
-                ui(() -> { if (!cancel[0]) fail("Couldn't read the text of this PDF."); });
+        final long t0 = System.currentTimeMillis();
+        // the service reads the book's text: it carries on when this panel is closed or the screen is off
+        SyncService.textPct = 0;
+        if (!SyncService.running) SyncService.start(this, item.id);
+        setMsg("Reading the book's text… 0%\n\nIt keeps going in the background. You can close this.", 0);
+        setBtns("Hide", (Runnable) this::closePanel, "Cancel", (Runnable) () -> { SyncService.stop(this); closePanel(); });
+        h.postDelayed(new Runnable() {
+            @Override public void run() {
+                if (cancel[0] || isFinishing()) return;
+                if (BookText.ready(ReaderActivity.this, item.id)) { loadSyncData(); next.run(); return; }
+                int pc = SyncService.textPct;
+                if (!SyncService.running && System.currentTimeMillis() - t0 > 4000) {
+                    fail(SyncService.error.isEmpty() ? "Couldn't read the text of this PDF." : SyncService.error);
+                    return;
+                }
+                if (pc >= 0) setMsg("Reading the book's text… " + pc + "%\n\nIt keeps going in the background. You can close this.", pc);
+                h.postDelayed(this, 500);
             }
-        }).start();
-    }
-
-    static class Probe { double t; PageMatcher.Result r; String text; }
-
-    /** Listens to 20 seconds starting at t and works out which page they come from. Slow: background thread only. */
-    Probe probe(double t) throws Exception {
-        Probe p = new Probe();
-        p.t = t;
-        long t0 = Dbg.now();
-        float[] pcm = AudioClip.decode(this, item.audio, t, 12);
-        long msDec = Dbg.ms(t0);
-        if (pcm.length < 16000 * 5) { Dbg.w("Probe", "at " + (int) t + " s: too little audio (" + pcm.length / 16000 + " s)"); return null; }
-        long t1 = Dbg.now();
-        String txt = Whisper.transcribe(this, pcm);
-        long msTr = Dbg.ms(t1);
-        if (txt == null) throw new Exception("speech model failed");
-        p.text = txt.trim();
-        long t2 = Dbg.now();
-        p.r = BookText.matcher(this, item.id, n).match(p.text);
-        Dbg.p("Probe", "listen at " + (int) t + " s", t0, "decode " + msDec + " ms, speech " + msTr + " ms, match " + Dbg.ms(t2) + " ms, heard " + p.text.split("\\s+").length + " words -> " + (p.r == null ? "no result" : "page " + (p.r.page + 1) + (p.r.sure ? " sure" : " not sure")));
-        if (p.r != null && p.r.sure) BookText.addSample(this, item.id, t, p.r.page);   // remember it: later searches start closer
-        return p;
-    }
-
-    String quote(String s) {
-        s = s.replaceAll("\\s+", " ").trim();
-        return s.length() > 110 ? "“" + s.substring(0, 110) + "…”" : "“" + s + "”";
-    }
-
-    void runFindMine() {
-        final double t0 = aT;
-        final boolean[] cancel = fcancel;
-        setMsg("Listening to the audio at " + fmtT(t0) + "…", -1);
-        setBtns("Cancel", (Runnable) this::closePanel);
-        new Thread(() -> {
-            try {
-                Probe p = probe(Math.max(0, t0 - 3));
-                if (cancel[0]) return;
-                ui(() -> {
-                    if (cancel[0]) return;
-                    if (p == null || p.r == null || !p.r.sure) {
-                        fail("I couldn't match this part with confidence" + (p != null && !p.text.isEmpty() ? ".\n\nHeard: " + quote(p.text) : ".")
-                                + "\n\nPause on a stretch of someone speaking the book (not music, an intro or silence) and try again.");
-                        return;
-                    }
-                    final int pg = p.r.page;
-                    setMsg("At " + fmtT(t0) + " the audio is on page " + (pg + 1) + (p.r.spansTwo ? " (close to the break with page " + (p.r.second + 1) + ")" : "")
-                            + ".\n\nHeard: " + quote(p.text), -1);
-                    setBtns("Pin page " + (pg + 1) + " here", (Runnable) () -> { goTo(pg, false); pinAt(pg, t0); closePanel(); },
-                            "Go to page", (Runnable) () -> { goTo(pg, false); closePanel(); });
-                });
-            } catch (Exception e) {
-                ui(() -> { if (!cancel[0]) fail("Couldn't read that audio file."); });
-            }
-        }).start();
+        }, 500);
     }
 
     void findMyPage() {
@@ -1058,105 +1032,6 @@ public class ReaderActivity extends Activity {
     }
 
     void findMyPageListening() { prepare("Find my page", "This listens to a few seconds of the audio at your position and finds the page in the book.", "Find", false, this::runFindFast); }
-
-    /** Where to listen next. Only used to choose where to probe, never as the answer. */
-    double guessTime(double[] lo, double[] hi, int target, double dur) {
-        double rate = dur > 0 ? (n - 1) / dur : 0.01;
-        if (lo != null && hi != null && hi[1] > lo[1]) return lo[0] + (target - lo[1]) * (hi[0] - lo[0]) / (hi[1] - lo[1]);
-        if (lo != null) { double r = lo[0] > 60 && lo[1] > 0 ? lo[1] / lo[0] : rate; return lo[0] + (target - lo[1]) / r; }
-        if (hi != null) { double r = hi[0] > 60 && hi[1] > 0 ? hi[1] / hi[0] : rate; return hi[0] - (hi[1] - target) / r; }
-        return target * dur / Math.max(1, n - 1);
-    }
-
-    void runSearch(int target) {
-        final boolean[] cancel = fcancel;
-        final double dur = aDur;
-        Dbg.i("Search", "looking for page " + (target + 1) + " (audio " + (int) dur + " s)");
-        new Thread(() -> {
-            long started = System.currentTimeMillis();
-            double[] lo = null, hi = null, exact = null;
-            List<double[]> refs = new ArrayList<>(anchors);
-            refs.addAll(BookText.samples(this, item.id));
-            for (double[] k : refs) {
-                if ((int) k[1] == target && (exact == null || k[0] < exact[0])) exact = k;
-                if (k[1] < target && (lo == null || k[1] > lo[1] || (k[1] == lo[1] && k[0] > lo[0]))) lo = new double[]{k[0], k[1]};
-                if (k[1] > target && (hi == null || k[1] < hi[1] || (k[1] == hi[1] && k[0] < hi[0]))) hi = new double[]{k[0], k[1]};
-            }
-            if (exact != null) {
-                // already checked earlier: no listening needed
-                final double et = exact[0];
-                ui(() -> {
-                    if (cancel[0]) return;
-                    setMsg("Page " + (target + 1) + " is read at about " + fmtT(et) + " (checked earlier, so this was instant).", -1);
-                    setBtns("Play and pin", (Runnable) () -> { pinAt(target, et); seekAbs(et, true); closePanel(); },
-                            "Play only", (Runnable) () -> { seekAbs(et, true); closePanel(); });
-                });
-                return;
-            }
-            double t = Math.max(0, Math.min(dur - 25, guessTime(lo, hi, target, dur)));
-            double found = -1;
-            int unclear = 0;
-            List<Double> tried = new ArrayList<>();
-            try {
-                for (int i = 0; i < 10 && found < 0; i++) {
-                    if (cancel[0]) return;
-                    final int step = i;
-                    final double tt = t;
-                    ui(() -> { if (!cancel[0]) { setMsg("Searching for page " + (target + 1) + "… checking " + fmtT(tt) + " (step " + (step + 1) + " of up to 10)", step * 10); setBtns("Cancel", (Runnable) this::closePanel); } });
-                    tried.add(t);
-                    Probe p = probe(t);
-                    if (p == null || p.r == null || !p.r.sure) {
-                        if (++unclear > 3) break;
-                        t = Math.min(dur - 25, t + 30);
-                        continue;
-                    }
-                    unclear = 0;
-                    int pg = p.r.page;
-                    if (pg == target || (p.r.spansTwo && p.r.second == target)) { found = t; break; }
-                    if (pg < target) { if (lo == null || pg > lo[1] || (pg == lo[1] && t > lo[0])) lo = new double[]{t, pg}; }
-                    else { if (hi == null || pg < hi[1] || (pg == hi[1] && t < hi[0])) hi = new double[]{t, pg}; }
-                    double nt = guessTime(lo, hi, target, dur);
-                    if (Math.abs(nt - t) < 8) nt = t + (pg < target ? 12 : -12);
-                    nt = Math.max(0, Math.min(dur - 25, nt));
-                    boolean again = false;
-                    for (double x : tried) if (Math.abs(x - nt) < 3) again = true;
-                    if (again) break;
-                    t = nt;
-                }
-                // walk back a little so playback starts near the top of the page
-                if (found > 0) {
-                    for (int k = 0; k < 4 && found >= 12; k++) {
-                        if (cancel[0]) return;
-                        final double ft = found;
-                        ui(() -> { if (!cancel[0]) setMsg("Found page " + (target + 1) + " around " + fmtT(ft) + ". Finding where it starts…", 90); });
-                        Probe b = probe(found - 12);
-                        if (b != null && b.r != null && b.r.sure && (b.r.page == target || (b.r.spansTwo && b.r.second == target && b.r.page != target - 1))) found -= 12;
-                        else break;
-                    }
-                }
-            } catch (Exception e) {
-                ui(() -> { if (!cancel[0]) fail("Couldn't read that audio file."); });
-                return;
-            }
-            if (cancel[0]) { Dbg.i("Search", "cancelled"); return; }
-            Dbg.i("Search", "page " + (target + 1) + (found >= 0 ? " found at " + (int) found + " s" : " NOT found") + " after " + tried.size() + " probes, " + (System.currentTimeMillis() - started) + " ms");
-            final double ft = found;
-            final double[] flo = lo;
-            ui(() -> {
-                if (cancel[0]) return;
-                if (ft >= 0) {
-                    setMsg("Page " + (target + 1) + " is read at about " + fmtT(ft) + ". Checked against the book, not a guess. Took " + (System.currentTimeMillis() - started) / 1000 + " s.", -1);
-                    setBtns("Play and pin", (Runnable) () -> { pinAt(target, ft); seekAbs(ft, true); closePanel(); },
-                            "Play only", (Runnable) () -> { seekAbs(ft, true); closePanel(); });
-                } else {
-                    String near = flo != null ? "\n\nClosest I could verify: page " + ((int) flo[1] + 1) + " at " + fmtT(flo[0]) + "." : "";
-                    if (flo != null) setBtns("Go there", (Runnable) () -> { seekAbs(flo[0], false); closePanel(); }, "Close", (Runnable) this::closePanel);
-                    else setBtns("Close", (Runnable) this::closePanel);
-                    setMsg("I couldn't confirm page " + (target + 1) + " in the audio. The audio may skip it, be abridged, or differ from this edition." + near, -1);
-                }
-            });
-        }).start();
-    }
 
     void pinAt(int page, double t) {
         Dbg.i("Pin", "page " + (page + 1) + " = " + fmtT(Math.floor(t)));

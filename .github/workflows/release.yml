@@ -1,7 +1,7 @@
 # Push to main (or run manually) -> builds the APK and publishes release v<versionName>, creating the tag.
 # Skips if that release already exists, so bump versionName in app/build.gradle for each update.
 # The in-app "Check for update" reads that release.
-# One-time setup: repo secret DEBUG_KEYSTORE_B64 = base64 of the signing keystore (keep it the same forever so updates install).
+# One-time setup: repo secret SIGNING_PASSPHRASE (short text) decrypts signing/dl.keystore.enc. Never change the key: updates would stop installing.
 name: release
 on:
   push:
@@ -23,11 +23,11 @@ jobs:
           yes | $SM --licenses > /dev/null || true
           $SM "platforms;android-36" "ndk;27.2.12479018" "cmake;3.22.1"
       - name: Signing key
-        env: { KS: '${{ secrets.DEBUG_KEYSTORE_B64 }}' }
+        env: { PASS: '${{ secrets.SIGNING_PASSPHRASE }}' }
         run: |
-          if [ -z "$KS" ]; then echo "::error::Missing secret DEBUG_KEYSTORE_B64"; exit 1; fi
-          echo "$KS" | tr -d '[:space:]' | base64 -d > "$RUNNER_TEMP/dl.keystore"
-          keytool -list -keystore "$RUNNER_TEMP/dl.keystore" -storepass android > /dev/null || { echo "::error::DEBUG_KEYSTORE_B64 is not a valid keystore (alias androiddebugkey, password android)"; exit 1; }
+          if [ -z "$PASS" ]; then echo "::error::Missing secret SIGNING_PASSPHRASE (a short passphrase; the keystore itself is signing/dl.keystore.enc)"; exit 1; fi
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 300000 -pass env:PASS -in signing/dl.keystore.enc -out "$RUNNER_TEMP/dl.keystore" || { echo "::error::SIGNING_PASSPHRASE is wrong (could not decrypt signing/dl.keystore.enc). Check it for typos."; exit 1; }
+          keytool -list -keystore "$RUNNER_TEMP/dl.keystore" -storepass android > /dev/null || { echo "::error::decrypted file is not a valid keystore"; exit 1; }
           echo "DAYSLEFT_KEYSTORE=$RUNNER_TEMP/dl.keystore" >> $GITHUB_ENV
       - name: Version and skip check
         id: v
@@ -45,7 +45,7 @@ jobs:
           AS=$(ls $ANDROID_HOME/build-tools/*/apksigner | tail -1)
           got=$($AS verify --print-certs app/build/outputs/apk/debug/app-debug.apk | grep -m1 "SHA-256 digest" | sed 's/.*: *//' | tr 'A-F' 'a-f')
           echo "key in secret: $want"; echo "key in APK:    $got"
-          [ "$want" = "$got" ] || { echo "::error::APK is not signed with the key from DEBUG_KEYSTORE_B64"; exit 1; }
+          [ "$want" = "$got" ] || { echo "::error::APK is not signed with the key from SIGNING_PASSPHRASE"; exit 1; }
       - if: steps.v.outputs.skip == 'false'
         run: cp app/build/outputs/apk/debug/app-debug.apk DaysLeft-${{ steps.v.outputs.tag }}.apk
       - if: steps.v.outputs.skip == 'false'

@@ -34,7 +34,7 @@ final class SyncPlanner {
     final int words;
     final TreeMap<Double, Integer> anchors = new TreeMap<>();
     private double fwdCursor, bwdEnd, fwdStride, bwdStride;
-    private int fwdN, bwdN, fwdFails, bwdFails, seedTry;
+    private int fwdN, bwdN, fwdFails, bwdFails, seedTry, seedsGiven;
     private boolean fwdDone, bwdDone, turnFwd = true, seeded;
     private final Map<Long, Integer> gapTries = new HashMap<>();
     private final Set<Long> badGaps = new HashSet<>();
@@ -92,6 +92,16 @@ final class SyncPlanner {
         double covered = 0, pt = -1;
         for (Double t : anchors.subMap(lo, true, hi, true).keySet()) { if (pt >= 0 && t - pt <= DENSE_GAP) covered += t - pt; pt = t; }
         return new double[]{covered, Math.max(1, hi - lo)};
+    }
+
+    /**
+     * Make the window bigger. The two walking directions were marked finished when the small window was done, so they
+     * must be woken again, otherwise the wider window is never filled (this was a real bug: only +-150 s ever got mapped).
+     */
+    void widen(double newReach) {
+        reach = newReach;
+        fwdDone = bwdDone = false;
+        fwdFails = bwdFails = 0;
     }
 
     int anchorCount() { return anchors.size(); }
@@ -221,16 +231,20 @@ final class SyncPlanner {
     }
 
     private Req seed() {
-        if (seedTry >= SEED_TRIES) { lost = true; return null; }
-        int n = seedTry++;
-        // user's place, then alternating further away (intro music, silence, a skipped part)
-        double off = ((n + 1) / 2) * 60.0 * (n % 2 == 1 ? 1 : -1);
-        double s = startSec + (n == 0 ? 0 : off);
-        if (s < 0 || s > total - 10) s = Math.max(0, Math.min(total - 10, startSec + Math.abs(off)));
-        Req r = new Req();
-        r.kind = 0; r.start = s; r.len = Math.min(PROBE, total - s);
-        r.lo = 0; r.hi = words; r.wide = true; r.why = "seed #" + (n + 1);
-        return r;
+        // the user's place, then alternately further away (intro music, silence, a skipped part); out-of-range ones are skipped
+        while (seedTry < SEED_TRIES * 2) {
+            int n = seedTry++;
+            double off = ((n + 1) / 2) * 60.0 * (n % 2 == 1 ? 1 : -1);
+            double s = startSec + (n == 0 ? 0 : off);
+            if (s < 0 || s > total - 10) continue;
+            Req r = new Req();
+            r.kind = 0; r.start = s; r.len = Math.min(PROBE, total - s);
+            r.lo = 0; r.hi = words; r.wide = true; r.why = "seed #" + (n + 1);
+            seedsGiven++;
+            return r;
+        }
+        lost = true;
+        return null;
     }
 
     private Req forward() {

@@ -71,7 +71,9 @@ class BookIndex {
         return m;
     }
 
-    void save(File f) throws IOException {
+    /** Writes to a temporary file and renames it, so a reader never sees a half-written index. */
+    void save(File dest) throws IOException {
+        File f = new File(dest.getPath() + ".tmp");
         try (DataOutputStream o = new DataOutputStream(new BufferedOutputStream(new FileOutputStream(f), 1 << 16))) {
             o.writeInt(0xB00C0002);
             o.writeInt(pages);
@@ -82,6 +84,8 @@ class BookIndex {
                 for (int k = 0; k < 4; k++) o.writeFloat(box[j * 4 + k]);
             }
         }
+        dest.delete();
+        if (!f.renameTo(dest)) throw new IOException("could not save the book index");
     }
 
     static BookIndex load(File f) throws IOException {

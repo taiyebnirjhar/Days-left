@@ -67,6 +67,11 @@ class Whisper {
 
     private static void ensureCtx(Context c) {
         appCtx = c.getApplicationContext();
+        if (Store.num(appCtx, "wThrV", 0) != 2) {   // thread tuning method changed: measure again
+            android.content.SharedPreferences.Editor e = Store.sp(appCtx).edit().remove("wThr").remove("wThrN").putInt("wThrV", 2);
+            for (int t : CAND) e.remove("wThrT" + t);
+            e.apply();
+        }
         int m = which(c);
         if (ctx != 0 && ctxModel != m) { nFree(ctx); ctx = 0; }
         if (ctx == 0) {
@@ -90,14 +95,16 @@ class Whisper {
         return curThreads = Math.max(2, Math.min(CAND[n % CAND.length], cores));
     }
 
-    /** Remember how long a full-size call took with the thread count it used. */
+    /** Remember how long a call took with the thread count it used; each count is tried twice and the better run counts. */
     private static void tuned(long ms) {
         if (appCtx == null || Store.num(appCtx, "wThr", 0) > 0) return;
         int n = Store.num(appCtx, "wThrN", 0);
-        Store.setNum(appCtx, "wThrT" + curThreads, (int) Math.min(Integer.MAX_VALUE, ms));
+        String k = "wThrT" + curThreads;
+        int old = Store.num(appCtx, k, 0);
+        Store.setNum(appCtx, k, old > 0 ? (int) Math.min(old, ms) : (int) Math.min(Integer.MAX_VALUE, ms));
         Store.setNum(appCtx, "wThrN", n + 1);
         Dbg.i("Whisper", "tuning: " + curThreads + " threads took " + ms + " ms");
-        if (n + 1 >= CAND.length) {
+        if (n + 1 >= CAND.length * 2) {
             int bestT = 4; long bestMs = Long.MAX_VALUE;
             for (int t : CAND) { int v = Store.num(appCtx, "wThrT" + t, 0); if (v > 0 && v < bestMs) { bestMs = v; bestT = t; } }
             Store.setNum(appCtx, "wThr", bestT);

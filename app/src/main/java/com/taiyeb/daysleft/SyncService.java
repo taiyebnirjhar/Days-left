@@ -27,6 +27,8 @@ public class SyncService extends Service {
     static volatile boolean idle;
     /** Speech model download progress (0..100) while the service is downloading, else -1. */
     static volatile int dlPct = -1;
+    /** Book text reading progress (0..100) while the service is reading it, else -1. */
+    static volatile int textPct = -1;
     /** The reader asks: when is this book word spoken? (-1 none). The answer appears in goalTimeOut (-1 working, -2 not found). */
     static volatile int goalWordReq = -1;
     static volatile double goalTimeOut = -1;
@@ -153,14 +155,14 @@ public class SyncService extends Service {
                 BookIndex got;
                 try {
                     got = BookText.extract(this, it, pc -> {
-                        stop[0] = cancel; dlPct = -1;
+                        stop[0] = cancel; dlPct = -1; textPct = pc;
                         long now = System.currentTimeMillis();
                         if (now - lastN[0] > 1000) { lastN[0] = now; nm.notify(7100, note("Reading the book's text… " + pc + "%", pc, false)); }
                     }, stop);
                 } catch (Exception e) {
                     if (cancel) return;
                     throw e;
-                }
+                } finally { textPct = -1; }
                 if (BookText.looksScanned(got)) { BookText.forget(this, id); throw new Exception("This PDF is made of page pictures (a scan), so there is no text to match against."); }
             }
             BookIndex bi = BookText.index(this, id);
@@ -193,7 +195,7 @@ public class SyncService extends Service {
                 if (batch.isEmpty()) {
                     if (pl.lost) break;
                     if (stage < STAGES.length - 1) {
-                        stage++; pl.reach = STAGES[stage]; widening = true;
+                        stage++; pl.widen(STAGES[stage]); widening = true;
                         idle = true;   // the small ring is done: usable now, the wider ring is filled in quietly
                         Store.sp(this).edit().putBoolean("syncWin_" + id, true).putInt("syncPct_" + id, 100).apply();
                         Dbg.i("Sync", "ready around " + (int) Player.pos() + " s after " + probes + " probes; widening to +-" + (int) STAGES[stage] + " s");
@@ -274,7 +276,7 @@ public class SyncService extends Service {
             Dbg.e("Sync", "failed (serious)", t);
         } finally {
             Dbg.i("Sync", (complete ? "finished" : cancel ? "stopped" : error.isEmpty() ? "ended" : "ended with error: " + error) + " at " + (int) doneSec + " of " + (int) totalSec + " s");
-            running = false; idle = false; hereWord = -1;
+            running = false; idle = false; hereWord = -1; textPct = -1; dlPct = -1;
             AudioClip.closeCache();
             Whisper.abort(false);
             if (wl != null && wl.isHeld()) wl.release();
