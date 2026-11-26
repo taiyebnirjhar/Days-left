@@ -8,6 +8,7 @@ public class SyncSim {
     static String[] book; static double[] tw; static int N;
     static double total;
 
+    static double introSec = 30;
     static void build(long seed, double hours, double sttSpeed) {
         rnd = new Random(seed);
         N = (int) (hours * 3600 * 2.6);
@@ -16,7 +17,7 @@ public class SyncSim {
         double[] cum = new double[V]; double s = 0;
         for (int i = 0; i < V; i++) { s += 1.0 / (i + 8); cum[i] = s; }
         for (int i = 0; i < N; i++) { double x = rnd.nextDouble() * s; int lo = 0, hi = V - 1; while (lo < hi) { int m = (lo + hi) / 2; if (cum[m] < x) lo = m + 1; else hi = m; } book[i] = "w" + lo; }
-        double t = 30;                       // 30 s of intro music
+        double t = introSec;                 // intro music / publisher text that is not in the book
         double pace = 2.6;
         for (int i = 0; i < N; i++) {
             if (i % 400 == 0) pace = Math.max(1.8, Math.min(3.4, pace + rnd.nextGaussian() * 0.25));
@@ -67,6 +68,7 @@ public class SyncSim {
 
     static int calls;       // speech-model calls: the real cost unit (one call = one 30 s window, about 10 s on the phone with the tiny model)
     static double listened;
+    static final Map<Long, Integer> startCount = new HashMap<>();   // how often each probe start was asked for
     static double lastCost;   // seconds the last call would take on the phone (speech 2.0 + 0.17/s of audio, decode 0.9 per piece)
     static boolean realCost;
 
@@ -78,9 +80,11 @@ public class SyncSim {
         double audio = 0; for (SyncPlanner.Req r0 : b) audio += r0.len;
         lastCost = 2.0 + 0.17 * audio + 0.9 * b.size();
         for (SyncPlanner.Req r : b) {
+            startCount.merge(Math.round(r.start * 10), 1, Integer::sum);
             List<String> w = new ArrayList<>(); List<Double> t = new ArrayList<>();
             hear(r.start, r.len, w, t);
             double[] tt = new double[t.size()]; for (int i = 0; i < tt.length; i++) tt[i] = t.get(i);
+            r.heard = w.size();
             p.feed(r, al.align(w.toArray(new String[0]), tt, r.lo, r.hi));
             listened += r.len;
         }
@@ -173,6 +177,37 @@ public class SyncSim {
                 SyncPlanner.PROBE, SyncPlanner.DENSE_NEAR, SyncPlanner.NEAR_AHEAD, sumFirst / runs, sumFirstSec / runs, sumAvail / runs, wrongAll, shownAll, med, p95, worstAll);
         if (sumFirst / runs > 6 || sumAvail / runs < 90 || wrongAll * 100 > Math.max(1, shownAll) * 3) bad++;
         SyncPlanner.DENSE_NEAR = 20; SyncPlanner.NEAR_AHEAD = 150; SyncPlanner.PROBE = 9;
+
+        // ---- 1e. real-life log (v3.37): the audio opens with 7 minutes that are NOT in the book (other edition, publisher text); the playhead sits at 3 s.
+        // The first seeds find nothing; one seed far ahead matches. v3.37 started over at the playhead after every call (a "jump"), re-listened to the same 3 probes
+        // for ever and showed 47% progress for nothing. Now: no repeated probes, the island is mapped, no 'lost', and the highlight appears once the playhead reaches the book. ----
+        for (int pausedRun = 0; pausedRun < 2; pausedRun++) {
+            boolean paused = pausedRun == 1;   // the real log: the player stood still at 21 s while the sync listened
+            introSec = 420;
+            build(61, hours, callSec);
+            int[] ps4 = {0, N};
+            Aligner al4 = new Aligner(new BookIndex(book, ps4, new float[N * 4], new byte[N]));
+            double playhead = 3;
+            SyncPlanner p = new SyncPlanner(total, playhead, N, new int[0], new double[0]);
+            p.reach = 150; p.dense = true;
+            startCount.clear(); int nCalls = 0, firstShow = -1; boolean widened = false;
+            for (int i = 0; i < 300; i++) {
+                p.recenter(playhead);
+                boolean work = step(p, al4);
+                if (work) nCalls++;
+                if (!work && !widened) { p.widen(600); widened = true; }
+                if (p.lost) break;
+                if (!paused) playhead += work ? lastCost : 2;
+                p.recenter(playhead);
+                if (snapshot(p).gapAt(playhead) <= 25 && firstShow < 0) firstShow = i + 1;
+            }
+            int maxRepeat = 0; for (int c : startCount.values()) maxRepeat = Math.max(maxRepeat, c);
+            if (System.getProperty("dbg") != null) startCount.forEach((k, v) -> { if (v > 2) System.out.println("   repeated: " + k / 10.0 + " s x" + v); });
+            System.out.printf((paused ? "[player paused] " : "") + "audio opens with 7 min that are not in the book (playhead at 3 s): %d calls, same probe asked at most %d time(s), lost %s, %d anchors, highlight %s%n",
+                    nCalls, maxRepeat, p.lost, p.anchorCount(), firstShow < 0 ? "never (playhead " + (int) playhead + " s)" : "from call " + firstShow);
+            if (maxRepeat > 2 || p.lost || (!paused && firstShow < 0)) bad++;
+            introSec = 30;
+        }
 
         // ---- 1d. the failing real-life case: listen, jump far away with Play page (a search maps a small island there), keep listening ----
         {

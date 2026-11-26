@@ -18,12 +18,14 @@ class Aligner {
     private final BookIndex bi;
     /** The narrator's usual words per second, if known: a match whose implied pace is far from it is a false match. 0 = unknown. */
     volatile double paceHint;
+    /** Why the last align() gave no answer (for the debug log). */
+    static volatile String lastWhy = "";
     Aligner(BookIndex bi) { this.bi = bi; }
 
     /** words[i] was spoken at times[i]. Only book positions in [lo, hi] are considered. */
     Out align(String[] words, double[] times, int lo, int hi) {
         int m = words.length;
-        if (m < 8) return null;
+        if (m < 8) { lastWhy = "too few words heard"; return null; }
         Map<Long, int[]> idx = bi.bigrams();
         int[][] hits = new int[m][];
         Map<Integer, Integer> votes = new HashMap<>();
@@ -39,7 +41,7 @@ class Aligner {
             int v = e.getValue() + votes.getOrDefault(b - 1, 0) + votes.getOrDefault(b + 1, 0);
             if (v > bestV) { bestV = v; best = b; }
         }
-        if (bestV < 4) return null;
+        if (bestV < 4) { lastWhy = "no run of words agreed with one place in the book"; return null; }
         int center = best * 6 + 3;
         // candidate pairs near that diagonal
         List<int[]> cand = new ArrayList<>();   // {i, pos}
@@ -51,7 +53,7 @@ class Aligner {
         }
         // longest run that keeps increasing in book position
         int c = cand.size();
-        if (c < 3) return null;
+        if (c < 3) { lastWhy = "too few words on the best line"; return null; }
         int[] tail = new int[c], prev = new int[c];
         int len = 0;
         for (int k = 0; k < c; k++) {
@@ -61,7 +63,7 @@ class Aligner {
             tail[lo2] = k;
             if (lo2 == len) len++;
         }
-        if (len < 3) return null;
+        if (len < 3) { lastWhy = "best chain too short"; return null; }
         int[] seq = new int[len];
         for (int k = tail[len - 1], at = len - 1; k >= 0 && at >= 0; k = prev[k], at--) seq[at] = k;
         Out o = new Out();
@@ -87,12 +89,12 @@ class Aligner {
         int c = 0;
         for (int i = 0; i < n; i++) for (int j = i + 1; j < n; j++)
             if (o.pos[j] > o.pos[i]) sl[c++] = (o.time[j] - o.time[i]) / (o.pos[j] - o.pos[i]);
-        if (c < 3) return null;
+        if (c < 3) { lastWhy = "too few word pairs"; return null; }
         double[] ss = Arrays.copyOf(sl, c);
         Arrays.sort(ss);
         double m = ss[c / 2];
-        if (m < 0.16 || m > 0.85) return null;      // outside 1.2..6 words per second: not a person reading this book (a false match)
-        if (hint > 0 && (1 / m < 0.5 * hint || 1 / m > 1.8 * hint)) return null;   // far from this narrator's pace: a false match
+        if (m < 0.16 || m > 0.85) { lastWhy = "speech pace outside 1.2-6 words/s"; return null; }       // outside 1.0..7 words per second: not a person reading this book (a false match)
+        if (hint > 0 && (1 / m < 0.5 * hint || 1 / m > 1.8 * hint)) { lastWhy = "pace far from this narrator's"; return null; }   // far from this narrator's pace: a false match
         double[] ic = new double[n];
         for (int i = 0; i < n; i++) ic[i] = o.time[i] - m * o.pos[i];
         double[] sc = ic.clone();
@@ -101,7 +103,7 @@ class Aligner {
         int keep = 0;
         boolean[] ok = new boolean[n];
         for (int i = 0; i < n; i++) if (Math.abs(ic[i] - b) <= 1.5) { ok[i] = true; keep++; }
-        if (keep < 3) return null;
+        if (keep < 3) { lastWhy = "matched words not on one straight line"; return null; }
         if (keep == n) return o;
         Out r = new Out();
         r.pos = new int[keep]; r.time = new double[keep];

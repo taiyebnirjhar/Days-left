@@ -31,10 +31,12 @@ final class SyncPlanner {
         String why = "";
         double gapLeftT, gapRightT;    // kind 3: identifies the gap
         double prevT; int prevW; // kind 1/2: the anchor the prediction is measured from
+        int heard = 99;          // words the speech model heard in this piece (set by the caller before feed): a piece with speech but no match is NOT silence
     }
 
     final double total;
     double startSec;
+    private double placedAt = -1e9;
     final int words;
     final TreeMap<Double, Integer> anchors = new TreeMap<>();
     private double fwdCursor, bwdEnd, fwdStride, bwdStride;
@@ -96,7 +98,8 @@ final class SyncPlanner {
             double old = startSec;
             startSec = pos;                       // the window follows the playhead
             int r = Math.abs(pos - old) > 1 ? 1 : 0;
-            if (pos > fwdCursor + 60 || pos < bwdEnd - 60) {
+            if ((pos > fwdCursor + 60 || pos < bwdEnd - 60) && Math.abs(pos - placedAt) > 2) {   // only if the playhead MOVED since the last placement
+                placedAt = pos;
                 // jumped to another mapped stretch (Play page, a seek): the cursors still sit where we were before, so move them here
                 placeCursors(pos);
                 fwdDone = bwdDone = false;
@@ -107,7 +110,10 @@ final class SyncPlanner {
             if (bwdDone && bwdEnd > startSec - reach && bwdEnd > 8) { bwdDone = false; bwdFails = 0; r = 1; }
             return r;
         }
-        // jumped somewhere nothing is mapped: look again there
+        // Nothing is mapped near the playhead. Starting over at the playhead is right when it moved (a seek, or playing on: the search follows it),
+        // but a playhead that has NOT moved since the last start (paused) must not restart the search: the v3.37 log repeated the same three probes for
+        // ever and never got further than the first one that matched.
+        if (Math.abs(pos - startSec) < 5) return 0;
         startSec = pos;
         fwdDone = bwdDone = false;
         fwdFails = bwdFails = 0; fwdN = bwdN = 0; fwdStride = bwdStride = 0;
@@ -469,7 +475,7 @@ final class SyncPlanner {
     int feed(Req r, Aligner.Out o) {
         int kept = 0;
         boolean ok = o != null && o.pos.length >= (r.kind == 0 ? 5 : 3) && (r.kind != 0 || o.votes >= 6);
-        if (!ok && r.kind == 0) voids.add(new double[]{r.start, r.start + r.len});
+        if (!ok && r.kind == 0 && r.heard < 6) voids.add(new double[]{r.start, r.start + r.len});
         if (r.kind == 0) {
             if (ok) { kept = add(o); seeded = true; placeCursors((o.time[0] + o.time[o.time.length - 1]) / 2); }
             return kept;
@@ -491,12 +497,12 @@ final class SyncPlanner {
         }
         boolean fwd = r.kind == 1;
         if (!ok) {
-            if (fwd) voids.add(new double[]{r.start, r.start + r.len + 20}); else voids.add(new double[]{r.start - 20, r.start + r.len});
+            if (r.heard < 6) { if (fwd) voids.add(new double[]{r.start, r.start + r.len + 20}); else voids.add(new double[]{r.start - 20, r.start + r.len}); }
             if (fwd) { fwdFails++; fwdCursor += 20; fwdStride = Math.max(0, fwdStride / 2); if (fwdFails >= EXT_FAILS_GIVE_UP) { fwdDone = true; lost = true; } }
             else {
                 bwdFails++; bwdEnd -= 20; bwdStride = Math.max(0, bwdStride / 2);
                 if (r.start < 40) bwdDone = true;   // the start of the audio is usually an intro that is not in the book
-                else if (bwdFails >= EXT_FAILS_GIVE_UP) { bwdDone = true; lost = true; }
+                else if (bwdFails >= EXT_FAILS_GIVE_UP) { bwdDone = true; lost = anchors.size() < 3; }   // text before the first match that the book does not have (an intro) is not 'lost'
             }
             return 0;
         }

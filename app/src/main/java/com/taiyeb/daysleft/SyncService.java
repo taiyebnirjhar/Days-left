@@ -92,7 +92,7 @@ public class SyncService extends Service {
         if (dlPct >= 0) return "Downloading the speech model… " + dlPct + "%";
         if (textPct >= 0) return "Reading the book… " + textPct + "%";
         if (ready) return "Ready · follows you as you listen";
-        if (anchorCount == 0) return "Finding your place in the audio…";
+        if (anchorCount == 0 || statusPct() < 3) return "Finding your place in the audio…";   // nothing mapped around you yet: do not show a percentage
         int sec = etaSeconds();
         return "Syncing around you… " + statusPct() + "%" + (sec > 0 ? " · about " + (sec >= 90 ? (sec + 30) / 60 + " min" : sec + " s") : "");
     }

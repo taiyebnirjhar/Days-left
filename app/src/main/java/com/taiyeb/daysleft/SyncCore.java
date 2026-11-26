@@ -115,10 +115,11 @@ final class SyncCore {
             Heard h = parse(raws[i], q.start);
             Aligner.Out o = pcm[i].length >= 16000 * 3 ? al.align(h.words, h.times, q.lo, q.hi) : null;
             if (o != null) sink.anchors(o.pos, o.time);
+            q.heard = h.times.length;
             int kept = pl.feed(q, o);
             probes++; listened += q.len;
             sum.append("\n   ").append(q.why).append(" at ").append((int) q.start).append(" s: heard ").append(h.times.length).append(" words, ")
-                    .append(o == null ? "no match" : "matched " + o.pos.length + " (votes " + o.votes + ")").append(", kept ").append(kept)
+                    .append(o == null ? "no match (" + (pcm[i].length < 16000 * 3 ? "clip too short" : Aligner.lastWhy) + ")" : "matched " + o.pos.length + " (votes " + o.votes + ")").append(", kept ").append(kept)
                     .append(", window ").append(q.lo).append("..").append(q.hi);
         }
         sink.batch(batch.size(), msDec, msTr, sum.toString());

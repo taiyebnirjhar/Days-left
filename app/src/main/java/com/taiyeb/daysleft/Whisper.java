@@ -38,31 +38,54 @@ class Whisper {
 
     interface Progress { void on(int percent); }
 
-    /** Blocking. Call from a background thread. */
+    /**
+     * Blocking. Call from a background thread. A dropped connection (mobile data, Wi-Fi roaming) is normal for a 30-150 MB file: the
+     * partial file is kept and the download carries on from where it stopped, up to 6 tries (the first real log died on "unexpected end of stream").
+     */
     static void download(Context c, Progress pr, boolean[] cancel) throws Exception {
         int wm = which(c);
         File tmp = new File(c.getFilesDir(), MODELS[wm] + ".part");
-        HttpURLConnection con = (HttpURLConnection) new URL(BASE_URL + MODELS[wm]).openConnection();
-        con.setConnectTimeout(15000);
-        con.setReadTimeout(20000);
-        con.setInstanceFollowRedirects(true);
-        long total = con.getContentLengthLong();
-        try (InputStream in = con.getInputStream(); FileOutputStream out = new FileOutputStream(tmp)) {
-            byte[] buf = new byte[64 * 1024];
-            long got = 0;
-            int r, last = -1;
-            while ((r = in.read(buf)) > 0) {
-                if (cancel[0]) { tmp.delete(); throw new Exception("cancelled"); }
-                out.write(buf, 0, r);
-                got += r;
-                int pc = total > 0 ? (int) (got * 100 / total) : 0;
-                if (pc != last) { last = pc; pr.on(pc); }
+        Exception last = null;
+        for (int attempt = 1; attempt <= 6; attempt++) {
+            if (cancel[0]) { tmp.delete(); throw new Exception("cancelled"); }
+            try {
+                long have = tmp.exists() ? tmp.length() : 0;
+                HttpURLConnection con = (HttpURLConnection) new URL(BASE_URL + MODELS[wm]).openConnection();
+                con.setConnectTimeout(15000);
+                con.setReadTimeout(20000);
+                con.setInstanceFollowRedirects(true);
+                if (have > 0) con.setRequestProperty("Range", "bytes=" + have + "-");
+                int code = con.getResponseCode();
+                boolean resumed = code == 206;
+                if (code == 416) { tmp.delete(); continue; }                 // the partial file is not usable: start again
+                if (code != 200 && code != 206) throw new java.io.IOException("server answered " + code);
+                if (!resumed) have = 0;                                      // the server ignored Range: from the start
+                long total = con.getContentLengthLong();
+                if (total > 0) total += have;
+                try (InputStream in = con.getInputStream(); FileOutputStream out = new FileOutputStream(tmp, resumed)) {
+                    byte[] buf = new byte[64 * 1024];
+                    long got = have;
+                    int r, lastPc = -1;
+                    while ((r = in.read(buf)) > 0) {
+                        if (cancel[0]) { tmp.delete(); throw new Exception("cancelled"); }
+                        out.write(buf, 0, r);
+                        got += r;
+                        int pc = total > 0 ? (int) (got * 100 / total) : 0;
+                        if (pc != lastPc) { lastPc = pc; pr.on(pc); }
+                    }
+                }
+                if (tmp.length() < MIN_BYTES[wm]) { tmp.delete(); throw new java.io.IOException("download incomplete"); }
+                File f = modelFile(c);
+                f.delete();
+                if (!tmp.renameTo(f)) throw new Exception("could not save the model");
+                return;
+            } catch (java.io.IOException e) {
+                last = e;
+                Dbg.i("Whisper", "download interrupted (try " + attempt + " of 6, " + (tmp.exists() ? tmp.length() : 0) + " bytes kept): " + e.getMessage());
+                try { Thread.sleep(Math.min(8000, 1000L * attempt)); } catch (InterruptedException ie) { throw new Exception("cancelled"); }
             }
         }
-        if (tmp.length() < MIN_BYTES[wm]) { tmp.delete(); throw new Exception("download incomplete"); }
-        File f = modelFile(c);
-        f.delete();
-        if (!tmp.renameTo(f)) throw new Exception("could not save the model");
+        throw last != null ? last : new Exception("download failed");
     }
 
     private static void ensureCtx(Context c) {

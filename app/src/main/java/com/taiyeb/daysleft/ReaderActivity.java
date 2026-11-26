@@ -1245,16 +1245,16 @@ public class ReaderActivity extends Activity {
         aa.setOnClickListener(v -> settings.setVisibility(settings.getVisibility() == View.VISIBLE ? View.GONE : View.VISIBLE));
         lockBtn = new Glyph(3);
         lockBtn.setOnClickListener(v -> setLocked(true));
-        lockBtn.setPadding(dp(11), dp(11), dp(11), dp(11));
-        top.addView(lockBtn, new LinearLayout.LayoutParams(dp(44), dp(44)));
+        lockBtn.setPadding(dp(15), dp(10), dp(15), dp(10));   // the drawn padlock is about as tall as the 'Aa' next to it
+        top.addView(lockBtn, new LinearLayout.LayoutParams(dp(48), dp(40)));
         top.addView(aa, new LinearLayout.LayoutParams(dp(48), dp(40)));
         root.addView(top, new FrameLayout.LayoutParams(-1, -2, Gravity.TOP));
         unlockBtn = new Glyph(3);
         unlockBtn.color = 0xFFFFFFFF;
         unlockBtn.round = true;
         unlockBtn.setVisibility(View.GONE);
-        root.addView(unlockBtn, new FrameLayout.LayoutParams(dp(64), dp(64), Gravity.CENTER_VERTICAL | Gravity.START));
-        ((FrameLayout.LayoutParams) unlockBtn.getLayoutParams()).leftMargin = dp(20);
+        root.addView(unlockBtn, new FrameLayout.LayoutParams(dp(64), dp(64), Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL));
+        ((FrameLayout.LayoutParams) unlockBtn.getLayoutParams()).bottomMargin = dp(56);   // bottom middle, clear of the gesture bar
 
         // bottom area: done pill, settings panel, controls
         LinearLayout stack = new LinearLayout(this);
@@ -1699,7 +1699,8 @@ public class ReaderActivity extends Activity {
             if (round) { p.setColor(0xCC202020); c.drawCircle(w / 2, hh / 2, Math.min(w, hh) / 2, p); }
             p.setColor(color);
             if (type == 3) {
-                float in = round ? w * 0.26f : getPaddingLeft(), l = in, r = w - in, t = hh * (round ? 0.26f : 0.12f), b = hh - (round ? hh * 0.26f : hh * 0.12f);
+                float l = round ? w * 0.26f : getPaddingLeft(), r = w - (round ? w * 0.26f : getPaddingRight());
+                float t = round ? hh * 0.26f : getPaddingTop(), b = hh - (round ? hh * 0.26f : getPaddingBottom());
                 float bw = r - l, bodyTop = t + (b - t) * 0.42f;
                 c.drawRoundRect(l, bodyTop, r, b, bw * 0.16f, bw * 0.16f, p);
                 p.setStyle(Paint.Style.STROKE); p.setStrokeWidth(bw * 0.14f); p.setStrokeCap(Paint.Cap.ROUND);
