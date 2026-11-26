@@ -8,6 +8,7 @@ import java.util.*;
  * and whether it ends a sentence. Pure Java so it can be tested away from the phone.
  */
 class BookIndex {
+    static final int MAGIC = 0xB00C0003;   // 3: one box per WORD (2 had one box per printed line)
     final String[] w;        // normalised words
     final int[] pageStart;   // first word of each page, plus one extra entry = word count
     final float[] box;       // x0,y0,x1,y1 per word, 0..1 of the page (y from the top)
@@ -75,7 +76,7 @@ class BookIndex {
     void save(File dest) throws IOException {
         File f = new File(dest.getPath() + ".tmp");
         try (DataOutputStream o = new DataOutputStream(new BufferedOutputStream(new FileOutputStream(f), 1 << 16))) {
-            o.writeInt(0xB00C0002);
+            o.writeInt(MAGIC);
             o.writeInt(pages);
             for (int p = 0; p <= pages; p++) o.writeInt(pageStart[p]);
             for (int j = 0; j < w.length; j++) {
@@ -90,7 +91,7 @@ class BookIndex {
 
     static BookIndex load(File f) throws IOException {
         try (DataInputStream in = new DataInputStream(new BufferedInputStream(new FileInputStream(f), 1 << 16))) {
-            if (in.readInt() != 0xB00C0002) throw new IOException("old format");
+            if (in.readInt() != MAGIC) throw new IOException("old format");
             int pages = in.readInt();
             int[] ps = new int[pages + 1];
             for (int p = 0; p <= pages; p++) ps[p] = in.readInt();

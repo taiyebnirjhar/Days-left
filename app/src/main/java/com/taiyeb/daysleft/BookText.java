@@ -23,7 +23,17 @@ class BookText {
     static File file(Context c, int itemId) { return new File(c.getFilesDir(), "bi_" + itemId + ".bin"); }
     static File alignFile(Context c, int itemId) { return new File(c.getFilesDir(), "al_" + itemId + ".bin"); }
 
-    static boolean ready(Context c, int itemId) { return file(c, itemId).exists(); }
+    static boolean ready(Context c, int itemId) {
+        File f = file(c, itemId);
+        if (!f.exists()) return false;
+        try (DataInputStream in = new DataInputStream(new FileInputStream(f))) {
+            if (in.readInt() == BookIndex.MAGIC) return true;
+        } catch (Exception ignored) {}
+        f.delete();   // an index from before v3.45 (boxes per line, not per word): read the book again, the word numbers do not change
+        dispFile(c, itemId).delete();
+        if (cachedId == itemId) { cached = null; cachedMatcher = null; cachedId = -1; }
+        return false;
+    }
 
     private static final Set<String> ABBR = new HashSet<>(Arrays.asList("dr", "mr", "mrs", "ms", "st", "vs", "jr", "sr", "prof", "fig", "vol", "inc", "no", "eg", "ie", "etc", "cf"));
 
@@ -46,29 +56,64 @@ class BookText {
             super.startPage(page);
         }
 
+        /**
+         * PDFBox hands over one printed LINE at a time, so a box per call would give every word of a line the same box. Here every word gets its OWN box
+         * from the glyphs it is made of (the glyphs line up one to one with the characters of the line). y0 = baseline - h, y1 = baseline + 0.22 h, taken
+         * from the glyphs of the word's main size, so a footnote number glued to a word does not move its baseline. If the glyphs do not line up with the
+         * characters (ligatures, normalised text) the line's box is shared out by letters.
+         */
         @Override protected void writeString(String text, List<TextPosition> pos) throws IOException {
             if (text == null || text.trim().isEmpty() || pos == null || pos.isEmpty()) return;
-            float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f;
-            for (TextPosition t : pos) {
+            float lx0 = 1e9f, ly0 = 1e9f, lx1 = -1e9f, ly1 = -1e9f;
+            int[] off = new int[pos.size() + 1];
+            for (int q = 0; q < pos.size(); q++) {
+                TextPosition t = pos.get(q);
                 float x = t.getXDirAdj(), w = t.getWidthDirAdj(), h = t.getHeightDir(), y = t.getYDirAdj();
-                x0 = Math.min(x0, x); x1 = Math.max(x1, x + w);
-                y0 = Math.min(y0, y - h); y1 = Math.max(y1, y + h * 0.22f);
+                lx0 = Math.min(lx0, x); lx1 = Math.max(lx1, x + w);
+                ly0 = Math.min(ly0, y - h); ly1 = Math.max(ly1, y + h * 0.22f);
+                off[q + 1] = off[q] + (t.getUnicode() == null ? 0 : t.getUnicode().length());
             }
-            float[] bx = {clamp(x0 / pw), clamp(y0 / ph), clamp(x1 / pw), clamp(y1 / ph)};
+            boolean aligned = off[pos.size()] == text.length();
             java.util.regex.Matcher tm = java.util.regex.Pattern.compile("\\S+").matcher(text);
             while (tm.find()) {
                 String tok = tm.group();
                 List<String> ws = PageMatcher.words(tok);
                 if (ws.isEmpty()) continue;
-                int[] lk = lookOf(pos.get(Math.min(tm.start(), pos.size() - 1)));
-                boolean end = endsSentence(tok, ws.get(ws.size() - 1));
-                for (int k = 0; k < ws.size(); k++) {
-                    words.add(ws.get(k));
-                    boxes.add(bx);
-                    flags.add((byte) (end && k == ws.size() - 1 ? 1 : 0));
-                    disp.add(k == 0 ? tok : "");
-                    look.add(lk);
+                float[] bx;
+                int[] lk;
+                if (aligned) {
+                    float x0 = 1e9f, x1 = -1e9f, big = 0;
+                    int s0 = tm.start(), e0 = tm.end();
+                    for (int q = 0; q < pos.size(); q++) if (off[q + 1] > s0 && off[q] < e0) big = Math.max(big, pos.get(q).getFontSizeInPt());
+                    float y0 = 1e9f, y1 = -1e9f;
+                    TextPosition firstP = null;
+                    for (int q = 0; q < pos.size(); q++) {
+                        if (off[q + 1] <= s0 || off[q] >= e0) continue;
+                        TextPosition t = pos.get(q);
+                        if (firstP == null) firstP = t;
+                        x0 = Math.min(x0, t.getXDirAdj()); x1 = Math.max(x1, t.getXDirAdj() + t.getWidthDirAdj());
+                        if (t.getFontSizeInPt() >= 0.9f * big) { y0 = Math.min(y0, t.getYDirAdj() - t.getHeightDir()); y1 = Math.max(y1, t.getYDirAdj() + t.getHeightDir() * 0.22f); }
+                    }
+                    if (firstP == null || y1 < y0) { aligned = false; bx = null; lk = null; }
+                    else { bx = new float[]{clamp(x0 / pw), clamp(y0 / ph), clamp(x1 / pw), clamp(y1 / ph)}; lk = lookOf(firstP); }
+                    if (bx != null) { add(tok, ws, bx, lk); continue; }
                 }
+                // fallback: the line's box shared out by letters
+                float tot = Math.max(1, text.length());
+                float fx0 = lx0 + (lx1 - lx0) * tm.start() / tot, fx1 = lx0 + (lx1 - lx0) * tm.end() / tot;
+                add(tok, ws, new float[]{clamp(fx0 / pw), clamp(ly0 / ph), clamp(fx1 / pw), clamp(ly1 / ph)}, lookOf(pos.get(Math.min(tm.start(), pos.size() - 1))));
+                aligned = off[pos.size()] == text.length();
+            }
+        }
+
+        private void add(String tok, List<String> ws, float[] bx, int[] lk) {
+            boolean end = endsSentence(tok, ws.get(ws.size() - 1));
+            for (int k = 0; k < ws.size(); k++) {
+                words.add(ws.get(k));
+                boxes.add(bx);
+                flags.add((byte) (end && k == ws.size() - 1 ? 1 : 0));
+                disp.add(k == 0 ? tok : "");
+                look.add(lk);
             }
         }
 

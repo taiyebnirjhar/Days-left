@@ -196,7 +196,11 @@ class ReflowView extends ListView {
 
         PageRow(Context c) { super(c); }
 
-        void bind(int p) { page = p; f = flow(p); requestLayout(); invalidate(); }
+        void bind(int p) {
+            page = p;
+            try { f = flow(p); } catch (Throwable t) { Dbg.e("Reflow", "layout of page " + (p + 1) + " failed", t); f = null; }
+            requestLayout(); invalidate();
+        }
 
         @Override protected void onMeasure(int wms, int hms) {
             int w = MeasureSpec.getSize(wms);
@@ -213,6 +217,10 @@ class ReflowView extends ListView {
 
         @Override protected void onDraw(Canvas c) {
             if (f == null) return;
+            try { draw(c); } catch (Throwable t) { Dbg.e("Reflow", "drawing page " + (page + 1) + " failed", t); }
+        }
+
+        private void draw(Canvas c) {
             c.drawText("— " + (page + 1) + " —", getWidth() / 2f, topPad * 0.72f, lblP);
             Bitmap bm = host.pageBitmap(page);
             if (bm != null) {

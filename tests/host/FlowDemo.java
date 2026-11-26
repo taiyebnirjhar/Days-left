@@ -17,11 +17,22 @@ public class FlowDemo {
     public static void main(String[] a) throws Exception {
         String pdf = a[0]; int page = Integer.parseInt(a[1]); float z = Float.parseFloat(a[2]); float lineW = Float.parseFloat(a[3]); String out = a[4];
         Path tmp = Files.createTempDirectory("flow");
+        String idxFile = a.length > 5 ? a[5] : null;   // optional: words and boxes dumped by the app's own extraction (IndexDump), instead of pdftotext's boxes
+        float pw, ph, aspect;
+        List<float[]> boxes = new ArrayList<>(); List<String> toks = new ArrayList<>(); List<Byte> fl = new ArrayList<>();
+        if (idxFile != null) {
+            List<String> L = Files.readAllLines(Paths.get(idxFile));
+            String[] hw = L.get(0).split(" "); pw = Float.parseFloat(hw[0]); ph = Float.parseFloat(hw[1]); aspect = ph / pw;
+            for (int i = 1; i + 1 < L.size(); i += 2) {
+                String[] q = L.get(i + 1).split(" ");
+                boxes.add(new float[]{Float.parseFloat(q[0]), Float.parseFloat(q[1]), Float.parseFloat(q[2]), Float.parseFloat(q[3])});
+                toks.add(L.get(i).equals("-") ? "" : L.get(i)); fl.add(Byte.parseByte(q[4]));
+            }
+        } else {
         run("pdftotext", "-bbox", "-f", "" + page, "-l", "" + page, pdf, tmp + "/w.html");
         String html = new String(Files.readAllBytes(Paths.get(tmp + "/w.html")), "UTF-8");
         Matcher pm = Pattern.compile("<page width=\"([\\d.]+)\" height=\"([\\d.]+)\"").matcher(html); pm.find();
-        float pw = Float.parseFloat(pm.group(1)), ph = Float.parseFloat(pm.group(2)), aspect = ph / pw;
-        List<float[]> boxes = new ArrayList<>(); List<String> toks = new ArrayList<>(); List<Byte> fl = new ArrayList<>();
+        pw = Float.parseFloat(pm.group(1)); ph = Float.parseFloat(pm.group(2)); aspect = ph / pw;
         Matcher wm = Pattern.compile("<word xMin=\"([\\d.]+)\" yMin=\"([\\d.]+)\" xMax=\"([\\d.]+)\" yMax=\"([\\d.]+)\">(.*?)</word>").matcher(html);
         while (wm.find()) {
             float x0 = Float.parseFloat(wm.group(1)), y0 = Float.parseFloat(wm.group(2)), x1 = Float.parseFloat(wm.group(3)), y1 = Float.parseFloat(wm.group(4));
@@ -32,6 +43,7 @@ public class FlowDemo {
             toks.add(t);
             char c = t.replaceAll("[\"'”’)\\]]+$", "").isEmpty() ? ' ' : t.replaceAll("[\"'”’)\\]]+$", "").charAt(t.replaceAll("[\"'”’)\\]]+$", "").length() - 1);
             fl.add((byte) (c == '.' || c == '!' || c == '?' ? 1 : 0));
+        }
         }
         int n = boxes.size();
         float[] box = new float[n * 4]; byte[] flag = new byte[n];

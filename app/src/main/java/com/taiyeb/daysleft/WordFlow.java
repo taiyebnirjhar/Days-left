@@ -161,7 +161,7 @@ final class WordFlow {
         float yb = 0;
         for (int k = 0; k < lines; k++) {
             float asc = 0.78f * Math.max(lineLead.get(k), leadU * sc * 0.5f);
-            if (k == 0) yb = asc;
+            if (k == 0) yb = 0.84f * Math.max(lineLead.get(k), leadU * sc * 0.5f);   // room above the first baseline for the crop
             else yb += 0.22f * Math.max(lineLead.get(k - 1), leadU * sc * 0.5f) + asc + lineGap.get(k);
             baseY[k] = yb;
         }
@@ -171,9 +171,9 @@ final class WordFlow {
         f.sx0 = ix0; f.sx1 = ix1; f.sy0 = new float[n]; f.sy1 = new float[n];
         f.first = fi; f.last = la;
         for (int i = 0; i < n; i++) {
-            f.sy0[i] = base[i] - 0.78f * leadI[i]; f.sy1[i] = base[i] + 0.22f * leadI[i];
+            f.sy0[i] = base[i] - 0.84f * leadI[i]; f.sy1[i] = base[i] + 0.22f * leadI[i];
             f.x[i] = px[i]; f.w[i] = (ix1[i] - ix0[i]) * sc; f.h[i] = leadI[i] * sc;
-            f.y[i] = baseY[line[i]] - 0.78f * leadI[i] * sc - raise[i] * sc;
+            f.y[i] = baseY[line[i]] - 0.84f * leadI[i] * sc - raise[i] * sc;
         }
         f.height = baseY[lines - 1] + 0.22f * leadU * sc + leadU * sc * 0.4f;
         return f;

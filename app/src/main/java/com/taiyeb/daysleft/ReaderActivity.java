@@ -818,7 +818,8 @@ public class ReaderActivity extends Activity {
                 ui(() -> {
                     bi = b; al = a; seenLiveVer = -1; if (dw != null && disp == null) disp = dw; jumpToAudioPage();
                     updatePin(); if (pv != null) pv.invalidate();
-                    if (b == null && !prepTried && textZoom() > 1.005f) h.postDelayed(() -> prepareText(false), 800);
+                    // an index from an older version is discarded (boxes per line): read the book again quietly; also needed for the bigger text
+                    if (b == null && !prepTried && (textZoom() > 1.005f || (item.audio != null && !item.audio.isEmpty()))) h.postDelayed(() -> prepareText(false), 800);
                     if (b != null && textZoom() > 1.005f && !rfActive) applyTextZoom();   // the saved Text size
                     // a sync that was interrupted (app closed by the system, low battery) carries on by itself
                     if (b != null && fileMode && !SyncService.running && SyncService.wanted(this, id) && !SyncService.fullFor(this, id) && Whisper.hasModel(this)) {
