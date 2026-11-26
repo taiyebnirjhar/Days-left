@@ -169,7 +169,11 @@ public class SyncService extends Service {
             Alignment prior = Alignment.load(BookText.alignFile(this, id));
             double here = Player.pos();   // start where the user is listening: usable within one short clip
             SyncPlanner pl = new SyncPlanner(totalSec, here, bi.count(), prior.words(), prior.times());
-            pl.reach = WINDOW;
+            // two rings: a small one around the playhead first (usable in about a minute), then the full window
+            final double[] STAGES = {150, WINDOW};
+            int stage = 0;
+            boolean widening = false;
+            pl.reach = STAGES[0];
             Store.sp(this).edit().putBoolean("syncWin_" + id, false).apply();
             totalSec = pl.windowProgress()[1];   // the progress bar is about the window around the playhead
             doneSec = pl.windowProgress()[0]; startedFrom = doneSec; startedMs = System.currentTimeMillis();
@@ -185,7 +189,16 @@ public class SyncService extends Service {
                 List<SyncPlanner.Req> batch = pl.nextBatch(3);
                 if (batch.isEmpty()) {
                     if (pl.lost) break;
-                    if (pl.recenter(Player.pos())) { idleSince = 0; idle = false; Dbg.i("Sync", "playhead moved to " + (int) Player.pos() + " s, mapping around it"); totalSec = pl.windowProgress()[1]; continue; }
+                    if (stage < STAGES.length - 1) {
+                        stage++; pl.reach = STAGES[stage]; widening = true;
+                        idle = true;   // the small ring is done: usable now, the wider ring is filled in quietly
+                        Store.sp(this).edit().putBoolean("syncWin_" + id, true).apply();
+                        Dbg.i("Sync", "ready around " + (int) Player.pos() + " s after " + probes + " probes; widening to +-" + (int) STAGES[stage] + " s");
+                        nm.notify(7100, note("Ready. Widening the mapped area…", 100, false));
+                        continue;
+                    }
+                    widening = false;
+                    if (pl.recenter(Player.pos())) { stage = 0; pl.reach = STAGES[0]; widening = false; idleSince = 0; idle = false; Dbg.i("Sync", "playhead moved to " + (int) Player.pos() + " s, mapping around it"); totalSec = pl.windowProgress()[1]; continue; }
                     long nowMs = System.currentTimeMillis();
                     if (idleSince == 0) {
                         idleSince = nowMs; idle = true; doneSec = totalSec;
@@ -197,7 +210,7 @@ public class SyncService extends Service {
                     Thread.sleep(2000);
                     continue;
                 }
-                if (idle) { idle = false; Store.sp(this).edit().putBoolean("syncWin_" + id, false).apply(); }
+                if (idle && !widening) { idle = false; Store.sp(this).edit().putBoolean("syncWin_" + id, false).apply(); }
                 idleSince = 0;
                 if (lowBattery()) { error = "The battery is low. Plug in and it carries on when you open the book."; break; }
                 long t0 = Dbg.now();

@@ -95,7 +95,7 @@ public class SyncSim {
             Aligner al = new Aligner(new BookIndex(book, ps, new float[N * 4], new byte[N]));
             double pos = 0.37 * total;
             SyncPlanner p = new SyncPlanner(total, pos, N, new int[0], new double[0]);
-            p.reach = 600;
+            p.reach = Double.parseDouble(System.getProperty("reach", "600"));
             calls = 0; listened = 0;
             int firstCalls = -1;
             while (step(p, al)) { if (firstCalls < 0 && p.anchorCount() > 0) firstCalls = calls; if (calls > 3000) break; }
