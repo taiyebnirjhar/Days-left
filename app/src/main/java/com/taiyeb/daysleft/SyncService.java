@@ -109,17 +109,28 @@ public class SyncService extends Service {
     @Override public IBinder onBind(Intent i) { return null; }
 
     @Override public int onStartCommand(Intent in, int flags, int startId) {
-        if (in != null && "stop".equals(in.getAction())) { stop(this); return START_NOT_STICKY; }
-        if (running) return START_REDELIVER_INTENT;
-        final int id = in == null ? -1 : in.getIntExtra("id", -1);
+        // Android kills the whole app a few seconds after startForegroundService() unless startForeground() is called right away,
+        // for EVERY start request, including the ones we then ignore (a stop request, or a start while already running).
+        // That was a real crash: the early returns used to come first. tests/host/check_services.py guards this.
         nm = getSystemService(NotificationManager.class);
         nm.createNotificationChannel(new NotificationChannel("sync", "Syncing audiobook", NotificationManager.IMPORTANCE_LOW));
+        final boolean stopping = in != null && "stop".equals(in.getAction());
+        try {
+            Notification first = running ? note(statusText(), statusPct(), statusPct() < 0) : note("Getting ready…", 0, true);
+            if (Build.VERSION.SDK_INT >= 29) startForeground(7100, first, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC);
+            else startForeground(7100, first);
+        } catch (Exception e) {
+            Dbg.e("Sync", "startForeground refused", e);
+            if (!stopping) error = "Android did not allow the background work to start. Open the book and try again.";
+            if (!running) stopSelf();
+            if (!stopping) return START_NOT_STICKY;
+        }
+        if (stopping) { stop(this); if (!running) { stopForeground(true); stopSelf(); } return START_NOT_STICKY; }
+        if (running) return START_REDELIVER_INTENT;
+        final int id = in == null ? -1 : in.getIntExtra("id", -1);
         running = true; cancel = false; idle = false; ready = false; try { powerSaving = getSystemService(PowerManager.class).isPowerSaveMode(); } catch (Exception ignored) {} error = ""; itemId = id; hereWord = -1; goalTimeOut = -1;
         Whisper.abort(false);
         Store.sp(this).edit().putBoolean("syncWant_" + id, true).apply();
-        Notification n = note("Getting ready…", 0, true);
-        if (Build.VERSION.SDK_INT >= 29) startForeground(7100, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC);
-        else startForeground(7100, n);
         PowerManager pm = getSystemService(PowerManager.class);
         wl = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "daysleft:sync");
         wl.acquire(8 * 60 * 60 * 1000L);

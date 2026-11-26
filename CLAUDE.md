@@ -6,7 +6,7 @@ Plain Java, no androidx, all views built in code. Keep it that way. Package `com
 ## Build
 - `gradle assembleDebug --no-daemon -q` (AGP 8.10.1, compileSdk 36, minSdk 26, NDK 27.2.12479018, cmake 3.22.1, abi arm64-v8a only)
 - Set `ANDROID_HOME` first. APK: `app/build/outputs/apk/debug/app-debug.apk`
-- Bump `versionCode`/`versionName` in `app/build.gradle` and the "Days Left X.Y" label in MainActivity.java each delivery. Current: 3.34 (48).
+- Bump `versionCode`/`versionName` in `app/build.gradle` and the "Days Left X.Y" label in MainActivity.java each delivery. Current: 3.35 (49).
 - Dependency: `com.tom-roush:pdfbox-android:2.0.27.0`. whisper.cpp is vendored in `app/src/main/cpp/whisper` (CPU only), wrapped by `cpp/jni.cpp`.
 
 ## Features
@@ -33,7 +33,7 @@ Countdowns (status bar, notification, overlay) + Library: eye-friendly PDF reade
 - Nothing may depend on the reader screen: model download, book text reading, sync, Find/Play page searches and prefetch all run in `SyncService` (foreground, survives leaving the app). The reader only polls statics (`dlPct`, `textPct`, `goalTimeOut`, `hereWord`) and wakes the service in `resumeSync()` / `Player.play()` / `onTick` when the playhead is outside the mapped area.
 - `SyncPlanner.widen()` must reset `fwdDone/bwdDone`, otherwise a wider window is never filled (v3.28 only ever mapped +-150 s; covered by the 'two rings' check in `tests/host/simrun.sh`).
 - `getInsetsController` NPE: call immersive() only after the view is built.
-- startForegroundService requires startForeground right away in onStartCommand.
+- startForegroundService requires startForeground right away in onStartCommand, for EVERY start request including ones that are ignored (stop, already running, nothing active). v3.34 crashed with ForegroundServiceDidNotStartInTimeException because SyncService returned early; `tests/host/check_services.py` (run by run.sh) fails if any service returns before startForeground().
 - Whisper has a global abort flag (`Whisper.abort`); SyncService.stop sets it, service start clears it.
 - Host tests for PageMatcher/Aligner/BookIndex were plain `javac` programs (not in repo).
 

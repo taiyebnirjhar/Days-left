@@ -58,6 +58,16 @@ public class CountdownService extends Service {
 
         List<Cd> act = new ArrayList<>();
         for (Cd d : Store.load(this)) if (d.active) act.add(d);
+        // startForegroundService() needs startForeground() right away for every request, including the ones that end here
+        // (nothing active, or just a repost). Missing it kills the app a few seconds later. tests/host/check_services.py guards this.
+        try {
+            Notification first = act.isEmpty()
+                    ? new Notification.Builder(this, CH).setSmallIcon(R.drawable.ic_fg).setContentTitle("Days Left").build()
+                    : build(act.get(0));
+            startForeground(act.isEmpty() ? 5998 : nid(act.get(0)), first, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE);
+        } catch (Exception e) {
+            Dbg.e("Countdown", "startForeground refused", e);
+        }
         if (act.isEmpty()) {
             removeOverlay();
             stopForeground(STOP_FOREGROUND_REMOVE);

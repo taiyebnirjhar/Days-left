@@ -56,12 +56,18 @@ public class PlaybackService extends Service {
         @Override public void onReceive(Context c, Intent i) { Player.pause(c); }   // headphones unplugged
     };
 
+    private Notification cur;   // the last full notification, shown again if Android asks us to go foreground again
+
     @Override public int onStartCommand(Intent in, int flags, int startId) {
         String a = in == null ? null : in.getAction();
-        if (!fg) {   // a service started with startForegroundService() must go foreground right away
-            Notification first = new Notification.Builder(this, "play").setSmallIcon(R.drawable.ic_fg).setContentTitle(Player.title).build();
-            if (Build.VERSION.SDK_INT >= 29) startForeground(7200, first, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK); else startForeground(7200, first);
+        // startForegroundService() needs startForeground() every time, even if we believe we are already foreground (that flag can
+        // be stale after a stop): a missed call is a crash a few seconds later.
+        try {
+            Notification n = cur != null ? cur : new Notification.Builder(this, "play").setSmallIcon(R.drawable.ic_fg).setContentTitle(Player.title).build();
+            if (Build.VERSION.SDK_INT >= 29) startForeground(7200, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK); else startForeground(7200, n);
             fg = true;
+        } catch (Exception e) {
+            Dbg.e("Playback", "startForeground refused", e);
         }
         if ("toggle".equals(a)) Player.toggle(this);
         else if ("back".equals(a)) Player.seekBy(this, -15);
@@ -69,6 +75,7 @@ public class PlaybackService extends Service {
         else if ("stop".equals(a)) {
             if (!Player.readerOpen) Player.release(this);
             stopForeground(true);
+            fg = false; cur = null;
             stopSelf();
             return START_NOT_STICKY;
         }
@@ -90,7 +97,7 @@ public class PlaybackService extends Service {
     };
 
     private void refresh() {
-        if (Player.mp == null) { stopForeground(true); stopSelf(); return; }
+        if (Player.mp == null) { stopForeground(true); fg = false; cur = null; stopSelf(); return; }
         Item it = Learn.item(this, Player.itemId);
         boolean playing = Player.isPlaying();
         long pos = (long) (Player.pos() * 1000), dur = (long) (Player.dur() * 1000);
@@ -123,6 +130,7 @@ public class PlaybackService extends Service {
                 .setStyle(new Notification.MediaStyle().setMediaSession(session.getSessionToken()).setShowActionsInCompactView(0, 1, 2))
                 .setOngoing(playing);
         Notification n = b.build();
+        cur = n;
         if (playing) {
             if (!fg) {
                 if (Build.VERSION.SDK_INT >= 29) startForeground(7200, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK); else startForeground(7200, n);
