@@ -164,7 +164,10 @@ public class ReaderActivity extends Activity {
         try { synchronized (lock) { if (pr != null) pr.close(); } if (pfd != null) pfd.close(); } catch (Exception ignored) {}
     }
 
-    /** While locked every touch is swallowed, except on the unlock padlock, which appears for 3 s after any touch. */
+    /**
+     * The touch lock blocks what changes things by accident: taps (controls, buttons), double-tap and pinch zoom. Scrolling and swiping still work, so the
+     * book can be read on (a locked page that cannot be moved is useless). A tap shows the unlock padlock for 3 s; the padlock unlocks.
+     */
     @Override public boolean dispatchTouchEvent(MotionEvent e) {
         if (!locked) return super.dispatchTouchEvent(e);
         if (unlockBtn.getVisibility() == View.VISIBLE) {
@@ -175,9 +178,11 @@ public class ReaderActivity extends Activity {
                 return true;
             }
         }
-        if (e.getAction() == MotionEvent.ACTION_DOWN) { unlockBtn.setVisibility(View.VISIBLE); h.removeCallbacks(hideUnlock); h.postDelayed(hideUnlock, 3000); }
-        return true;
+        return super.dispatchTouchEvent(e);   // the page / the scroll gets the touch; its taps, double-taps and pinches are ignored while locked (see below)
     }
+
+    /** A tap while locked: show the way out. */
+    void revealUnlock() { unlockBtn.setVisibility(View.VISIBLE); h.removeCallbacks(hideUnlock); h.postDelayed(hideUnlock, 3000); }
 
     // ====================== the book's text, read quietly ======================
     /**
@@ -256,7 +261,7 @@ public class ReaderActivity extends Activity {
             showChrome(false);
             unlockBtn.setVisibility(View.VISIBLE);
             h.postDelayed(hideUnlock, 2500);
-            Toast.makeText(this, "Touch lock on. Tap the screen, then the padlock, to unlock.", Toast.LENGTH_LONG).show();
+            Toast.makeText(this, "Touch lock on: taps and zoom are off, scrolling still works. Tap the screen, then the padlock, to unlock.", Toast.LENGTH_LONG).show();
         } else {
             unlockBtn.setVisibility(View.GONE);
             showChrome(true);
@@ -264,7 +269,7 @@ public class ReaderActivity extends Activity {
     }
 
     @Override public void onBackPressed() {
-        if (locked) { unlockBtn.setVisibility(View.VISIBLE); h.removeCallbacks(hideUnlock); h.postDelayed(hideUnlock, 3000); return; }
+        if (locked) { revealUnlock(); return; }
         if (settings != null && settings.getVisibility() == View.VISIBLE) { settings.setVisibility(View.GONE); return; }
         super.onBackPressed();
     }
@@ -1937,6 +1942,7 @@ public class ReaderActivity extends Activity {
             setAdapter(ad);
             sgd2 = new GestureDetector(c, new GestureDetector.SimpleOnGestureListener() {
                 @Override public boolean onSingleTapConfirmed(MotionEvent e) {
+                    if (locked) { revealUnlock(); return true; }
                     if (settings.getVisibility() == View.VISIBLE) settings.setVisibility(View.GONE); else showChrome(!chrome);
                     return true;
                 }
@@ -2078,12 +2084,14 @@ public class ReaderActivity extends Activity {
                 @Override public boolean onDown(MotionEvent e) { flung = false; dragging = false; cancelAnim(); return true; }
                 @Override public boolean onSingleTapConfirmed(MotionEvent e) {
                     float x = e.getX(), w = getWidth();
+                    if (locked) { revealUnlock(); return true; }
                     if (settings.getVisibility() == View.VISIBLE) { settings.setVisibility(View.GONE); return true; }
                     // Taps never turn the page (swipe for that). A tap just shows or hides the controls.
                     showChrome(!chrome);
                     return true;
                 }
                 @Override public boolean onDoubleTap(MotionEvent e) {
+                    if (locked) return true;   // no zoom by accident while locked
                     if (zoom > 1.05f) resetZoom();
                     else {
                         zoom = 2.4f;
@@ -2179,8 +2187,8 @@ public class ReaderActivity extends Activity {
         }
 
         @Override public boolean onTouchEvent(MotionEvent e) {
-            sgd.onTouchEvent(e);
-            if (!sgd.isInProgress()) gd.onTouchEvent(e);
+            if (!locked) sgd.onTouchEvent(e);   // no pinch zoom while locked
+            if (locked || !sgd.isInProgress()) gd.onTouchEvent(e);
             int a = e.getActionMasked();
             if ((a == MotionEvent.ACTION_UP || a == MotionEvent.ACTION_CANCEL) && dragging && !flung && zoom <= 1.01f)
                 settle(dragX < -getWidth() * 0.22f && cur < n - 1 ? 1 : dragX > getWidth() * 0.22f && cur > 0 ? -1 : 0);
