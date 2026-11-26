@@ -214,6 +214,7 @@ class BookText {
 
     /** Forget everything derived from the audio (a new audio file was attached). */
     static void clearAudioData(Context c, int itemId) {
+        if (SyncService.liveItem == itemId) { SyncService.live = null; SyncService.liveItem = -1; }   // the in-memory copy must not bring cleared data back
         clearSamples(c, itemId);
         alignFile(c, itemId).delete();
         Store.sp(c).edit().remove("syncDone_" + itemId).remove("syncFull_" + itemId).remove("syncPct_" + itemId).remove("syncWin_" + itemId).apply();

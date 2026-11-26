@@ -17,6 +17,9 @@ import java.util.*;
  */
 public class SyncService extends Service {
     static volatile boolean running;
+    /** The alignment as the sync knows it right now, handed to the reader in memory (it used to re-read the file every 10 s: the marker lagged by that much). */
+    static volatile Alignment live;
+    static volatile int liveItem = -1, liveVer;
     static volatile int itemId = -1;
     static volatile double doneSec, totalSec;
     static volatile long startedMs;
@@ -225,6 +228,8 @@ public class SyncService extends Service {
             totalSec = Long.parseLong(mr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)) / 1000.0;
             mr.release();
             Alignment prior = Alignment.load(BookText.alignFile(this, id));
+            final List<int[]> livePos = new ArrayList<>(); final List<Double> liveTime = new ArrayList<>();
+            { int[] pw = prior.words(); double[] pt = prior.times(); for (int i = 0; i < pw.length; i++) { livePos.add(new int[]{pw[i]}); liveTime.add(pt[i]); } }
             double here = Player.pos();   // start where the user is listening: usable within one short clip
             SyncPlanner pl = new SyncPlanner(totalSec, here, bi.count(), prior.words(), prior.times());
             idle = winReady(this, id);   // was ready last time: stays "Synced" unless new work turns up
@@ -246,6 +251,9 @@ public class SyncService extends Service {
             }, new SyncCore.Sink() {
                 @Override public void anchors(int[] pos, double[] time) {
                     try { Alignment.append(BookText.alignFile(SyncService.this, id), pos, time); } catch (Exception e) { Dbg.w("Sync", "could not save anchors: " + e); }
+                    for (int i = 0; i < pos.length; i++) { livePos.add(new int[]{pos[i]}); liveTime.add(time[i]); }
+                    live = Alignment.fromPoints(livePos, liveTime);   // a fresh object: the reader may use it while we build the next
+                    liveItem = id; liveVer++;
                 }
                 @Override public void readyChanged(boolean r, double zd, double zt) {
                     Store.sp(SyncService.this).edit().putBoolean("syncWin_" + id, r).putInt("syncPct_" + id, r ? 100 : (int) (zd * 100 / Math.max(1, zt))).apply();

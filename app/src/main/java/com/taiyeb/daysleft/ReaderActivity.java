@@ -71,6 +71,7 @@ public class ReaderActivity extends Activity {
     boolean hlOn, followOn;
     int hlStyle;   // 0 marker, 1 underline
     long lastManual, alReloaded;
+    int seenLiveVer = -1;
 
     int goPage;
     boolean jumpToAudio;
@@ -528,6 +529,12 @@ public class ReaderActivity extends Activity {
 
     void onTick(double t, double d, int st) {
         aT = t; aDur = d; aState = st;
+        // the sync hands over what it knows in memory: a new match shows up on this very tick instead of after a file reload
+        if (bi != null && SyncService.liveItem == item.id && SyncService.liveVer != seenLiveVer) {
+            Alignment l = SyncService.live;
+            seenLiveVer = SyncService.liveVer;
+            if (l != null) { al = l.withBook(bi); alReloaded = System.currentTimeMillis(); }
+        }
         if (timeLbl != null) timeLbl.setText(fmtT(t) + " / " + fmtT(d));
         int g = st == 1 || st == 3 ? 2 : 1;
         if (playGlyph != null && playGlyph.type != g) { playGlyph.type = g; playGlyph.invalidate(); }
@@ -551,7 +558,7 @@ public class ReaderActivity extends Activity {
                 if (pg != cur) goTo(pg, false);
             }
         }
-        if (SyncService.running && SyncService.itemId == item.id && now - alReloaded > 10000) loadSyncData();
+        if (SyncService.running && SyncService.itemId == item.id && SyncService.liveItem != item.id && now - alReloaded > 10000) loadSyncData();   // live hand-over replaces this poll
         if (waitingReady && SyncService.running && SyncService.ready && SyncService.itemId == item.id) {
             waitingReady = false;
             loadSyncData();
@@ -632,7 +639,7 @@ public class ReaderActivity extends Activity {
             try {
                 if (mpReady && Player.mp != null) onTick(Player.pos(), Player.dur(), Player.isPlaying() ? 1 : 2);
             } catch (Exception ignored) {}
-            h.postDelayed(this, 250);
+            h.postDelayed(this, 100);   // the marker follows the audio within a tenth of a second
         }
     };
 
@@ -763,7 +770,7 @@ public class ReaderActivity extends Activity {
                 final BookText.Disp dw = b == null ? null : BookText.display(this, id, b.count());
                 Dbg.p("Reader", "sync data loaded", tl, "book words " + (b == null ? "none" : b.count()) + ", aligned " + a.size() + (SyncService.running ? ", sync running" : ""));
                 ui(() -> {
-                    bi = b; al = a; if (dw != null && disp == null) disp = dw; jumpToAudioPage();
+                    bi = b; al = a; seenLiveVer = -1; if (dw != null && disp == null) disp = dw; jumpToAudioPage();
                     if ((b == null || dw == null) && !prepTried) h.postDelayed(() -> prepareText(false), 1500);   // so the text view is ready when you pinch updatePin(); if (pv != null) pv.invalidate();
                     // a sync that was interrupted (app closed by the system, low battery) carries on by itself
                     if (b != null && fileMode && !SyncService.running && SyncService.wanted(this, id) && !SyncService.fullFor(this, id) && Whisper.hasModel(this)) {
