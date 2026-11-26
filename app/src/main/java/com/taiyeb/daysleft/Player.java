@@ -77,16 +77,28 @@ class Player {
     static double pos() { try { if (mp != null && ready) { lastPos = mp.getCurrentPosition() / 1000.0; return lastPos; } return 0; } catch (Exception e) { return 0; } }
     static double dur() { try { return mp != null && ready ? mp.getDuration() / 1000.0 : 0; } catch (Exception e) { return 0; } }
 
+    private static Context appRef;
+
+    // One focus request for the whole time the player exists. Building a new request on every Play made Android tell
+    // the previous request "focus lost", and its listener then paused the player right after it started.
+    private static final AudioManager.OnAudioFocusChangeListener focusListener = ch -> main.post(() -> {
+        Dbg.i("Player", "audio focus change " + ch);
+        Context app = appRef;
+        if (app == null) return;
+        if (ch == AudioManager.AUDIOFOCUS_LOSS) { resumeAfterFocus = false; pause(app); }
+        else if (ch == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT) { resumeAfterFocus = isPlaying(); pause(app); }
+        else if (ch == AudioManager.AUDIOFOCUS_GAIN && resumeAfterFocus) { resumeAfterFocus = false; play(app); }
+    });
+
     private static boolean getFocus(Context c) {
-        AudioManager am = c.getSystemService(AudioManager.class);
-        focus = new AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
-                .setAudioAttributes(new AudioAttributes.Builder().setContentType(AudioAttributes.CONTENT_TYPE_SPEECH).setUsage(AudioAttributes.USAGE_MEDIA).build())
-                .setOnAudioFocusChangeListener(ch -> main.post(() -> {
-                    if (ch == AudioManager.AUDIOFOCUS_LOSS) { resumeAfterFocus = false; pause(c.getApplicationContext()); }
-                    else if (ch == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT) { resumeAfterFocus = isPlaying(); pause(c.getApplicationContext()); }
-                    else if (ch == AudioManager.AUDIOFOCUS_GAIN && resumeAfterFocus) { resumeAfterFocus = false; play(c.getApplicationContext()); }
-                }))
-                .build();
+        appRef = c.getApplicationContext();
+        AudioManager am = appRef.getSystemService(AudioManager.class);
+        if (focus == null) {
+            focus = new AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
+                    .setAudioAttributes(new AudioAttributes.Builder().setContentType(AudioAttributes.CONTENT_TYPE_SPEECH).setUsage(AudioAttributes.USAGE_MEDIA).build())
+                    .setOnAudioFocusChangeListener(focusListener)
+                    .build();
+        }
         return am.requestAudioFocus(focus) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED;
     }
 

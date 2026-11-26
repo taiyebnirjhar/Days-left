@@ -275,6 +275,7 @@ public class SyncService extends Service {
         } finally {
             Dbg.i("Sync", (complete ? "finished" : cancel ? "stopped" : error.isEmpty() ? "ended" : "ended with error: " + error) + " at " + (int) doneSec + " of " + (int) totalSec + " s");
             running = false; idle = false; hereWord = -1;
+            AudioClip.closeCache();
             Whisper.abort(false);
             if (wl != null && wl.isHeld()) wl.release();
             stopForeground(true);

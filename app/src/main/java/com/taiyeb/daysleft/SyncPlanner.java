@@ -341,7 +341,11 @@ final class SyncPlanner {
         boolean fwd = r.kind == 1;
         if (!ok) {
             if (fwd) { fwdFails++; fwdCursor += 20; fwdStride = Math.max(0, fwdStride / 2); if (fwdFails >= EXT_FAILS_GIVE_UP) { fwdDone = true; lost = true; } }
-            else { bwdFails++; bwdEnd -= 20; bwdStride = Math.max(0, bwdStride / 2); if (bwdFails >= EXT_FAILS_GIVE_UP) { bwdDone = true; lost = true; } }
+            else {
+                bwdFails++; bwdEnd -= 20; bwdStride = Math.max(0, bwdStride / 2);
+                if (r.start < 40) bwdDone = true;   // the start of the audio is usually an intro that is not in the book
+                else if (bwdFails >= EXT_FAILS_GIVE_UP) { bwdDone = true; lost = true; }
+            }
             return 0;
         }
         // how well did the pace prediction hold?

@@ -61,21 +61,37 @@ public class Updater {
         catch (Exception e) { return "0"; }
     }
 
-    /** Result: Info if a newer version exists, null value (and no error) if up to date. */
+    /**
+     * Result: Info if a newer version exists, null value (and no error) if up to date.
+     * Uses the public "latest release" web redirect (github.com/.../releases/latest -> .../tag/vX.Y): unlike the
+     * api.github.com endpoint it has no 60-requests-per-hour limit per network address. The API is only a fallback.
+     */
     static void check(Context c, Cb<Info> cb) {
         new Thread(() -> {
             Info res = null;
             String err = null;
             try {
-                HttpURLConnection h = open("https://api.github.com/repos/" + REPO + "/releases/latest");
-                h.setRequestProperty("Accept", "application/vnd.github+json");
-                int code = h.getResponseCode();
-                if (code == 404) err = "No release published yet";
-                else if (code != 200) err = "GitHub answered " + code;
-                else {
-                    Info n = parse(read(h.getInputStream()));
-                    if (n == null) err = "The latest release has no APK";
-                    else if (Version.compare(n.version, installedVersion(c)) > 0) res = n;
+                String tag = latestTagFromRedirect();
+                if (tag != null) {
+                    if (Version.compare(tag, installedVersion(c)) > 0) {
+                        Info n = new Info();
+                        n.version = tag.replaceFirst("^[vV]", "");
+                        n.url = "https://github.com/" + REPO + "/releases/download/" + tag + "/DaysLeft-" + tag + ".apk";
+                        n.notes = "";
+                        res = n;
+                    }
+                } else {
+                    HttpURLConnection h = open("https://api.github.com/repos/" + REPO + "/releases/latest");
+                    h.setRequestProperty("Accept", "application/vnd.github+json");
+                    int code = h.getResponseCode();
+                    if (code == 404) err = "No release published yet";
+                    else if (code == 403 || code == 429) err = "GitHub is limiting requests right now. Try again in a few minutes";
+                    else if (code != 200) err = "GitHub answered " + code;
+                    else {
+                        Info n = parse(read(h.getInputStream()));
+                        if (n == null) err = "The latest release has no APK";
+                        else if (Version.compare(n.version, installedVersion(c)) > 0) res = n;
+                    }
                 }
             } catch (Exception e) {
                 err = "Couldn't reach GitHub: " + e.getMessage();
@@ -84,6 +100,23 @@ public class Updater {
             Info r = res; String er = err;
             UI.post(() -> cb.done(r, er));
         }, "update-check").start();
+    }
+
+    /** The tag of the newest release, from the redirect of the "latest" page; null if that didn't work. */
+    private static String latestTagFromRedirect() {
+        try {
+            HttpURLConnection h = open("https://github.com/" + REPO + "/releases/latest");
+            h.setInstanceFollowRedirects(false);
+            int code = h.getResponseCode();
+            String loc = h.getHeaderField("Location");
+            Dbg.i("Update", "latest page answered " + code + (loc == null ? "" : ", " + loc));
+            if (code / 100 != 3 || loc == null) return null;
+            int i = loc.lastIndexOf("/tag/");
+            return i < 0 ? null : java.net.URLDecoder.decode(loc.substring(i + 5), "UTF-8");
+        } catch (Exception e) {
+            Dbg.w("Update", "redirect check failed: " + e);
+            return null;
+        }
     }
 
     /** Downloads the APK into the app cache, then asks the system installer to install it. */

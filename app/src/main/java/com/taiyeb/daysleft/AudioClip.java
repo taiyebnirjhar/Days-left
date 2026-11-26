@@ -10,20 +10,42 @@ import java.nio.ByteOrder;
 
 /** Cuts a few seconds out of an audio file as 16 kHz mono samples, the form the speech model wants. */
 class AudioClip {
-    static float[] decode(Context c, String uri, double startSec, double lenSec) throws Exception {
-        MediaExtractor ex = new MediaExtractor();
+    // The opened file is kept between calls. Opening a 10 hour m4a (parsing its index through the file provider) took
+    // 2 to 14 seconds each time on the phone, more than the speech model itself.
+    private static MediaExtractor cEx;
+    private static String cUri = "";
+    private static int cTrack = -1;
+    private static MediaFormat cFmt;
+
+    /** Call when a batch of decoding is over, to give the file back. */
+    static synchronized void closeCache() {
+        try { if (cEx != null) cEx.release(); } catch (Exception ignored) {}
+        cEx = null; cUri = ""; cTrack = -1; cFmt = null;
+    }
+
+    static synchronized float[] decode(Context c, String uri, double startSec, double lenSec) throws Exception {
         MediaCodec codec = null;
+        boolean ok = false;
         try {
-            ex.setDataSource(c, Uri.parse(uri), null);
-            int track = -1;
-            MediaFormat fmt = null;
-            for (int i = 0; i < ex.getTrackCount(); i++) {
-                MediaFormat f = ex.getTrackFormat(i);
-                String mime = f.getString(MediaFormat.KEY_MIME);
-                if (mime != null && mime.startsWith("audio/")) { track = i; fmt = f; break; }
+            if (cEx == null || !uri.equals(cUri)) {
+                closeCache();
+                MediaExtractor e = new MediaExtractor();
+                try {
+                    e.setDataSource(c, Uri.parse(uri), null);
+                    int tr = -1;
+                    MediaFormat f = null;
+                    for (int i = 0; i < e.getTrackCount(); i++) {
+                        MediaFormat tf = e.getTrackFormat(i);
+                        String mime = tf.getString(MediaFormat.KEY_MIME);
+                        if (mime != null && mime.startsWith("audio/")) { tr = i; f = tf; break; }
+                    }
+                    if (tr < 0) throw new Exception("no audio in that file");
+                    e.selectTrack(tr);
+                    cEx = e; cUri = uri; cTrack = tr; cFmt = f;
+                } catch (Exception x) { e.release(); throw x; }
             }
-            if (track < 0) throw new Exception("no audio in that file");
-            ex.selectTrack(track);
+            MediaExtractor ex = cEx;
+            MediaFormat fmt = cFmt;
             long startUs = (long) (Math.max(0, startSec) * 1e6), endUs = startUs + (long) (lenSec * 1e6);
             ex.seekTo(startUs, MediaExtractor.SEEK_TO_PREVIOUS_SYNC);
             codec = MediaCodec.createDecoderByType(fmt.getString(MediaFormat.KEY_MIME));
@@ -83,10 +105,11 @@ class AudioClip {
             int n = Math.min(outN, (int) (lenSec * 16000));
             float[] res = new float[n];
             System.arraycopy(mono, 0, res, 0, n);
+            ok = true;
             return res;
         } finally {
             try { if (codec != null) { codec.stop(); codec.release(); } } catch (Exception ignored) {}
-            ex.release();
+            if (!ok) closeCache();   // something went wrong: next call opens the file fresh
         }
     }
 }
