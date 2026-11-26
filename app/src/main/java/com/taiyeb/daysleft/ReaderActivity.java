@@ -48,10 +48,7 @@ public class ReaderActivity extends Activity {
     FrameLayout playBtn;
     TextView audioBtn;
     boolean chrome = true, finishedToastShown;
-    // text view (reflow): pinch out and the text is set to the screen width at a bigger size instead of overflowing the page
-    ReflowView rf;
-    boolean rfActive, rfBuilding;
-    BookText.Disp disp;             // printed words of the book and how they look; prepared in the background when the book is opened
+    boolean readingText, textTried;   // the book's text is being read quietly in the background (once per opening)
     boolean locked;                 // touch lock (like VLC): the screen ignores touches until the padlock is tapped
     Glyph lockBtn, unlockBtn;       // padlock in the top bar; the one that appears after a tap while locked
     final Runnable hideUnlock = () -> { if (unlockBtn != null) unlockBtn.setVisibility(View.GONE); };
@@ -67,7 +64,7 @@ public class ReaderActivity extends Activity {
     boolean clearArmed;
     BookIndex bi;
     Alignment al = new Alignment();
-    int hlFrom = -1, hlTo = -1, hlWord = -1;   // sentence being read, and the word inside it
+    int hlFrom = -1, hlTo = -1;
     boolean hlOn, followOn;
     int hlStyle;   // 0 marker, 1 underline
     long lastManual, alReloaded;
@@ -179,138 +176,23 @@ public class ReaderActivity extends Activity {
         return true;
     }
 
-    // ====================== text size (bigger text that still fits) ======================
-    /** True when the zoomed view can be used: it needs the word boxes of the book (the words are cut out of the PDF's own rendering). */
-    boolean tryEnterReflow() {
-        if (!fileMode) return false;
-        if (bi != null) return true;
-        if (rfBuilding) Toast.makeText(this, "Preparing the bigger text, a few seconds…", Toast.LENGTH_SHORT).show();
-        else prepareText(true);
-        return false;
-    }
-
-    /** The Text size setting, 1.0 = the page as it is, up to 2.0 = twice as big. */
-    float textZoom() { return Store.num(this, "rdRfZoom", 100) / 100f; }
-
-    /** Applies the Text size: 1.0 shows the normal page, more shows the same page with bigger text, wrapped to the screen. */
-    void applyTextZoom() {
-        float z = textZoom();
-        if (z <= 1.005f) { if (rfActive) exitReflow(); return; }
-        if (!tryEnterReflow()) return;
-        if (!rfActive) enterReflow();
-        rf.setZoom(z);
-    }
-
-    boolean prepTried;
-
+    // ====================== the book's text, read quietly ======================
     /**
-     * Reads the book's text and how it looks (font sizes, bold, italic) in the background, so the text view is ready when you pinch. Not for
-     * scans (no text) and not while the sync service is reading the same book. {@code say} = tell the user when it is done.
+     * A book with audio needs the word positions (for the marker); an index from an older version is discarded when it is opened, so read the text again
+     * in the background (about 15 s, once). Also gives the exact text area for "Trim empty margins". Not while the sync service is reading the same book.
      */
-    void prepareText(boolean say) {
-        if (rfBuilding || item == null || !fileMode || SyncService.running && SyncService.itemId == item.id) return;
-        rfBuilding = true; prepTried = true;
-        if (say) Toast.makeText(this, "Preparing the bigger text (about 15 s)…", Toast.LENGTH_LONG).show();
+    void readBookQuietly() {
+        if (readingText || textTried || item == null || !fileMode || SyncService.running && SyncService.itemId == item.id) return;
+        readingText = true; textTried = true;
         final int id = item.id;
         new Thread(() -> {
             try {
-                BookIndex nb = BookText.ready(this, id) ? BookText.index(this, id) : null;
-                BookText.Disp dw = nb == null ? null : BookText.display(this, id, nb.count());
-                if (dw == null) {
-                    BookIndex fresh = BookText.extract(this, item, pc -> {}, new boolean[1]);   // same deterministic extraction: word numbers do not change
-                    if (BookText.looksScanned(fresh)) { ui(() -> { if (say) Toast.makeText(this, "This PDF is a scan (no text), so the text cannot be made bigger.", Toast.LENGTH_LONG).show(); }); return; }
-                    if (nb != null && nb.count() != fresh.count()) { Dbg.i("Reader", "text view: the PDF changed, word counts differ"); return; }
-                    nb = nb != null ? nb : fresh;
-                    dw = BookText.display(this, id, nb.count());
-                }
-                final BookIndex fb = nb; final BookText.Disp fd = dw;
-                if (fd == null) { ui(() -> { if (say) Toast.makeText(this, "Could not prepare the bigger text for this PDF.", Toast.LENGTH_LONG).show(); }); return; }
-                ui(() -> {
-                    if (bi == null) { bi = fb; al.withBook(fb); }
-                    disp = fd;
-                    if (say) Toast.makeText(this, "Ready: move the Text size slider.", Toast.LENGTH_SHORT).show();
-                    applyTextZoom();
-                });
-            } catch (Throwable e) {
-                Dbg.e("Reader", "text view prepare failed", e);
-                ui(() -> { if (say) Toast.makeText(this, "Could not prepare the bigger text for this PDF.", Toast.LENGTH_LONG).show(); });
-            } finally { rfBuilding = false; }
-        }, "text-view").start();
-    }
-
-    /** Gets the bigger text ready BEFORE the slider is touched, so moving it responds at once: the book's word positions (once) and the page pictures around the reader. */
-    void warmZoom() {
-        if (!fileMode) return;
-        if (bi == null) { if (!prepTried) prepareText(false); return; }
-        rfPicture(cur); rfPicture(cur + 1);
-    }
-
-    int hlColor() { return hlStyle == 1 ? (theme == 3 ? 0xFFFFD54F : 0xFFD9822B) : (theme == 3 ? 0x55FFD54F : 0x70F2B93B); }
-
-    final float[] aspects = new float[100000];
-
-    /** Page height / width, cached (opening a page asks the renderer, which renders one thing at a time). */
-    float aspectOf(int i) {
-        if (i < 0 || i >= n) return 1.414f;
-        if (i < aspects.length && aspects[i] > 0) return aspects[i];
-        float a = 1.414f;
-        try {
-            synchronized (lock) { PdfRenderer.Page pg = pr.openPage(i); try { a = (float) pg.getHeight() / pg.getWidth(); } finally { pg.close(); } }
-        } catch (Throwable ignored) {}
-        if (i < aspects.length) aspects[i] = a;
-        return a;
-    }
-
-    // one sharp picture per page for the bigger text, cached; the normal page picture is shown until it arrives
-    final LruCache<Integer, Bitmap> rfPics = new LruCache<>(4);
-    final Set<Integer> rfInflight = new HashSet<>();
-
-    Bitmap rfPicture(int i) {
-        Bitmap b = rfPics.get(i);
-        if (b != null) return b;
-        if (i >= 0 && i < n && rfInflight.add(i)) {
-            final int w = Math.min(2560, Math.max(renderW, 2200));
-            exec.submit(() -> {
-                try {
-                    Bitmap nb = render(i, w);
-                    h.post(() -> { rfPics.put(i, nb); rfInflight.remove(i); if (rf != null) rf.pictureReady(); });
-                } catch (Throwable t) { h.post(() -> rfInflight.remove(i)); }
-            });
-        }
-        return cache.get(i);   // meanwhile the page the reader already has (a little softer)
-    }
-
-    void enterReflow() {
-        if (rf == null) {
-            rf = new ReflowView(this, bi, disp == null ? null : disp.tok, new ReflowView.Host() {
-                @Override public void onTap() { if (settings.getVisibility() == View.VISIBLE) settings.setVisibility(View.GONE); else showChrome(!chrome); }
-                @Override public void onPage(int p) {
-                    if (p == cur || p < 0 || p >= n) return;
-                    cur = p; updateLabel(cur); if (seek != null) seek.setProgress(cur);
-                    h.removeCallbacks(saver); h.postDelayed(saver, 700);
-                    rfPicture(p + 1);   // the next page's sharp picture is ready before you get there
-                }
-                @Override public void onUserScroll() { lastManual = System.currentTimeMillis(); if (chrome && settings.getVisibility() != View.VISIBLE) showChrome(false); }
-                @Override public Bitmap pageBitmap(int page) { return rfPicture(page); }
-                @Override public float aspect(int page) { return aspectOf(page); }
-            });
-            root.addView(rf, 1, new FrameLayout.LayoutParams(-1, -1));
-        }
-        rf.setColors(INK[theme], PAPER[theme], theme);
-        rf.setVisibility(View.VISIBLE);
-        rfActive = true;
-        int p = hlFrom >= 0 ? bi.pageOf(hlFrom) : cur;
-        rf.showPage(p);
-        rf.setHighlight(hlOn ? hlFrom : -1, hlOn ? hlTo : -1, hlStyle);
-        if (hlFrom >= 0 && hlOn) rf.post(() -> rf.follow(hlFrom));
-    }
-
-    void exitReflow() {
-        if (!rfActive) return;
-        rfActive = false;
-        int p = rf.pageAtTop();
-        rf.setVisibility(View.GONE);
-        goTo(p, false);
+                BookIndex fresh = BookText.extract(this, item, pc -> {}, new boolean[1]);
+                if (BookText.looksScanned(fresh)) return;
+                ui(() -> { if (bi == null) { bi = fresh; al.withBook(fresh); computePageBounds(); computeCrop(); if (pv != null) pv.invalidate(); } });
+            } catch (Throwable e) { Dbg.e("Reader", "reading the book text failed", e); }
+            finally { readingText = false; }
+        }, "book-text").start();
     }
 
     void setLocked(boolean on) {
@@ -385,9 +267,55 @@ public class ReaderActivity extends Activity {
         });
     }
 
-    /** Looks at a handful of pages to find the margins that are always empty, so the text can be drawn bigger. */
+    // ---- Trim empty margins ----
+    // The book's own margins, as fractions of the page, are the same on (almost) every page, so every page is cut the same way and the text keeps one size.
+    // From the printed words' positions when the book is read (exact, instant), else from looking at a few rendered pages. A page whose text reaches
+    // beyond the book-wide cut is never clipped: its own text area is added back (only for that page).
+    float[][] pageB;   // per page: printed text area {left, top, right, bottom} as fractions, or null (a page with almost no text)
+
+    void computePageBounds() {
+        if (bi == null) { pageB = null; return; }
+        float[][] pb = new float[bi.pages][];
+        for (int p = 0; p < bi.pages; p++) {
+            int a = bi.pageStart[p], b = bi.pageStart[p + 1];
+            if (b - a < 12) continue;
+            float l = 1, t = 1, r = 0, bt = 0;
+            for (int j = a; j < b; j++) { l = Math.min(l, bi.box[4 * j]); t = Math.min(t, bi.box[4 * j + 1]); r = Math.max(r, bi.box[4 * j + 2]); bt = Math.max(bt, bi.box[4 * j + 3]); }
+            if (r > l && bt > t) pb[p] = new float[]{l, t, r, bt};
+        }
+        pageB = pb;
+    }
+
+    static float pct(float[] v, int n, float q) { float[] c = java.util.Arrays.copyOf(v, n); java.util.Arrays.sort(c); return c[Math.max(0, Math.min(n - 1, Math.round(q * (n - 1))))]; }
+
+    void applyCrop(float l, float t, float r, float b, boolean save) {
+        cl = l; ct = t; cr = r; cb = b;
+        if (save && item != null) Store.sp(this).edit().putString("trim_" + item.id, l + "," + t + "," + r + "," + b).apply();
+        if (pv != null) pv.invalidate();
+    }
+
     void computeCrop() {
-        if (!trim) { cl = ct = cr = cb = 0; pv.invalidate(); return; }
+        if (!trim) { cl = ct = cr = cb = 0; if (pv != null) pv.invalidate(); return; }
+        // 1. what was found last time: shown at once, no jump when the book opens
+        boolean saved = false;
+        try {
+            String sv = item == null ? null : Store.sp(this).getString("trim_" + item.id, null);
+            if (sv != null) { String[] q = sv.split(","); applyCrop(Float.parseFloat(q[0]), Float.parseFloat(q[1]), Float.parseFloat(q[2]), Float.parseFloat(q[3]), false); saved = true; }
+        } catch (Exception ignored) {}
+        // 2. from the printed words
+        if (pageB != null) {
+            float[] L = new float[pageB.length], T = new float[pageB.length], R = new float[pageB.length], B = new float[pageB.length];
+            int c = 0;
+            for (float[] q : pageB) if (q != null) { L[c] = q[0]; T[c] = q[1]; R[c] = 1 - q[2]; B[c] = 1 - q[3]; c++; }
+            if (c >= 3) {
+                // the margin that (almost) every page respects: ignore the few pages that reach further out (a wide table, a full-width figure)
+                final float pad = 0.012f;
+                float fl = Math.max(0, pct(L, c, 0.1f) - pad), ft = Math.max(0, pct(T, c, 0.1f) - pad), fr = Math.max(0, pct(R, c, 0.1f) - pad), fb = Math.max(0, pct(B, c, 0.1f) - pad);
+                if (1 - fl - fr >= 0.5f && 1 - ft - fb >= 0.5f) { applyCrop(fl, ft, fr, fb, true); return; }
+            }
+        }
+        // 3. no word positions yet and nothing saved: look at a handful of rendered pages for the margins that are always empty
+        if (saved) return;
         exec.submit(() -> {
             try {
                 float l = 1, t = 1, r = 1, b = 1;
@@ -413,9 +341,9 @@ public class ReaderActivity extends Activity {
                 }
                 if (hits == 0) return;
                 final float pad = 0.012f;
-                float fl = Math.max(0, l - pad), fr = Math.max(0, r - pad), ft = Math.max(0, t - pad), fb = Math.max(0, b - pad);
+                final float fl = Math.max(0, l - pad), fr = Math.max(0, r - pad), ft = Math.max(0, t - pad), fb = Math.max(0, b - pad);
                 if (1 - fl - fr < 0.5f || 1 - ft - fb < 0.5f) return;
-                h.post(() -> { cl = fl; cr = fr; ct = ft; cb = fb; if (pv != null) pv.invalidate(); });
+                h.post(() -> { if (pageB == null && trim) applyCrop(fl, ft, fr, fb, true); });
             } catch (Throwable ignored) {}
         });
     }
@@ -426,7 +354,6 @@ public class ReaderActivity extends Activity {
         for (int k = -1; k <= 2; k++) ensure(cur + k);
         ensure(cur);
         if (pv != null) { pv.resetZoom(); pv.invalidate(); }
-        if (rfActive && rf != null && rf.pageAtTop() != cur) rf.showPage(cur);
         updateLabel(cur);
         if (seek != null) seek.setProgress(cur);
         h.removeCallbacks(saver);
@@ -597,10 +524,7 @@ public class ReaderActivity extends Activity {
             if (mt.update(al, bi, t, st == 1, now)) { hlFrom = mt.from; hlTo = mt.to; if (hlOn && pv != null) pv.invalidate(); }
             int hw = mt.word;
             if (fw < 0 && mt.estimated) fw = mt.word;   // the page follows the marker too
-            if (rfActive && rf != null) {
-                rf.setHighlight(hlOn ? hlFrom : -1, hlOn ? hlTo : -1, hlStyle);
-                if (hw >= 0 && followOn && st == 1 && now - lastManual > 5000 && settings.getVisibility() != View.VISIBLE) rf.follow(hw);
-            } else if (fw >= 0 && followOn && st == 1 && now - lastManual > 5000 && pv != null && !pv.dragging && pv.zoom <= 1.01f && settings.getVisibility() != View.VISIBLE) {
+            if (fw >= 0 && followOn && st == 1 && now - lastManual > 5000 && pv != null && !pv.dragging && pv.zoom <= 1.01f && settings.getVisibility() != View.VISIBLE) {
                 int pg = bi.pageOf(fw);
                 if (pg != cur) goTo(pg, false);
             }
@@ -814,14 +738,13 @@ public class ReaderActivity extends Activity {
                 BookIndex b = BookText.ready(this, id) ? BookText.index(this, id) : null;
                 long tl = Dbg.now();
                 Alignment a = Alignment.load(BookText.alignFile(this, id)).withBook(b);
-                final BookText.Disp dw = b == null ? null : BookText.display(this, id, b.count());
                 Dbg.p("Reader", "sync data loaded", tl, "book words " + (b == null ? "none" : b.count()) + ", aligned " + a.size() + (SyncService.running ? ", sync running" : ""));
                 ui(() -> {
-                    bi = b; al = a; seenLiveVer = -1; if (dw != null && disp == null) disp = dw; jumpToAudioPage();
-                    updatePin(); if (pv != null) pv.invalidate();
-                    // an index from an older version is discarded (boxes per line): read the book again quietly; also needed for the bigger text
-                    if (b == null && !prepTried && (textZoom() > 1.005f || (item.audio != null && !item.audio.isEmpty()))) h.postDelayed(() -> prepareText(false), 800);
-                    if (b != null && textZoom() > 1.005f && !rfActive) applyTextZoom();   // the saved Text size
+                    bi = b; al = a; seenLiveVer = -1; jumpToAudioPage(); updatePin();
+                    if (b != null && pageB == null) { computePageBounds(); computeCrop(); }
+                    if (pv != null) pv.invalidate();
+                    // an index from an older version is discarded when opened: read the book again quietly (a book with audio needs it for the marker)
+                    if (b == null && item.audio != null && !item.audio.isEmpty()) h.postDelayed(this::readBookQuietly, 800);
                     // a sync that was interrupted (app closed by the system, low battery) carries on by itself
                     if (b != null && fileMode && !SyncService.running && SyncService.wanted(this, id) && !SyncService.fullFor(this, id) && Whisper.hasModel(this)) {
                         Dbg.i("Sync", "auto-resuming from the reader (was interrupted, not stopped by the user)");
@@ -1393,11 +1316,7 @@ public class ReaderActivity extends Activity {
         aa.setTextSize(17);
         aa.setTypeface(Typeface.create(Typeface.SERIF, Typeface.BOLD));
         aa.setGravity(Gravity.CENTER);
-        aa.setOnClickListener(v -> {
-            boolean open = settings.getVisibility() != View.VISIBLE;
-            settings.setVisibility(open ? View.VISIBLE : View.GONE);
-            if (open) warmZoom();
-        });
+        aa.setOnClickListener(v -> settings.setVisibility(settings.getVisibility() == View.VISIBLE ? View.GONE : View.VISIBLE));
         lockBtn = new Glyph(3);
         lockBtn.setOnClickListener(v -> setLocked(true));
         lockBtn.setPadding(dp(15), dp(10), dp(15), dp(10));   // the drawn padlock is about as tall as the 'Aa' next to it
@@ -1650,29 +1569,6 @@ public class ReaderActivity extends Activity {
         br.setTag("seek");
         settings.addView(br, lpm(-1, -2, 0, 2, 0, 0));
 
-        // Text size: bigger text that wraps to the next line instead of running off the screen (the look of the page never changes)
-        final TextView l3 = new TextView(this);
-        l3.setTag("sub");
-        l3.setTextSize(11);
-        l3.setLetterSpacing(0.1f);
-        settings.addView(l3, lpm(-2, -2, 0, 14, 0, 0));
-        SeekBar zs = new SeekBar(this);
-        zs.setMax(100);
-        zs.setProgress(Math.round((textZoom() - 1f) * 100));
-        l3.setText("TEXT SIZE  " + Math.round(textZoom() * 100) + "%");
-        zs.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
-            @Override public void onProgressChanged(SeekBar s, int p, boolean user) {
-                if (!user) return;
-                Store.setNum(ReaderActivity.this, "rdRfZoom", 100 + p);
-                l3.setText("TEXT SIZE  " + (100 + p) + "%");
-                applyTextZoom();
-            }
-            @Override public void onStartTrackingTouch(SeekBar s) {}
-            @Override public void onStopTrackingTouch(SeekBar s) {}
-        });
-        zs.setTag("seek");
-        settings.addView(zs, lpm(-1, -2, 0, 2, 0, 0));
-
         LinearLayout tr = new LinearLayout(this);
         tr.setGravity(Gravity.CENTER_VERTICAL);
         TextView tt = new TextView(this);
@@ -1694,7 +1590,7 @@ public class ReaderActivity extends Activity {
             hs.setTextSize(15);
             hs.setTag("txt");
             hs.setPadding(0, dp(14), 0, dp(4));
-            hs.setOnClickListener(v -> { hlStyle = 1 - hlStyle; Store.setNum(this, "rdHlStyle", hlStyle); if (rf != null) rf.setHighlight(hlOn ? hlFrom : -1, hlOn ? hlTo : -1, hlStyle); hs.setText("Highlight style: " + (hlStyle == 0 ? "Marker" : "Underline") + "  ›"); if (pv != null) pv.invalidate(); });
+            hs.setOnClickListener(v -> { hlStyle = 1 - hlStyle; Store.setNum(this, "rdHlStyle", hlStyle); hs.setText("Highlight style: " + (hlStyle == 0 ? "Marker" : "Underline") + "  ›"); if (pv != null) pv.invalidate(); });
             settings.addView(hs);
             TextView sy = new TextView(this);
             sy.setText("Sync with the book…");
@@ -1758,7 +1654,6 @@ public class ReaderActivity extends Activity {
 
     void skin() {
         int ink = INK[theme], paper = PAPER[theme], desk = DESK[theme];
-        if (rf != null) rf.setColors(ink, paper, theme);
         chromeBg = (desk & 0x00FFFFFF) | 0xF2000000;
         top.setBackgroundColor(chromeBg);
         bottom.setBackground(box(chromeBg, 24, 24));
@@ -1917,7 +1812,7 @@ public class ReaderActivity extends Activity {
         final Paint paperP = new Paint(Paint.ANTI_ALIAS_FLAG), bmpP = new Paint(Paint.FILTER_BITMAP_FLAG), shP = new Paint(Paint.ANTI_ALIAS_FLAG),
                 grainP = new Paint(), edgeP = new Paint(), dimP = new Paint(), gutP = new Paint();
         final RectF sheet = new RectF();
-        final ScaleGestureDetector sgd;   // unused: pinch zoom is off
+        final ScaleGestureDetector sgd;
         final GestureDetector gd;
 
         PageView() {
@@ -1926,7 +1821,18 @@ public class ReaderActivity extends Activity {
             Random r = new Random(7);
             for (int i = 0; i < 128 * 128 / 5; i++) g.setPixel(r.nextInt(128), r.nextInt(128), Color.argb(8 + r.nextInt(22), 70, 50, 20));
             grainP.setShader(new BitmapShader(g, Shader.TileMode.REPEAT, Shader.TileMode.REPEAT));
-            sgd = null;
+            sgd = new ScaleGestureDetector(ReaderActivity.this, new ScaleGestureDetector.SimpleOnScaleGestureListener() {
+                @Override public boolean onScaleBegin(ScaleGestureDetector d) { scaling = true; cancelAnim(); dragX = 0; return true; }
+                @Override public boolean onScale(ScaleGestureDetector d) {
+                    float nz = Math.max(1f, Math.min(5f, zoom * d.getScaleFactor()));
+                    px *= nz / zoom; py *= nz / zoom;
+                    zoom = nz;
+                    clampPan();
+                    invalidate();
+                    return true;
+                }
+                @Override public void onScaleEnd(ScaleGestureDetector d) { scaling = false; if (zoom < 1.05f) resetZoom(); }
+            });
             gd = new GestureDetector(ReaderActivity.this, new GestureDetector.SimpleOnGestureListener() {
                 @Override public boolean onDown(MotionEvent e) { flung = false; dragging = false; cancelAnim(); return true; }
                 @Override public boolean onSingleTapConfirmed(MotionEvent e) {
@@ -1936,7 +1842,17 @@ public class ReaderActivity extends Activity {
                     showChrome(!chrome);
                     return true;
                 }
-                @Override public boolean onDoubleTap(MotionEvent e) { return true; }   // no double-tap zoom
+                @Override public boolean onDoubleTap(MotionEvent e) {
+                    if (zoom > 1.05f) resetZoom();
+                    else {
+                        zoom = 2.4f;
+                        px = (e.getX() - getWidth() / 2f) * (1 - zoom);
+                        py = (e.getY() - getHeight() / 2f) * (1 - zoom);
+                        clampPan();
+                    }
+                    invalidate();
+                    return true;
+                }
                 @Override public boolean onScroll(MotionEvent a, MotionEvent b, float dx, float dy) {
                     if (scaling) return false;
                     if (zoom > 1.01f) { px -= dx; py -= dy; clampPan(); invalidate(); return true; }
@@ -1980,6 +1896,12 @@ public class ReaderActivity extends Activity {
 
         void resetZoom() { zoom = 1; px = py = 0; }
 
+        /** Turning the phone: a zoom/pan from the other shape would leave the page off screen. */
+        @Override protected void onSizeChanged(int w, int h2, int ow, int oh) {
+            super.onSizeChanged(w, h2, ow, oh);
+            if (ow != 0 || oh != 0) { zoom = 1; px = py = 0; dragX = 0; }
+        }
+
         void clampPan() {
             float mx = (zoom - 1) * getWidth() / 2f, my = (zoom - 1) * getHeight() / 2f;
             px = Math.max(-mx, Math.min(mx, px));
@@ -2015,17 +1937,26 @@ public class ReaderActivity extends Activity {
         }
 
         @Override public boolean onTouchEvent(MotionEvent e) {
-            gd.onTouchEvent(e);   // no pinch zoom: the Text size slider does it (and re-wraps the text so nothing runs off the screen)
+            sgd.onTouchEvent(e);
+            if (!sgd.isInProgress()) gd.onTouchEvent(e);
             int a = e.getActionMasked();
             if ((a == MotionEvent.ACTION_UP || a == MotionEvent.ACTION_CANCEL) && dragging && !flung && zoom <= 1.01f)
                 settle(dragX < -getWidth() * 0.22f && cur < n - 1 ? 1 : dragX > getWidth() * 0.22f && cur > 0 ? -1 : 0);
             return true;
         }
 
-        RectF cropOf(Bitmap b) {
+        RectF cropOf(Bitmap b, int idx) {
             if (b == null) return new RectF(0, 0, 100, 140);
             int w = b.getWidth(), hh = b.getHeight();
-            return trim ? new RectF(cl * w, ct * hh, w - cr * w, hh - cb * hh) : new RectF(0, 0, w, hh);
+            if (!trim) return new RectF(0, 0, w, hh);
+            float l = cl, t = ct, r = cr, bt = cb;   // margins to cut
+            float[] q = pageB != null && idx >= 0 && idx < pageB.length ? pageB[idx] : null;
+            if (q != null) {   // this page's own text is never cut: add its area back
+                final float pad = 0.012f;
+                l = Math.min(l, Math.max(0, q[0] - pad)); t = Math.min(t, Math.max(0, q[1] - pad));
+                r = Math.min(r, Math.max(0, 1 - q[2] - pad)); bt = Math.min(bt, Math.max(0, 1 - q[3] - pad));
+            }
+            return new RectF(l * w, t * hh, w - r * w, hh - bt * hh);
         }
 
         @Override protected void onDraw(Canvas c) {
@@ -2110,7 +2041,7 @@ public class ReaderActivity extends Activity {
             }
             Bitmap b = cache.get(idx);
             if (b != null) {
-                RectF src = cropOf(b);
+                RectF src = cropOf(b, idx);
                 float pad = dp(14);
                 float s = Math.min((sheet.width() - 2 * pad) / src.width(), (sheet.height() - 2 * pad) / src.height());
                 float cw = src.width() * s, ch = src.height() * s;
