@@ -33,7 +33,43 @@ static std::string run(whisper_context *ctx, const std::vector<float> &pcm, int 
     }
     return out;
 }
+// server mode for the end-to-end test:  drv MODEL - THREADS serve
+// stdin:  RUN <file with raw float32 samples at 16 kHz>     stdout: one "SEG<TAB>t0<TAB>t1<TAB>text" per word, then "END"
+// The parameters are those of jni.cpp nRunWords, so the laptop test hears what the phone hears.
+static int serve(const char *model, int threads) {
+    whisper_context_params cp = whisper_context_default_params(); cp.use_gpu = false;
+    whisper_context *ctx = whisper_init_from_file_with_params(model, cp);
+    if (!ctx) { printf("ERR model\nEND\n"); return 1; }
+    printf("READY\n"); fflush(stdout);
+    char line[4096];
+    while (fgets(line, sizeof line, stdin)) {
+        if (strncmp(line, "RUN ", 4) != 0) continue;
+        std::string path(line + 4); while (!path.empty() && (path.back() == '\n' || path.back() == '\r')) path.pop_back();
+        FILE *f = fopen(path.c_str(), "rb");
+        if (!f) { printf("ERR file\nEND\n"); fflush(stdout); continue; }
+        fseek(f, 0, SEEK_END); long n = ftell(f) / 4; fseek(f, 0, SEEK_SET);
+        std::vector<float> pcm(n); size_t got = fread(pcm.data(), 4, n, f); (void) got; fclose(f);
+        whisper_full_params wp = whisper_full_default_params(WHISPER_SAMPLING_GREEDY);
+        wp.language = "en"; wp.translate = false; wp.n_threads = threads;
+        wp.print_progress = wp.print_realtime = wp.print_timestamps = wp.print_special = false;
+        wp.no_context = true; wp.suppress_blank = true; wp.temperature = 0.0f;
+        wp.no_timestamps = false; wp.single_segment = false;
+        wp.token_timestamps = true; wp.max_len = 1; wp.split_on_word = true;
+        if (whisper_full(ctx, wp, pcm.data(), (int) pcm.size()) != 0) { printf("ERR run\nEND\n"); fflush(stdout); continue; }
+        int segs = whisper_full_n_segments(ctx);
+        for (int i = 0; i < segs; i++) {
+            const char *t = whisper_full_get_segment_text(ctx, i);
+            if (!t) continue;
+            printf("SEG\t%.2f\t%.2f\t%s\n", whisper_full_get_segment_t0(ctx, i) / 100.0, whisper_full_get_segment_t1(ctx, i) / 100.0, t);
+        }
+        printf("END\n"); fflush(stdout);
+    }
+    whisper_free(ctx);
+    return 0;
+}
+
 int main(int argc, char **argv) {
+    if (argc > 4 && strcmp(argv[4], "serve") == 0) return serve(argv[1], atoi(argv[3]));
     const char *model = argv[1], *wav = argv[2]; int threads = atoi(argv[3]);
     whisper_context_params cp = whisper_context_default_params(); cp.use_gpu = false;
     double t0 = now(); whisper_context *ctx = whisper_init_from_file_with_params(model, cp);

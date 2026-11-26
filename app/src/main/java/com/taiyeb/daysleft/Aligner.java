@@ -16,6 +16,8 @@ class Aligner {
     }
 
     private final BookIndex bi;
+    /** The narrator's usual words per second, if known: a match whose implied pace is far from it is a false match. 0 = unknown. */
+    volatile double paceHint;
     Aligner(BookIndex bi) { this.bi = bi; }
 
     /** words[i] was spoken at times[i]. Only book positions in [lo, hi] are considered. */
@@ -76,7 +78,9 @@ class Aligner {
      * (time against book position). A common word pair matched at the wrong place does not: drop it. Uses the median
      * slope (Theil-Sen), so a few wrong points cannot drag the line. Null if too little is left or the pace is absurd.
      */
-    static Out consistent(Out o) {
+    Out consistent(Out o) { return consistent(o, paceHint); }
+
+    static Out consistent(Out o, double hint) {
         int n = o.pos.length;
         if (n < 4) return n >= 3 ? o : null;
         double[] sl = new double[n * (n - 1) / 2];
@@ -87,7 +91,8 @@ class Aligner {
         double[] ss = Arrays.copyOf(sl, c);
         Arrays.sort(ss);
         double m = ss[c / 2];
-        if (m < 0.12 || m > 1.6) return null;       // outside 0.6..8 words per second: not speech matching the book
+        if (m < 0.16 || m > 0.85) return null;      // outside 1.2..6 words per second: not a person reading this book (a false match)
+        if (hint > 0 && (1 / m < 0.5 * hint || 1 / m > 1.8 * hint)) return null;   // far from this narrator's pace: a false match
         double[] ic = new double[n];
         for (int i = 0; i < n; i++) ic[i] = o.time[i] - m * o.pos[i];
         double[] sc = ic.clone();

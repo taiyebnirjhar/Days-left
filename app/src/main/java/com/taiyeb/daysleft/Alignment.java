@@ -11,6 +11,28 @@ class Alignment {
     private int[] aw = new int[0];
     private double[] at = new double[0];
     private double typ;   // the narrator's usual words per second (median over close probe pairs); 0 if unknown
+    private double[] cum; // cumulative "speaking time" in word units per book word (a sentence end adds a pause); null = plain word counting
+    /** A narrator pauses at the end of a sentence for about this long. */
+    static final double SENTENCE_PAUSE_S = 0.5;
+
+    double typicalWps() { return typ; }
+
+    /**
+     * Interpolating by word count spreads time evenly over words, but a narrator pauses between sentences, so a boundary
+     * lands 1 to 3 s off inside a long gap. With the book's sentence ends known, each end counts as a pause worth
+     * SENTENCE_PAUSE_S of speech, which puts the boundary where the audio has it.
+     */
+    Alignment withBook(BookIndex bi) {
+        if (typ > 0 && bi != null) {
+            double credit = SENTENCE_PAUSE_S * typ;
+            double[] c = new double[bi.count() + 1];
+            for (int j = 0; j < bi.count(); j++) c[j + 1] = c[j] + 1 + ((bi.flag[j] & 1) != 0 ? credit : 0);
+            cum = c;
+        } else cum = null;
+        return this;
+    }
+
+    private double wt(int j) { return cum == null ? j : cum[Math.max(0, Math.min(cum.length - 1, j))]; }
     static final double MAX_GAP_S = 200;    // sparse sync leaves gaps up to ~165 s; beyond this, do not trust interpolation
     static final int MAX_GAP_W = 900;
 
@@ -110,7 +132,8 @@ class Alignment {
         int i = floorW(j);
         if (i < 0 || i + 1 >= aw.length) return i >= 0 && aw[i] == j ? at[i] : -1;
         if (aw[i + 1] - aw[i] > MAX_GAP_W || at[i + 1] - at[i] > MAX_GAP_S) return aw[i] == j ? at[i] : -1;
-        return at[i] + (j - aw[i]) * (at[i + 1] - at[i]) / (double) (aw[i + 1] - aw[i]);
+        double span = wt(aw[i + 1]) - wt(aw[i]);
+        return at[i] + (wt(j) - wt(aw[i])) * (at[i + 1] - at[i]) / (span <= 0 ? 1 : span);
     }
 
     /**
@@ -125,12 +148,51 @@ class Alignment {
         return at[i + 1] - at[i];
     }
 
+    /** Max seconds between the probes around t for a sentence highlight / an automatic page turn. */
+    static final double HL_GAP = 25, FLIP_GAP = 60;
+
+    /** The book word to highlight at second t, or -1: only where the probes around t are close and no pause hides between them. */
+    int highlightWordAt(double t) {
+        int j = wordAtTime(t);
+        if (j < 0 || gapAt(t) > HL_GAP) return -1;
+        int i = floorT(t);
+        if (i >= 0 && i + 1 < at.length && skippedTextBetween(i)) {
+            // text nobody read lies in this gap. A short gap: stay on a word that was really spoken. A long one: say nothing until a probe looks inside.
+            if (at[i + 1] - at[i] > 3) return -1;
+            return t - at[i] < at[i + 1] - t ? aw[i] : aw[i + 1];
+        }
+        return j;
+    }
+
+    /** The book word to turn the page for at second t, or -1. */
+    int flipWordAt(double t) {
+        int j = wordAtTime(t);
+        return j >= 0 && gapAt(t) <= FLIP_GAP ? j : -1;
+    }
+
     /** Book word being spoken at second t, or -1 if unknown. */
     int wordAtTime(double t) {
         int i = floorT(t);
         if (i < 0) return -1;
         if (i + 1 >= aw.length) return t - at[i] < 6 ? aw[i] : -1;
         if (aw[i + 1] - aw[i] > MAX_GAP_W || at[i + 1] - at[i] > MAX_GAP_S) return t - at[i] < 4 ? aw[i] : -1;
-        return aw[i] + (int) ((t - at[i]) * (aw[i + 1] - aw[i]) / (at[i + 1] - at[i]));
+        if (cum == null) return aw[i] + (int) ((t - at[i]) * (aw[i + 1] - aw[i]) / (at[i + 1] - at[i]));
+        double target = wt(aw[i]) + (t - at[i]) / (at[i + 1] - at[i]) * (wt(aw[i + 1]) - wt(aw[i]));
+        int lo = aw[i], hi = aw[i + 1];
+        while (lo < hi) { int m = (lo + hi + 1) >>> 1; if (cum[m] <= target) lo = m; else hi = m - 1; }
+        return lo;
     }
+
+    /**
+     * True when the words between two probes are far too MANY for the time between them: text in the book that the narrator did not
+     * read (footnotes, page numbers, a skipped passage) sits in that gap.
+     */
+    boolean skippedTextBetween(int i) {
+        double dt = at[i + 1] - at[i];
+        int dw = aw[i + 1] - aw[i];
+        return typ > 0 && dw >= 5 && dt > 0.2 && dw / dt > FAST_GAP * typ;
+    }
+
+    /** Words per second between two probes more than this times the usual: unread text is probably in between. */
+    static final double FAST_GAP = 1.3;
 }

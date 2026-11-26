@@ -19,7 +19,7 @@ final class SyncPlanner {
     /** Highlighting a sentence needs probes close together right around the playhead: 20 s apart from 40 s behind to 150 s ahead of it (swept in tests/host/simrun.sh: 20 s keeps 0 wrong highlights and shows the first one a call sooner than 12 s), 30 s apart within 5 min, else DENSE_GAP. */
     /** A page start is only answered when the two probes around it are this close (seconds): then it is right to well under a second. */
     static final double GOAL_GAP = 25;
-    static double NEAR_BEHIND = 40, NEAR_AHEAD = 150, DENSE_NEAR = 20, DENSE_MID = 30;
+    static double NEAR_BEHIND = 40, NEAR_AHEAD = 150, DENSE_NEAR = 14, DENSE_MID = 30;
     static final int EXT_FAILS_WIDE = 4, EXT_FAILS_GIVE_UP = 8, SEED_TRIES = 12, GAP_TRIES = 2;
 
     /** What to listen to. Fill in the result with feed(). */
@@ -29,7 +29,7 @@ final class SyncPlanner {
         boolean wide;
         int kind;           // 0 seed, 1 forward, 2 backward, 3 gap, 4 goal
         String why = "";
-        double gapLeftT;    // kind 3: identifies the gap
+        double gapLeftT, gapRightT;    // kind 3: identifies the gap
         double prevT; int prevW; // kind 1/2: the anchor the prediction is measured from
     }
 
@@ -42,6 +42,8 @@ final class SyncPlanner {
     private boolean fwdDone, bwdDone, turnFwd = true, seeded;
     private final Map<Long, Integer> gapTries = new HashMap<>();
     private final Set<Long> badGaps = new HashSet<>();
+    /** Stretches that were listened to and held nothing usable (silence, an intro, music): they count as settled, not as missing. */
+    private final List<double[]> voids = new ArrayList<>();
     /** Only map this far (seconds) either side of the playhead; infinity = the whole book. */
     double reach = Double.POSITIVE_INFINITY;
     /** Where the user is listening right now (follows the player). */
@@ -124,10 +126,18 @@ final class SyncPlanner {
      */
     double[] zoneProgress() {
         double lo = Math.max(0, focus - NEAR_BEHIND), hi = Math.min(total, focus + NEAR_AHEAD);
-        double covered = 0, pt = -1;
+        List<double[]> iv = new ArrayList<>();
+        double pt = -1;
         for (Double t : anchors.subMap(lo - 120, true, hi + 120, true).keySet()) {
-            if (pt >= 0 && t - pt <= DENSE_NEAR + 5) covered += Math.max(0, Math.min(t, hi) - Math.max(pt, lo));
+            if (pt >= 0 && t - pt <= DENSE_NEAR + 5) iv.add(new double[]{pt, t});
             pt = t;
+        }
+        for (double[] v : voids) if (v[1] > lo && v[0] < hi) iv.add(v);   // listened to, nothing there: settled
+        iv.sort((x, y) -> Double.compare(x[0], y[0]));
+        double covered = 0, curEnd = lo;
+        for (double[] v : iv) {
+            double a2 = Math.max(Math.max(v[0], lo), curEnd), b2 = Math.min(v[1], hi);
+            if (b2 > a2) { covered += b2 - a2; curEnd = b2; } else if (b2 > curEnd) curEnd = b2;
         }
         return new double[]{Math.min(covered, hi - lo), Math.max(1, hi - lo)};
     }
@@ -151,6 +161,9 @@ final class SyncPlanner {
     }
 
     int anchorCount() { return anchors.size(); }
+
+    /** The narrator's usual words per second, from probes that are close together; 0 when unknown. */
+    double typicalWps() { return typicalRate(); }
 
     /** Book word being spoken at second t if it is known well (between close anchors, or just next to one), else -1. */
     int wordNear(double t) {
@@ -432,7 +445,8 @@ final class SyncPlanner {
         final double typ = dense ? typicalRate() : 0;
         for (Map.Entry<Double, Integer> e : anchors.entrySet()) {
             double t = e.getKey();
-            boolean pauseGap = dense && pt >= 0 && t - pt > 7 && typ > 0 && (e.getValue() - pw) / (t - pt) < 0.55 * typ;   // a pause or music sits in here: look inside
+            double rr = pt >= 0 && t > pt ? (e.getValue() - pw) / (t - pt) : 0;
+            boolean pauseGap = dense && pt >= 0 && t - pt > 7 && typ > 0 && (rr < 0.55 * typ || (e.getValue() - pw >= 5 && rr > Alignment.FAST_GAP * typ));   // a pause, music or unread text sits in here: look inside
             if (pt >= 0 && t - pt <= GAP_MAX && (t - pt > gapLimit((pt + t) / 2) || pauseGap) && !badGaps.contains(Math.round(pt * 10)) && !inFlightGaps.contains(Math.round(pt * 10)) && pt < startSec + reach && t > startSec - reach) {
                 double d = Math.abs((pt + t) / 2 - focus);
                 if (d < bestD) { bestD = d; lt = pt; rt = t; lw = pw; rw = e.getValue(); }
@@ -441,7 +455,7 @@ final class SyncPlanner {
         }
         if (bestD == Double.MAX_VALUE) return null;
         Req r = new Req();
-        r.kind = 3; r.gapLeftT = lt;
+        r.kind = 3; r.gapLeftT = lt; r.gapRightT = rt;
         inFlightGaps.add(Math.round(lt * 10));
         double mid = (lt + rt) / 2;
         r.len = Math.min(PROBE, rt - lt - 4);
@@ -455,6 +469,7 @@ final class SyncPlanner {
     int feed(Req r, Aligner.Out o) {
         int kept = 0;
         boolean ok = o != null && o.pos.length >= (r.kind == 0 ? 5 : 3) && (r.kind != 0 || o.votes >= 6);
+        if (!ok && r.kind == 0) voids.add(new double[]{r.start, r.start + r.len});
         if (r.kind == 0) {
             if (ok) { kept = add(o); seeded = true; placeCursors((o.time[0] + o.time[o.time.length - 1]) / 2); }
             return kept;
@@ -470,12 +485,13 @@ final class SyncPlanner {
             if (ok) kept = add(o);
             if (kept == 0) {
                 int n = gapTries.merge(key, 1, Integer::sum);
-                if (n >= GAP_TRIES) badGaps.add(key);
+                if (n >= GAP_TRIES) { badGaps.add(key); voids.add(new double[]{r.gapLeftT, r.gapRightT}); }
             }
             return kept;
         }
         boolean fwd = r.kind == 1;
         if (!ok) {
+            if (fwd) voids.add(new double[]{r.start, r.start + r.len + 20}); else voids.add(new double[]{r.start - 20, r.start + r.len});
             if (fwd) { fwdFails++; fwdCursor += 20; fwdStride = Math.max(0, fwdStride / 2); if (fwdFails >= EXT_FAILS_GIVE_UP) { fwdDone = true; lost = true; } }
             else {
                 bwdFails++; bwdEnd -= 20; bwdStride = Math.max(0, bwdStride / 2);

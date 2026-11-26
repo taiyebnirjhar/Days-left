@@ -6,7 +6,7 @@ Plain Java, no androidx, all views built in code. Keep it that way. Package `com
 ## Build
 - `gradle assembleDebug --no-daemon -q` (AGP 8.10.1, compileSdk 36, minSdk 26, NDK 27.2.12479018, cmake 3.22.1, abi arm64-v8a only)
 - Set `ANDROID_HOME` first. APK: `app/build/outputs/apk/debug/app-debug.apk`
-- Bump `versionCode`/`versionName` in `app/build.gradle` and the "Days Left X.Y" label in MainActivity.java each delivery. Current: 3.35 (49).
+- Bump `versionCode`/`versionName` in `app/build.gradle` and the "Days Left X.Y" label in MainActivity.java each delivery. Current: 3.36 (50).
 - Dependency: `com.tom-roush:pdfbox-android:2.0.27.0`. whisper.cpp is vendored in `app/src/main/cpp/whisper` (CPU only), wrapped by `cpp/jni.cpp`.
 
 ## Features
@@ -23,6 +23,9 @@ Countdowns (status bar, notification, overlay) + Library: eye-friendly PDF reade
 - UX: first Play on an unsynced book asks (`askSync`: benefits, be patient, keep listening/reading; 'Sync and play' / 'Just play' / 'Don't ask'), the panel hides itself after 9 s and a toast says when it is ready. Unset model = tiny.
 - Audio decode (`AudioClip`) keeps the opened file and the codec between clips (flush) and drains without 10 ms waits; it retries once fresh on any failure.
 - Settings -> Debug log (`Dbg.java`): file log, copies for sharing. Records Java crashes and, on API 30+, why previous runs ended (native crashes show as CRASH_NATIVE). Use it, do not guess.
+
+- v3.36 end-to-end test (`tests/e2e/run.sh [scale] [scenarios]`, details in the file header): builds three synthetic audiobooks with a KNOWN timeline from public-domain text (neural voices, robotic voice + 12 dB noise + numbers, skipped sentences, spoken intro, page numbers/footnotes glued in, AAC), runs the app's real pure-Java `SyncCore` (the sync loop, shared with `SyncService`), `SyncPlanner`, `Aligner`, `Alignment`, `Highlight` with real whisper tiny.en (`tests/host/whisper/drv.cpp` in serve mode) and modelled phone latency, then scores the highlight the reader would show (`switchError`). Checks: first highlight median <= 45 s, zone ready p90 <= 90 s, >= 98.5% of shown highlights correct, shown >= 85% (80% on corpus C). Results v3.36 (scale 1, play): A 99.8%, B 99.6%, C 99.6% correct. Needs `truth_tsv.py` for each corpus (run.sh does it). Cannot cover: MediaCodec decode, UI, Android services.
+- v3.36 rules found by the test: `Alignment.withBook` credits SENTENCE_PAUSE_S of silence per sentence end when interpolating (boundaries land where the audio has them); `highlightWordAt` hides the highlight inside gaps where unread text is likely (words/s > FAST_GAP x usual) unless the gap is <= 3 s, and the planner probes such gaps; `Aligner.paceHint` rejects clusters whose pace is implausible (absolute band 1.2-6 words/s); `Highlight.sentenceFor` shows nothing on page numbers/lone figures; `SyncPlanner.voids` marks stretches that were listened to but have no speech (intro, music) so 'ready' does not wait for them; DENSE_NEAR 14 (was 20: +10 s to the first highlight, wrong highlights 11 -> 2 on A).
 
 ## Open problems (as of v3.17)
 1. NATIVE CRASH in `Whisper.nRun` (no_timestamps + single_segment, 12 s clip) ~1.7 s after model load on the device. Removing `audio_ctx` did not fix it. v3.17 routes `Whisper.transcribe` through `nRunSegs` instead (the path the sync used successfully). UNVERIFIED on device. Real fix needs a repro: build the JNI/whisper for x86_64 on the host, run both paths with the real model (ggml-base.en-q5_1.bin from huggingface) on a 12 s clip, use gdb/ASan.

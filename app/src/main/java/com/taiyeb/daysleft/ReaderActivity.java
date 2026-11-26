@@ -68,7 +68,6 @@ public class ReaderActivity extends Activity {
     int goPage;
     boolean jumpToAudio;
     double aT, aDur;
-    static final double HL_GAP = 25, FLIP_GAP = 60;   // max seconds between mapped probes for a sentence highlight / an automatic page turn
     long lastFollowStart;
     int aState = -1, speedIdx, bottomInset, chromeBg;
     long lastSave;
@@ -412,17 +411,17 @@ public class ReaderActivity extends Activity {
         long now = System.currentTimeMillis();
         if (now - lastSave > 5000 && t > 1) { lastSave = now; Learn.setAudio(this, item.id, (int) t, null); }
         if (al.size() > 0 && bi != null) {
-            int j = al.wordAtTime(t);
-            double gap = al.gapAt(t);
-            if (j >= 0 && gap <= HL_GAP) {
-                int[] r = bi.sentenceAround(j);
-                if (r[0] != hlFrom) { hlFrom = r[0]; hlTo = r[1]; if (hlOn && pv != null) pv.invalidate(); }
+            int hw = al.highlightWordAt(t), fw = al.flipWordAt(t);   // the rules live in Alignment, so the end-to-end test uses the same ones
+            if (hw >= 0) {
+                int[] r = Highlight.sentenceFor(bi, hw);   // null: nothing to read there (a page number or a lone figure)
+                if (r == null) { if (hlFrom >= 0) { hlFrom = hlTo = -1; if (pv != null) pv.invalidate(); } }
+                else if (r[0] != hlFrom) { hlFrom = r[0]; hlTo = r[1]; if (hlOn && pv != null) pv.invalidate(); }
             } else if (hlFrom >= 0) {
                 hlFrom = hlTo = -1;   // better no highlight than a wrong one: the probes around here are too far apart (yet)
                 if (pv != null) pv.invalidate();
             }
-            if (j >= 0 && gap <= FLIP_GAP && followOn && st == 1 && now - lastManual > 5000 && pv != null && !pv.dragging && pv.zoom <= 1.01f && settings.getVisibility() != View.VISIBLE) {
-                int pg = bi.pageOf(j);
+            if (fw >= 0 && followOn && st == 1 && now - lastManual > 5000 && pv != null && !pv.dragging && pv.zoom <= 1.01f && settings.getVisibility() != View.VISIBLE) {
+                int pg = bi.pageOf(fw);
                 if (pg != cur) goTo(pg, false);
             }
         }
@@ -634,7 +633,7 @@ public class ReaderActivity extends Activity {
             try {
                 BookIndex b = BookText.ready(this, id) ? BookText.index(this, id) : null;
                 long tl = Dbg.now();
-                Alignment a = Alignment.load(BookText.alignFile(this, id));
+                Alignment a = Alignment.load(BookText.alignFile(this, id)).withBook(b);
                 Dbg.p("Reader", "sync data loaded", tl, "book words " + (b == null ? "none" : b.count()) + ", aligned " + a.size() + (SyncService.running ? ", sync running" : ""));
                 ui(() -> {
                     bi = b; al = a; jumpToAudioPage(); updatePin(); if (pv != null) pv.invalidate();

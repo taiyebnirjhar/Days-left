@@ -159,45 +159,16 @@ class Whisper {
     static synchronized String[] transcribeBatch(Context c, float[][] clips) {
         ensureCtx(c);
         if (ctx == 0) return null;
-        final int gap = 16000;
-        int total = 0;
-        for (float[] k : clips) total += k.length + gap;
-        float[] buf = new float[total];
         double[] off = new double[clips.length], len = new double[clips.length];
-        int pos = 0;
-        for (int i = 0; i < clips.length; i++) {
-            off[i] = pos / 16000.0; len[i] = clips[i].length / 16000.0;
-            System.arraycopy(clips[i], 0, buf, pos, clips[i].length);
-            pos += clips[i].length + gap;
-        }
+        float[] buf = WordSplit.combine(clips, off, len);
         long t = Dbg.now();
         boolean words = wordMode();
         if (words) Store.sp(appCtx).edit().putBoolean("wordPending", true).commit();   // if the process dies inside the call, next time we know
         String raw = words ? nRunWords(ctx, buf, threads()) : nRunSegs(ctx, buf, threads());
         if (words) Store.sp(appCtx).edit().putBoolean("wordPending", false).commit();
         if (raw == null) return null;
-        if (!stopping()) tuned(Dbg.ms(t), total / 16000.0);
-        StringBuilder[] sb = new StringBuilder[clips.length];
-        for (int i = 0; i < sb.length; i++) sb[i] = new StringBuilder();
-        for (String line : raw.split("\n")) {
-            String[] p = line.split("\t", 3);
-            if (p.length < 3) continue;
-            double s0, s1;
-            try { s0 = Double.parseDouble(p[0]); s1 = Double.parseDouble(p[1]); } catch (Exception e) { continue; }
-            String[] ws = p[2].trim().split("\\s+");
-            for (int k = 0; k < ws.length; k++) {
-                if (ws[k].isEmpty()) continue;
-                // word mode: the model's start is a little early and its end runs into the next word, so take start+0.3 s, never past the middle
-                double tw = words ? Math.min(s0 + 0.3, (s0 + s1) / 2) : s0 + (k + 0.5) / ws.length * Math.max(0.2, s1 - s0);
-                int ci = 0;
-                for (int i = 0; i < off.length; i++) if (off[i] <= tw) ci = i;
-                double rel = Math.max(0, Math.min(len[ci], tw - off[ci]));
-                sb[ci].append(String.format(java.util.Locale.US, "%.2f\t%.2f\t%s\n", rel, rel, ws[k]));
-            }
-        }
-        String[] out = new String[clips.length];
-        for (int i = 0; i < out.length; i++) out[i] = sb[i].toString();
-        return out;
+        if (!stopping()) tuned(Dbg.ms(t), buf.length / 16000.0);
+        return WordSplit.split(raw, off, len, words);
     }
 
     static synchronized void release() { if (ctx != 0) { nFree(ctx); ctx = 0; ctxModel = -1; } }
