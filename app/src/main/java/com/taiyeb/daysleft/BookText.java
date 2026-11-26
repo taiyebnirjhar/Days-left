@@ -33,6 +33,7 @@ class BookText {
         final ArrayList<float[]> boxes = new ArrayList<>();
         final ArrayList<Byte> flags = new ArrayList<>();
         final ArrayList<String> disp = new ArrayList<>();   // the word as printed (case, punctuation); "" for the 2nd+ piece of one printed token
+        final ArrayList<int[]> look = new ArrayList<>();    // per word {bold|italic bits, font size in half points}
         float pw = 612, ph = 792;
 
         BoxStripper() throws IOException { super(); }
@@ -54,17 +55,31 @@ class BookText {
                 y0 = Math.min(y0, y - h); y1 = Math.max(y1, y + h * 0.22f);
             }
             float[] bx = {clamp(x0 / pw), clamp(y0 / ph), clamp(x1 / pw), clamp(y1 / ph)};
-            for (String tok : text.trim().split("\\s+")) {
+            java.util.regex.Matcher tm = java.util.regex.Pattern.compile("\\S+").matcher(text);
+            while (tm.find()) {
+                String tok = tm.group();
                 List<String> ws = PageMatcher.words(tok);
                 if (ws.isEmpty()) continue;
+                int[] lk = lookOf(pos.get(Math.min(tm.start(), pos.size() - 1)));
                 boolean end = endsSentence(tok, ws.get(ws.size() - 1));
                 for (int k = 0; k < ws.size(); k++) {
                     words.add(ws.get(k));
                     boxes.add(bx);
                     flags.add((byte) (end && k == ws.size() - 1 ? 1 : 0));
                     disp.add(k == 0 ? tok : "");
+                    look.add(lk);
                 }
             }
+        }
+
+        static int[] lookOf(TextPosition t) {
+            int bits = 0;
+            try {
+                String fn = t.getFont() == null || t.getFont().getName() == null ? "" : t.getFont().getName().toLowerCase(Locale.ROOT);
+                if (fn.contains("bold") || fn.contains("black") || fn.contains("heavy") || fn.contains("semibold")) bits |= 1;
+                if (fn.contains("italic") || fn.contains("oblique")) bits |= 2;
+            } catch (Exception ignored) {}
+            return new int[]{bits, Math.round(t.getFontSizeInPt() * 2)};
         }
 
         static float clamp(float v) { return Math.max(0f, Math.min(1f, v)); }
@@ -118,7 +133,7 @@ class BookText {
         boolean scanned = looksScanned(bi);
         if (!scanned) {
             bi.save(file(c, it.id));
-            try { saveDisplay(c, it.id, st.disp); } catch (Exception e) { Dbg.e("Book", "could not save the display text", e); }
+            try { saveDisplay(c, it.id, st.disp, st.look); } catch (Exception e) { Dbg.e("Book", "could not save the display text", e); }
         }
         Dbg.p("Book", "text read", tx, bi.pages + " pages, " + m + " words" + (scanned ? ", LOOKS SCANNED (too little text)" : ", saved"));
         return bi;
@@ -126,21 +141,34 @@ class BookText {
 
     static File dispFile(Context c, int itemId) { return new File(c.getFilesDir(), "tx_" + itemId + ".txt"); }
 
-    private static void saveDisplay(Context c, int itemId, List<String> disp) throws IOException {
+    private static void saveDisplay(Context c, int itemId, List<String> disp, List<int[]> look) throws IOException {
         File f = new File(dispFile(c, itemId).getPath() + ".tmp");
         try (Writer w = new BufferedWriter(new OutputStreamWriter(new FileOutputStream(f), "UTF-8"), 1 << 16)) {
-            for (String t : disp) { w.write(t); w.write('\n'); }
+            w.write("#v2\n");
+            for (int i = 0; i < disp.size(); i++) { int[] l = look.get(i); w.write(l[0] + " " + l[1] + " " + disp.get(i) + "\n"); }
         }
         if (!f.renameTo(dispFile(c, itemId))) throw new IOException("rename failed");
     }
 
-    /** The printed words, one per index word, for the text view. Null if not saved yet (books read before v3.39) or out of step with the index. */
-    static String[] display(Context c, int itemId, int words) {
+    /** The printed words with how they look, one per index word, for the text view. */
+    static final class Disp {
+        String[] tok; byte[] bits; short[] half;   // half = font size in half points
+    }
+
+    /** Null if not saved yet (books read before v3.40 have no look data) or out of step with the index. */
+    static Disp display(Context c, int itemId, int words) {
         File f = dispFile(c, itemId);
         if (!f.exists()) return null;
         try {
             List<String> l = java.nio.file.Files.readAllLines(f.toPath(), java.nio.charset.StandardCharsets.UTF_8);
-            return l.size() == words ? l.toArray(new String[0]) : null;
+            if (l.isEmpty() || !l.get(0).equals("#v2") || l.size() - 1 != words) return null;
+            Disp d = new Disp();
+            d.tok = new String[words]; d.bits = new byte[words]; d.half = new short[words];
+            for (int i = 0; i < words; i++) {
+                String[] q = l.get(i + 1).split(" ", 3);
+                d.bits[i] = (byte) Integer.parseInt(q[0]); d.half[i] = (short) Integer.parseInt(q[1]); d.tok[i] = q.length > 2 ? q[2] : "";
+            }
+            return d;
         } catch (Exception e) { return null; }
     }
 

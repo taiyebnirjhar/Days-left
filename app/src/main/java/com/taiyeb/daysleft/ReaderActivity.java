@@ -51,7 +51,7 @@ public class ReaderActivity extends Activity {
     // text view (reflow): pinch out and the text is set to the screen width at a bigger size instead of overflowing the page
     ReflowView rf;
     boolean rfActive, rfBuilding;
-    String[] disp;                  // printed words of the book, null until saved (books read before v3.39 are rebuilt on the first pinch)
+    BookText.Disp disp;             // printed words of the book and how they look; prepared in the background when the book is opened
     boolean locked;                 // touch lock (like VLC): the screen ignores touches until the padlock is tapped
     Glyph lockBtn, unlockBtn;       // padlock in the top bar; the one that appears after a tap while locked
     final Runnable hideUnlock = () -> { if (unlockBtn != null) unlockBtn.setVisibility(View.GONE); };
@@ -180,25 +180,47 @@ public class ReaderActivity extends Activity {
     // ====================== text view ======================
     /** Pinch-out hands over to the text view when the printed words are available. False = keep the normal page zoom. */
     boolean tryEnterReflow() {
-        if (bi == null || !fileMode) return false;
-        if (disp == null) {
-            if (!rfBuilding) {
-                rfBuilding = true;
-                Toast.makeText(this, "Preparing the text view (about 15 s). Pinch again when it says ready.", Toast.LENGTH_LONG).show();
-                final int id = item.id;
-                new Thread(() -> {
-                    try {
-                        BookIndex nb = BookText.extract(this, item, pc -> {}, new boolean[1]);
-                        String[] dw = BookText.display(this, id, nb.count());
-                        if (dw != null && bi != null && nb.count() == bi.count()) { disp = dw; ui(() -> Toast.makeText(this, "Text view ready: pinch out to zoom the text.", Toast.LENGTH_LONG).show()); }
-                        else ui(() -> Toast.makeText(this, "Could not prepare the text view for this PDF.", Toast.LENGTH_LONG).show());
-                    } catch (Exception e) { Dbg.e("Reader", "text view prepare failed", e); ui(() -> Toast.makeText(this, "Could not prepare the text view for this PDF.", Toast.LENGTH_LONG).show()); }
-                    finally { rfBuilding = false; }
-                }, "text-view").start();
-            }
-            return false;
-        }
-        return true;
+        if (!fileMode) return false;
+        if (bi != null && disp != null) return true;
+        if (rfBuilding) Toast.makeText(this, "Preparing the text view, a few seconds…", Toast.LENGTH_SHORT).show();
+        else if (!prepTried || bi == null || disp == null) prepareText(true);
+        return false;
+    }
+
+    boolean prepTried;
+
+    /**
+     * Reads the book's text and how it looks (font sizes, bold, italic) in the background, so the text view is ready when you pinch. Not for
+     * scans (no text) and not while the sync service is reading the same book. {@code say} = tell the user when it is done.
+     */
+    void prepareText(boolean say) {
+        if (rfBuilding || item == null || !fileMode || SyncService.running && SyncService.itemId == item.id) return;
+        rfBuilding = true; prepTried = true;
+        if (say) Toast.makeText(this, "Preparing the text view (about 15 s). Pinch again when it is ready.", Toast.LENGTH_LONG).show();
+        final int id = item.id;
+        new Thread(() -> {
+            try {
+                BookIndex nb = BookText.ready(this, id) ? BookText.index(this, id) : null;
+                BookText.Disp dw = nb == null ? null : BookText.display(this, id, nb.count());
+                if (dw == null) {
+                    BookIndex fresh = BookText.extract(this, item, pc -> {}, new boolean[1]);   // same deterministic extraction: word numbers do not change
+                    if (BookText.looksScanned(fresh)) { ui(() -> { if (say) Toast.makeText(this, "This PDF is a scan (no text), so there is no text view.", Toast.LENGTH_LONG).show(); }); return; }
+                    if (nb != null && nb.count() != fresh.count()) { Dbg.i("Reader", "text view: the PDF changed, word counts differ"); return; }
+                    nb = nb != null ? nb : fresh;
+                    dw = BookText.display(this, id, nb.count());
+                }
+                final BookIndex fb = nb; final BookText.Disp fd = dw;
+                if (fd == null) { ui(() -> { if (say) Toast.makeText(this, "Could not prepare the text view for this PDF.", Toast.LENGTH_LONG).show(); }); return; }
+                ui(() -> {
+                    if (bi == null) { bi = fb; al.withBook(fb); }
+                    disp = fd;
+                    if (say) Toast.makeText(this, "Text view ready: pinch out to zoom the text.", Toast.LENGTH_LONG).show();
+                });
+            } catch (Throwable e) {
+                Dbg.e("Reader", "text view prepare failed", e);
+                ui(() -> { if (say) Toast.makeText(this, "Could not prepare the text view for this PDF.", Toast.LENGTH_LONG).show(); });
+            } finally { rfBuilding = false; }
+        }, "text-view").start();
     }
 
     int hlColor() { return hlStyle == 1 ? (theme == 3 ? 0xFFFFD54F : 0xFFD9822B) : (theme == 3 ? 0x55FFD54F : 0x70F2B93B); }
@@ -738,10 +760,11 @@ public class ReaderActivity extends Activity {
                 BookIndex b = BookText.ready(this, id) ? BookText.index(this, id) : null;
                 long tl = Dbg.now();
                 Alignment a = Alignment.load(BookText.alignFile(this, id)).withBook(b);
-                final String[] dw = b == null ? null : BookText.display(this, id, b.count());
+                final BookText.Disp dw = b == null ? null : BookText.display(this, id, b.count());
                 Dbg.p("Reader", "sync data loaded", tl, "book words " + (b == null ? "none" : b.count()) + ", aligned " + a.size() + (SyncService.running ? ", sync running" : ""));
                 ui(() -> {
-                    bi = b; al = a; if (dw != null && disp == null) disp = dw; jumpToAudioPage(); updatePin(); if (pv != null) pv.invalidate();
+                    bi = b; al = a; if (dw != null && disp == null) disp = dw; jumpToAudioPage();
+                    if ((b == null || dw == null) && !prepTried) h.postDelayed(() -> prepareText(false), 1500);   // so the text view is ready when you pinch updatePin(); if (pv != null) pv.invalidate();
                     // a sync that was interrupted (app closed by the system, low battery) carries on by itself
                     if (b != null && fileMode && !SyncService.running && SyncService.wanted(this, id) && !SyncService.fullFor(this, id) && Whisper.hasModel(this)) {
                         Dbg.i("Sync", "auto-resuming from the reader (was interrupted, not stopped by the user)");

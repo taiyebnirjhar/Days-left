@@ -6,6 +6,9 @@ import android.text.Layout;
 import android.text.SpannableStringBuilder;
 import android.text.Spanned;
 import android.text.style.BackgroundColorSpan;
+import android.text.style.RelativeSizeSpan;
+import android.text.style.StyleSpan;
+import android.text.style.SuperscriptSpan;
 import android.text.style.UnderlineSpan;
 import android.util.TypedValue;
 import android.view.GestureDetector;
@@ -44,7 +47,7 @@ class ReflowView extends ListView {
     }
 
     private final BookIndex bi;
-    private final String[] disp;
+    private final BookText.Disp d;
     private final Host host;
     private final ScaleGestureDetector sgd;
     private final GestureDetector gd;
@@ -57,9 +60,9 @@ class ReflowView extends ListView {
     private int lastPage = -1;
     private final BaseAdapter adapter;
 
-    ReflowView(Context c, BookIndex bi, String[] disp, Host host) {
+    ReflowView(Context c, BookIndex bi, BookText.Disp d, Host host) {
         super(c);
-        this.bi = bi; this.disp = disp; this.host = host;
+        this.bi = bi; this.d = d; this.host = host;
         setDivider(null);
         setVerticalScrollBarEnabled(false);
         setOverScrollMode(OVER_SCROLL_NEVER);
@@ -165,43 +168,81 @@ class ReflowView extends ListView {
     void showPage(int p) { setSelectionFromTop(Math.max(0, Math.min(bi.pages - 1, p)), dp(64)); }
 
     // ---------- text of a page ----------
+    /**
+     * One page as running text. What the PDF tells us: where every printed line sits (the word boxes), the font size and bold/italic of every
+     * word. So: headings (bigger or bold short lines) stand alone, footnote numbers (much smaller than the text) stay raised and glued to their
+     * word and never start a new line or paragraph, italics stay italic, lines of one paragraph run together, a word broken by a hyphen at the
+     * end of a line is joined.
+     */
     private PageText page(int p) {
         PageText pt = cache.get(p);
         if (pt != null) return pt;
         pt = new PageText();
         int a = bi.pageStart[p], b = bi.pageStart[p + 1];
-        pt.ws = new int[Math.max(0, b - a)]; pt.we = new int[Math.max(0, b - a)];
+        int n = Math.max(0, b - a);
+        pt.ws = new int[n]; pt.we = new int[n];
+        // the size most words have = the body text of this page
+        java.util.HashMap<Integer, Integer> cnt = new java.util.HashMap<>();
+        int dom = 0, best = 0;
+        for (int j = a; j < b; j++) if (!d.tok[j].isEmpty()) { int h = d.half[j]; int c = cnt.merge(h, 1, Integer::sum); if (c > best) { best = c; dom = h; } }
+        if (dom <= 0) dom = 20;
         float minX = 1, maxX = 0;
-        for (int j = a; j < b; j++) if (!disp[j].isEmpty()) { minX = Math.min(minX, bi.box[4 * j]); maxX = Math.max(maxX, bi.box[4 * j + 2]); }
+        for (int j = a; j < b; j++) if (!d.tok[j].isEmpty() && d.half[j] >= dom * 0.9f) { minX = Math.min(minX, bi.box[4 * j]); maxX = Math.max(maxX, bi.box[4 * j + 2]); }
         StringBuilder sb = new StringBuilder();
+        java.util.ArrayList<int[]> spans = new java.util.ArrayList<>();   // {kind, from, to, sizeHalf}: 0 bold, 1 italic, 2 superscript, 3 heading size
         float prevY0 = -1, prevY1 = 0, prevH = 0.01f, prevX1 = 0;
-        boolean prevEnd = true; String prevTok = "";
+        boolean prevEnd = true, prevHead = false; String prevTok = "";
         for (int j = a; j < b; j++) {
-            String t = disp[j];
+            String t = d.tok[j];
+            int k = j - a;
             if (t.isEmpty()) {   // the second piece of one printed token shares its range
-                int k = j - a;
                 pt.ws[k] = k > 0 ? pt.ws[k - 1] : sb.length(); pt.we[k] = k > 0 ? pt.we[k - 1] : sb.length();
                 continue;
             }
+            int half = d.half[j], bits = d.bits[j];
+            boolean sup = half > 0 && half <= dom * 0.78f && sb.length() > 0 && t.length() <= 12;
+            boolean head = half >= dom * 1.18f || ((bits & 1) != 0 && half >= dom * 0.95f && lineIsShort(j, a, b, dom, maxX));
             float x0 = bi.box[4 * j], y0 = bi.box[4 * j + 1], y1 = bi.box[4 * j + 3];
             float h = Math.max(0.004f, y1 - y0);
-            boolean newLine = prevY0 >= 0 && y0 > prevY0 + 0.5f * prevH;
-            if (newLine) {
+            boolean newLine = !sup && prevY0 >= 0 && y0 > prevY0 + 0.5f * prevH;
+            if (sup) {
+                // a footnote number: raised, glued to the word before it
+            } else if (newLine) {
                 boolean shortLine = prevX1 < maxX - 0.12f;
-                boolean para = shortLine || (prevEnd && (x0 > minX + 0.02f || y0 - prevY1 > 0.45f * h));
+                boolean veryShort = prevX1 < maxX - 0.3f;
+                boolean para = head != prevHead || head || veryShort || (shortLine && prevEnd) || (prevEnd && (x0 > minX + 0.02f || y0 - prevY1 > 0.45f * h));
                 if (para) sb.append("\n\n");
                 else if (prevTok.endsWith("-") && !prevTok.endsWith("--") && Character.isLowerCase(t.charAt(0))) { /* a word broken at the line end: join */ }
                 else sb.append(' ');
-            } else if (prevY0 >= 0) sb.append(' ');
-            int k = j - a;
+            } else if (sb.length() > 0) sb.append(' ');
             pt.ws[k] = sb.length(); sb.append(t); pt.we[k] = sb.length();
-            if (!newLine) { prevY0 = prevY0 < 0 ? y0 : prevY0; } else prevY0 = y0;
-            prevY1 = y1; prevH = h; prevX1 = bi.box[4 * j + 2];
-            prevEnd = (bi.flag[j] & 1) != 0; prevTok = t;
+            if (sup) spans.add(new int[]{2, pt.ws[k], pt.we[k], half});
+            else {
+                if ((bits & 1) != 0) spans.add(new int[]{0, pt.ws[k], pt.we[k], half});
+                if ((bits & 2) != 0) spans.add(new int[]{1, pt.ws[k], pt.we[k], half});
+                if (head && half > dom) spans.add(new int[]{3, pt.ws[k], pt.we[k], half * 100 / dom});
+                prevY0 = (prevY0 < 0 || newLine) ? y0 : prevY0; prevY1 = y1; prevH = h; prevX1 = bi.box[4 * j + 2];
+                prevEnd = (bi.flag[j] & 1) != 0; prevTok = t; prevHead = head;
+            }
         }
         pt.sb = new SpannableStringBuilder(sb);
+        for (int[] sp : spans) {
+            Object o = sp[0] == 0 ? new StyleSpan(Typeface.BOLD) : sp[0] == 1 ? new StyleSpan(Typeface.ITALIC) : null;
+            if (o != null) pt.sb.setSpan(o, sp[1], sp[2], Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+            else if (sp[0] == 2) { pt.sb.setSpan(new SuperscriptSpan(), sp[1], sp[2], Spanned.SPAN_EXCLUSIVE_EXCLUSIVE); pt.sb.setSpan(new RelativeSizeSpan(0.7f), sp[1], sp[2], Spanned.SPAN_EXCLUSIVE_EXCLUSIVE); }
+            else pt.sb.setSpan(new RelativeSizeSpan(Math.min(1.6f, sp[3] / 100f)), sp[1], sp[2], Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+        }
         cache.put(p, pt);
         return pt;
+    }
+
+    /** True if the printed line holding word j ends well before the right edge (so a bold line is a heading, not a bold phrase inside text). */
+    private boolean lineIsShort(int j, int a, int b, int dom, float maxX) {
+        float y = bi.box[4 * j + 1];
+        float right = 0;
+        for (int q = j; q < b && Math.abs(bi.box[4 * q + 1] - y) < 0.004f; q++) right = Math.max(right, bi.box[4 * q + 2]);
+        for (int q = j - 1; q >= a && Math.abs(bi.box[4 * q + 1] - y) < 0.004f; q--) right = Math.max(right, bi.box[4 * q + 2]);
+        return right < maxX - 0.1f;
     }
 
     // ---------- the spoken sentence ----------
@@ -235,9 +276,12 @@ class ReflowView extends ListView {
         if (lo > hi || hi - a >= pt.we.length) return;
         int s = pt.ws[lo - a], e = pt.we[hi - a];
         if (e <= s) return;
-        Object span = hlStyle == 1 ? new UnderlineSpan() : new BackgroundColorSpan(hlColor);
-        pt.sb.setSpan(span, s, e, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
-        pt.marks.add(span);
+        // marker: a tinted band; underline style: a lighter band plus the underline, so it can be seen on any theme
+        int tint = hlStyle == 1 ? ((hlColor & 0x00FFFFFF) | 0x40000000) : hlColor;
+        Object band = new BackgroundColorSpan(tint);
+        pt.sb.setSpan(band, s, e, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+        pt.marks.add(band);
+        if (hlStyle == 1) { Object u = new UnderlineSpan(); pt.sb.setSpan(u, s, e, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE); pt.marks.add(u); }
     }
 
     /** Keeps the word being read on screen (not at the very top or bottom). */
