@@ -217,10 +217,10 @@ class ReflowView extends ListView {
 
         @Override protected void onDraw(Canvas c) {
             if (f == null) return;
-            try { draw(c); } catch (Throwable t) { Dbg.e("Reflow", "drawing page " + (page + 1) + " failed", t); }
+            try { paintPage(c); } catch (Throwable t) { Dbg.e("Reflow", "drawing page " + (page + 1) + " failed", t); }
         }
 
-        private void draw(Canvas c) {
+        private void paintPage(Canvas c) {
             c.drawText("— " + (page + 1) + " —", getWidth() / 2f, topPad * 0.72f, lblP);
             Bitmap bm = host.pageBitmap(page);
             if (bm != null) {
