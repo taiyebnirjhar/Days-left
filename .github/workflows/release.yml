@@ -26,7 +26,9 @@ jobs:
         env: { KS: '${{ secrets.DEBUG_KEYSTORE_B64 }}' }
         run: |
           if [ -z "$KS" ]; then echo "::error::Missing secret DEBUG_KEYSTORE_B64"; exit 1; fi
-          mkdir -p ~/.android && echo "$KS" | base64 -d > ~/.android/debug.keystore
+          echo "$KS" | tr -d '[:space:]' | base64 -d > "$RUNNER_TEMP/dl.keystore"
+          keytool -list -keystore "$RUNNER_TEMP/dl.keystore" -storepass android > /dev/null || { echo "::error::DEBUG_KEYSTORE_B64 is not a valid keystore (alias androiddebugkey, password android)"; exit 1; }
+          echo "DAYSLEFT_KEYSTORE=$RUNNER_TEMP/dl.keystore" >> $GITHUB_ENV
       - name: Version and skip check
         id: v
         env: { GH_TOKEN: '${{ github.token }}' }
@@ -36,6 +38,14 @@ jobs:
           if gh release view "v$v" >/dev/null 2>&1; then echo "skip=true" >> $GITHUB_OUTPUT; else echo "skip=false" >> $GITHUB_OUTPUT; fi
       - if: steps.v.outputs.skip == 'false'
         run: chmod +x gradlew && ./gradlew assembleDebug --no-daemon -q
+      - name: Check the APK is signed with the key from the secret
+        if: steps.v.outputs.skip == 'false'
+        run: |
+          want=$(keytool -list -v -keystore "$RUNNER_TEMP/dl.keystore" -storepass android | grep -m1 "SHA256:" | sed 's/.*SHA256: *//' | tr -d ':' | tr 'A-F' 'a-f')
+          AS=$(ls $ANDROID_HOME/build-tools/*/apksigner | tail -1)
+          got=$($AS verify --print-certs app/build/outputs/apk/debug/app-debug.apk | grep -m1 "SHA-256 digest" | sed 's/.*: *//' | tr 'A-F' 'a-f')
+          echo "key in secret: $want"; echo "key in APK:    $got"
+          [ "$want" = "$got" ] || { echo "::error::APK is not signed with the key from DEBUG_KEYSTORE_B64"; exit 1; }
       - if: steps.v.outputs.skip == 'false'
         run: cp app/build/outputs/apk/debug/app-debug.apk DaysLeft-${{ steps.v.outputs.tag }}.apk
       - if: steps.v.outputs.skip == 'false'
