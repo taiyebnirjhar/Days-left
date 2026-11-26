@@ -17,7 +17,7 @@ class Whisper {
     static final String[] SIZES = {"about 60 MB", "about 32 MB"};
     static final String BASE_URL = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/";
 
-    static int which(Context c) { return Store.num(c, "wModel", 0) == 1 ? 1 : 0; }
+    static int which(Context c) { return Store.num(c, "wModel", 1) == 1 ? 1 : 0; }   // unset = the fast model (about 3x quicker)
     static void setWhich(Context c, int m) { if (m != which(c)) release(); Store.setNum(c, "wModel", m); }
 
     static native long nInit(String path);
@@ -185,7 +185,8 @@ class Whisper {
             String[] ws = p[2].trim().split("\\s+");
             for (int k = 0; k < ws.length; k++) {
                 if (ws[k].isEmpty()) continue;
-                double tw = words ? (s0 + s1) / 2 : s0 + (k + 0.5) / ws.length * Math.max(0.2, s1 - s0);
+                // word mode: the model's start is a little early and its end runs into the next word, so take start+0.3 s, never past the middle
+                double tw = words ? Math.min(s0 + 0.3, (s0 + s1) / 2) : s0 + (k + 0.5) / ws.length * Math.max(0.2, s1 - s0);
                 int ci = 0;
                 for (int i = 0; i < off.length; i++) if (off[i] <= tw) ci = i;
                 double rel = Math.max(0, Math.min(len[ci], tw - off[ci]));

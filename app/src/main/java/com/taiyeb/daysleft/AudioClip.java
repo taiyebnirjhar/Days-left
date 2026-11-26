@@ -16,14 +16,28 @@ class AudioClip {
     private static String cUri = "";
     private static int cTrack = -1;
     private static MediaFormat cFmt;
+    private static MediaCodec cCodec;
 
     /** Call when a batch of decoding is over, to give the file back. */
     static synchronized void closeCache() {
+        try { if (cCodec != null) { cCodec.stop(); cCodec.release(); } } catch (Exception ignored) {}
+        cCodec = null;
         try { if (cEx != null) cEx.release(); } catch (Exception ignored) {}
         cEx = null; cUri = ""; cTrack = -1; cFmt = null;
     }
 
     static synchronized float[] decode(Context c, String uri, double startSec, double lenSec) throws Exception {
+        try {
+            return decodeOnce(c, uri, startSec, lenSec);
+        } catch (Exception e) {
+            // the kept file/codec may be in a bad state: start again from scratch, once
+            Dbg.w("Audio", "decode failed (" + e + "), retrying with a fresh decoder");
+            closeCache();
+            return decodeOnce(c, uri, startSec, lenSec);
+        }
+    }
+
+    private static float[] decodeOnce(Context c, String uri, double startSec, double lenSec) throws Exception {
         MediaCodec codec = null;
         boolean ok = false;
         try {
@@ -48,9 +62,15 @@ class AudioClip {
             MediaFormat fmt = cFmt;
             long startUs = (long) (Math.max(0, startSec) * 1e6), endUs = startUs + (long) (lenSec * 1e6);
             ex.seekTo(startUs, MediaExtractor.SEEK_TO_PREVIOUS_SYNC);
-            codec = MediaCodec.createDecoderByType(fmt.getString(MediaFormat.KEY_MIME));
-            codec.configure(fmt, null, null, 0);
-            codec.start();
+            if (cCodec == null) {
+                MediaCodec k = MediaCodec.createDecoderByType(fmt.getString(MediaFormat.KEY_MIME));
+                k.configure(fmt, null, null, 0);
+                k.start();
+                cCodec = k;
+            } else {
+                cCodec.flush();   // same codec, new position: much cheaper than building one per clip
+            }
+            codec = cCodec;
 
             int rate = fmt.containsKey(MediaFormat.KEY_SAMPLE_RATE) ? fmt.getInteger(MediaFormat.KEY_SAMPLE_RATE) : 44100;
             int ch = fmt.containsKey(MediaFormat.KEY_CHANNEL_COUNT) ? fmt.getInteger(MediaFormat.KEY_CHANNEL_COUNT) : 1;
@@ -63,43 +83,51 @@ class AudioClip {
             long srcCount = 0;              // source frames seen after startUs
             boolean inDone = false, outDone = false;
             MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
+            final long deadline = System.currentTimeMillis() + 20000;
             while (!outDone && outN < mono.length - 1) {
-                if (!inDone) {
-                    int ib = codec.dequeueInputBuffer(10000);
-                    if (ib >= 0) {
-                        ByteBuffer in = codec.getInputBuffer(ib);
-                        int sz = ex.readSampleData(in, 0);
-                        long ts = ex.getSampleTime();
-                        if (sz < 0 || ts > endUs + 500000) { codec.queueInputBuffer(ib, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM); inDone = true; }
-                        else { codec.queueInputBuffer(ib, 0, sz, ts, 0); ex.advance(); }
-                    }
+                if (System.currentTimeMillis() > deadline) throw new Exception("decoding timed out");
+                int fed = 0;
+                while (!inDone && fed < 16) {
+                    int ib = codec.dequeueInputBuffer(fed == 0 ? 1000 : 0);
+                    if (ib < 0) break;
+                    ByteBuffer in = codec.getInputBuffer(ib);
+                    int sz = ex.readSampleData(in, 0);
+                    long ts = ex.getSampleTime();
+                    if (sz < 0 || ts > endUs + 500000) { codec.queueInputBuffer(ib, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM); inDone = true; }
+                    else { codec.queueInputBuffer(ib, 0, sz, ts, 0); ex.advance(); }
+                    fed++;
                 }
-                int ob = codec.dequeueOutputBuffer(info, 10000);
-                if (ob == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
-                    MediaFormat of = codec.getOutputFormat();
-                    if (of.containsKey(MediaFormat.KEY_SAMPLE_RATE)) { rate = of.getInteger(MediaFormat.KEY_SAMPLE_RATE); step = rate / 16000.0; nextOut = pos + step; }
-                    if (of.containsKey(MediaFormat.KEY_CHANNEL_COUNT)) ch = Math.max(1, of.getInteger(MediaFormat.KEY_CHANNEL_COUNT));
-                } else if (ob >= 0) {
-                    ByteBuffer out = codec.getOutputBuffer(ob);
-                    out.position(info.offset);
-                    out.limit(info.offset + info.size);
-                    java.nio.ShortBuffer sb = out.order(ByteOrder.nativeOrder()).asShortBuffer();
-                    int frames = sb.remaining() / ch;
-                    // skip frames that come before the wanted start (the decoder starts at the previous sync point)
-                    long frameUs0 = info.presentationTimeUs;
-                    int skip = 0;
-                    if (frameUs0 < startUs) skip = (int) Math.min(frames, (startUs - frameUs0) * (long) rate / 1000000L);
-                    for (int f = 0; f < frames && outN < mono.length - 1; f++) {
-                        float v = 0;
-                        for (int k = 0; k < ch; k++) v += sb.get(f * ch + k);
-                        if (f < skip) continue;
-                        v /= (ch * 32768f);
-                        acc += v; accN++; pos += 1; srcCount++;
-                        if (pos >= nextOut) { mono[outN++] = (float) (acc / accN); acc = 0; accN = 0; nextOut += step; }
+                int wait = fed > 0 ? 0 : 2000;   // nothing to feed: give the codec a moment
+                while (!outDone && outN < mono.length - 1) {
+                    int ob = codec.dequeueOutputBuffer(info, wait);
+                    wait = 0;
+                    if (ob == MediaCodec.INFO_TRY_AGAIN_LATER) break;
+                    if (ob == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                        MediaFormat of = codec.getOutputFormat();
+                        if (of.containsKey(MediaFormat.KEY_SAMPLE_RATE)) { rate = of.getInteger(MediaFormat.KEY_SAMPLE_RATE); step = rate / 16000.0; nextOut = pos + step; }
+                        if (of.containsKey(MediaFormat.KEY_CHANNEL_COUNT)) ch = Math.max(1, of.getInteger(MediaFormat.KEY_CHANNEL_COUNT));
+                    } else if (ob >= 0) {
+                        ByteBuffer out = codec.getOutputBuffer(ob);
+                        out.position(info.offset);
+                        out.limit(info.offset + info.size);
+                        java.nio.ShortBuffer sb = out.order(ByteOrder.nativeOrder()).asShortBuffer();
+                        int frames = sb.remaining() / ch;
+                        // skip frames that come before the wanted start (the decoder starts at the previous sync point)
+                        long frameUs0 = info.presentationTimeUs;
+                        int skip = 0;
+                        if (frameUs0 < startUs) skip = (int) Math.min(frames, (startUs - frameUs0) * (long) rate / 1000000L);
+                        for (int f = 0; f < frames && outN < mono.length - 1; f++) {
+                            float v = 0;
+                            for (int k = 0; k < ch; k++) v += sb.get(f * ch + k);
+                            if (f < skip) continue;
+                            v /= (ch * 32768f);
+                            acc += v; accN++; pos += 1; srcCount++;
+                            if (pos >= nextOut) { mono[outN++] = (float) (acc / accN); acc = 0; accN = 0; nextOut += step; }
+                        }
+                        codec.releaseOutputBuffer(ob, false);
+                        if ((info.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) outDone = true;
+                        if (outN >= (int) (lenSec * 16000)) outDone = true;
                     }
-                    codec.releaseOutputBuffer(ob, false);
-                    if ((info.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) outDone = true;
-                    if (outN >= (int) (lenSec * 16000)) outDone = true;
                 }
             }
             int n = Math.min(outN, (int) (lenSec * 16000));
@@ -108,7 +136,6 @@ class AudioClip {
             ok = true;
             return res;
         } finally {
-            try { if (codec != null) { codec.stop(); codec.release(); } } catch (Exception ignored) {}
             if (!ok) closeCache();   // something went wrong: next call opens the file fresh
         }
     }

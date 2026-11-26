@@ -90,6 +90,17 @@ class Alignment {
         return at[i] + (j - aw[i]) * (at[i + 1] - at[i]) / (double) (aw[i + 1] - aw[i]);
     }
 
+    /**
+     * How far apart (seconds) the two probes around t are; the interpolation between them is only as good as this is small.
+     * Large when t is outside the mapped part. A sentence highlight needs this to be small (about 25 s or less).
+     */
+    double gapAt(double t) {
+        int i = floorT(t);
+        if (i < 0) return Double.MAX_VALUE;
+        if (i + 1 >= at.length) return t - at[i] < 6 ? 0 : Double.MAX_VALUE;
+        return at[i + 1] - at[i];
+    }
+
     /** Book word being spoken at second t, or -1 if unknown. */
     int wordAtTime(double t) {
         int i = floorT(t);

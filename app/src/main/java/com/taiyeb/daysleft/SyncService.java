@@ -191,11 +191,20 @@ public class SyncService extends Service {
             while (!cancel) {
                 int g = goalWordReq;
                 if (g != lastGoal) { lastGoal = g; if (g >= 0) { pl.setGoal(g); goalTimeOut = pl.goalTime; Dbg.i("Sync", "goal: when is book word " + g + " spoken?" + (pl.goalTime >= 0 ? " known already: " + (int) pl.goalTime + " s" : "")); } else pl.clearGoal(); }
+                if (Player.ready) {
+                    // the window and the dense zone follow the playhead; a jump to an unmapped place starts over there
+                    int rc = pl.recenter(Player.pos());
+                    if (rc == 2) {
+                        stage = 0; pl.reach = STAGES[0]; pl.dense = false; widening = false; idleSince = 0; idle = false;
+                        Dbg.i("Sync", "playhead jumped to " + (int) Player.pos() + " s, mapping around it");
+                        totalSec = pl.windowProgress()[1];
+                    }
+                }
                 List<SyncPlanner.Req> batch = pl.nextBatch(3);
                 if (batch.isEmpty()) {
                     if (pl.lost) break;
                     if (stage < STAGES.length - 1) {
-                        stage++; pl.widen(STAGES[stage]); widening = true;
+                        stage++; pl.widen(STAGES[stage]); pl.dense = true; widening = true;
                         idle = true;   // the small ring is done: usable now, the wider ring is filled in quietly
                         Store.sp(this).edit().putBoolean("syncWin_" + id, true).putInt("syncPct_" + id, 100).apply();
                         Dbg.i("Sync", "ready around " + (int) Player.pos() + " s after " + probes + " probes; widening to +-" + (int) STAGES[stage] + " s");
@@ -203,19 +212,20 @@ public class SyncService extends Service {
                         continue;
                     }
                     widening = false;
-                    if (pl.recenter(Player.pos())) { stage = 0; pl.reach = STAGES[0]; widening = false; idleSince = 0; idle = false; Dbg.i("Sync", "playhead moved to " + (int) Player.pos() + " s, mapping around it"); totalSec = pl.windowProgress()[1]; continue; }
                     long nowMs = System.currentTimeMillis();
                     if (idleSince == 0) {
-                        idleSince = nowMs; idle = true; doneSec = totalSec;
-                        Store.sp(this).edit().putBoolean("syncWin_" + id, true).putInt("syncPct_" + id, 100).apply();
-                        Dbg.i("Sync", "mapped around " + (int) Player.pos() + " s after listening to " + listened + " s in " + probes + " probes");
-                        nm.notify(7100, note("Ready. It follows you as you listen", 100, false));
+                        idleSince = nowMs;
+                        if (!idle) {
+                            idle = true; doneSec = totalSec;
+                            Store.sp(this).edit().putBoolean("syncWin_" + id, true).putInt("syncPct_" + id, 100).apply();
+                            Dbg.i("Sync", "mapped around " + (int) Player.pos() + " s after listening to " + listened + " s in " + probes + " probes");
+                            nm.notify(7100, note("Ready. It follows you as you listen", 100, false));
+                        }
                     }
                     if (!Player.isPlaying() && nowMs - idleSince > 10000) break;
                     Thread.sleep(2000);
                     continue;
                 }
-                if (!widening && (idle || winReady(this, id))) { idle = false; Store.sp(this).edit().putBoolean("syncWin_" + id, false).apply(); }
                 idleSince = 0;
                 if (lowBattery()) { error = "The battery is low. Plug in and it carries on when you open the book."; break; }
                 long t0 = Dbg.now();

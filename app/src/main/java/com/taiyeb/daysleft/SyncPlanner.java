@@ -16,6 +16,10 @@ import java.util.*;
  */
 final class SyncPlanner {
     static final double PROBE = 9, LONG_PROBE = 9, DENSE_GAP = 90, MAX_STRIDE = 150, MIN_STRIDE = 20;
+    /** Highlighting a sentence needs probes close together right around the playhead: 12 s apart from 40 s behind to 150 s ahead of it, 30 s apart within 5 min, else DENSE_GAP. */
+    /** A page start is only answered when the two probes around it are this close (seconds): then it is right to well under a second. */
+    static final double GOAL_GAP = 25;
+    static final double NEAR_BEHIND = 40, NEAR_AHEAD = 150, DENSE_NEAR = 12, DENSE_MID = 30;
     static final int EXT_FAILS_WIDE = 4, EXT_FAILS_GIVE_UP = 8, SEED_TRIES = 12, GAP_TRIES = 2;
 
     /** What to listen to. Fill in the result with feed(). */
@@ -40,6 +44,10 @@ final class SyncPlanner {
     private final Set<Long> badGaps = new HashSet<>();
     /** Only map this far (seconds) either side of the playhead; infinity = the whole book. */
     double reach = Double.POSITIVE_INFINITY;
+    /** Where the user is listening right now (follows the player). */
+    double focus = -1;
+    /** Refine around the playhead with the tighter gap limits above. */
+    boolean dense;
     private final Set<Long> inFlightGaps = new HashSet<>();
     private final TreeMap<Integer, Double> byWord = new TreeMap<>();   // book word -> time, same anchors
     /** Goal: find when this book word is spoken (Play this page). goalTime >= 0 once found, -2 if it could not be. */
@@ -52,6 +60,7 @@ final class SyncPlanner {
         this.total = totalSec;
         this.startSec = Math.max(0, Math.min(startSec, totalSec - 1));
         this.words = bookWords;
+        this.focus = this.startSec;
         for (int i = 0; i < pos.length; i++) { anchors.put(time[i], pos[i]); byWord.put(pos[i], time[i]); }
         if (!anchors.isEmpty()) { seeded = true; placeCursors(this.startSec); }
     }
@@ -68,23 +77,37 @@ final class SyncPlanner {
     }
 
     /**
-     * The playhead moved (playing, or the user jumped). Returns true if there is new work.
-     * Far outside what is mapped: look again there; inside: just walk on from the nearest mapped edge.
+     * The playhead position, called often. 0 = nothing changed; 1 = the window moved with the playhead (new work may
+     * exist: the extension directions are reopened, gaps near the playhead are found by the next nextBatch);
+     * 2 = the user jumped to a place with nothing mapped nearby: start over there (caller resets its stages).
      */
-    boolean recenter(double pos) {
+    int recenter(double pos) {
         pos = Math.max(0, Math.min(pos, total - 1));
-        if (Math.abs(pos - startSec) < Math.min(reach * 0.4, 240) && seeded) return false;
+        focus = pos;
+        if (anchors.isEmpty()) {
+            if (seeded || Math.abs(pos - startSec) > 30) { startSec = pos; seeded = false; seedTry = 0; fwdDone = bwdDone = false; return 2; }
+            return 0;
+        }
+        Double a = anchors.floorKey(pos), b = anchors.ceilingKey(pos);
+        boolean nearMapped = (a != null && pos - a <= MAX_NEAR) || (b != null && b - pos <= MAX_NEAR);
+        if (seeded && nearMapped) {
+            double old = startSec;
+            startSec = pos;                       // the window follows the playhead
+            int r = Math.abs(pos - old) > 1 ? 1 : 0;
+            if (fwdDone && fwdCursor < startSec + reach && fwdCursor < total - 8) { fwdDone = false; fwdFails = 0; r = 1; }
+            if (bwdDone && bwdEnd > startSec - reach && bwdEnd > 8) { bwdDone = false; bwdFails = 0; r = 1; }
+            return r;
+        }
+        // jumped somewhere nothing is mapped: look again there
         startSec = pos;
         fwdDone = bwdDone = false;
         fwdFails = bwdFails = 0; fwdN = bwdN = 0; fwdStride = bwdStride = 0;
-        if (!anchors.isEmpty()) {
-            Double a = anchors.floorKey(pos), b = anchors.ceilingKey(pos);
-            boolean mapped = (a != null && pos - a <= DENSE_GAP) || (b != null && b - pos <= DENSE_GAP);
-            if (mapped) { seeded = true; placeCursors(pos); }
-            else { seeded = false; seedTry = 0; }
-        } else { seeded = false; seedTry = 0; }
-        return true;
+        seeded = false; seedTry = 0;
+        return 2;
     }
+
+    /** Within this many seconds of an anchor counts as "mapped here". */
+    private static final double MAX_NEAR = 200;
 
     /** {mapped seconds, window size} inside the window around the playhead; the progress the user sees. */
     double[] windowProgress() {
@@ -183,7 +206,7 @@ final class SyncPlanner {
     private boolean resolveGoal() {
         Map.Entry<Integer, Double> lo = byWord.floorEntry(goalWord), hi = byWord.ceilingEntry(goalWord);
         if (lo != null && lo.getKey() == goalWord) { goalTime = lo.getValue(); return true; }
-        if (lo != null && hi != null && hi.getValue() - lo.getValue() <= DENSE_GAP) {
+        if (lo != null && hi != null && hi.getValue() - lo.getValue() <= GOAL_GAP) {
             goalTime = lo.getValue() + (goalWord - lo.getKey()) * (hi.getValue() - lo.getValue()) / (double) Math.max(1, hi.getKey() - lo.getKey());
             return true;
         }
@@ -305,14 +328,23 @@ final class SyncPlanner {
         bwdEnd = c;
     }
 
+    /** How wide a gap between probes may be at this moment of the audio. */
+    private double gapLimit(double mid) {
+        if (!dense) return DENSE_GAP;
+        double d = mid - focus;
+        if (d >= -NEAR_BEHIND && d <= NEAR_AHEAD) return DENSE_NEAR;
+        if (Math.abs(d) <= 300) return DENSE_MID;
+        return DENSE_GAP;
+    }
+
     private Req gap() {
         double bestD = Double.MAX_VALUE, lt = 0, rt = 0;
         int lw = 0, rw = 0;
         double pt = -1; int pw = 0;
         for (Map.Entry<Double, Integer> e : anchors.entrySet()) {
             double t = e.getKey();
-            if (pt >= 0 && t - pt > DENSE_GAP && !badGaps.contains(Math.round(pt * 10)) && !inFlightGaps.contains(Math.round(pt * 10)) && pt < startSec + reach && t > startSec - reach) {
-                double d = Math.abs((pt + t) / 2 - startSec);
+            if (pt >= 0 && t - pt > gapLimit((pt + t) / 2) && !badGaps.contains(Math.round(pt * 10)) && !inFlightGaps.contains(Math.round(pt * 10)) && pt < startSec + reach && t > startSec - reach) {
+                double d = Math.abs((pt + t) / 2 - focus);
                 if (d < bestD) { bestD = d; lt = pt; rt = t; lw = pw; rw = e.getValue(); }
             }
             pt = t; pw = e.getValue();

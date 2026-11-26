@@ -125,6 +125,48 @@ public class SyncSim {
             if (wide[0] < 95) bad++;
         }
 
+        // ---- 1c. listening along: the dense zone must travel with the playhead so the sentence highlight is there and right ----
+        build(41, hours, callSec);
+        {
+            int[] ps2 = {0, N};
+            Aligner al2 = new Aligner(new BookIndex(book, ps2, new float[N * 4], new byte[N]));
+            double playhead = 0.37 * total;
+            SyncPlanner p = new SyncPlanner(total, playhead, N, new int[0], new double[0]);
+            p.reach = 150;
+            calls = 0; listened = 0;
+            while (step(p, al2)) if (calls > 3000) break;
+            int ringCalls = calls;
+            p.widen(600); p.dense = Boolean.parseBoolean(System.getProperty("dense", "true"));
+            int shown = 0, total2 = 0, wrong = 0; double worstShown = 0; List<Double> errs = new ArrayList<>();
+            int readyAfter = -1;
+            for (int i = 0; i < 80; i++) {
+                p.recenter(playhead);
+                step(p, al2);                      // one speech call; the audio plays on meanwhile
+                playhead += callSec;
+                p.recenter(playhead);
+                Alignment fa = snapshot(p);
+                double gap = fa.gapAt(playhead);
+                boolean show = gap <= 25;
+                if (show && readyAfter < 0) readyAfter = i;
+                if (i >= 10) {
+                    total2++;
+                    if (show) {
+                        shown++;
+                        int w = trueWordAt(playhead);
+                        double est = fa.timeOfWord(w);
+                        double e = est < 0 ? 99 : Math.abs(est - tw[w]);
+                        errs.add(e); worstShown = Math.max(worstShown, e);
+                        if (e > 2.5) wrong++;
+                    }
+                }
+            }
+            Collections.sort(errs);
+            double med = errs.isEmpty() ? -1 : errs.get(errs.size() / 2), p95 = errs.isEmpty() ? -1 : errs.get((int) (errs.size() * 0.95));
+            System.out.printf("listening along (%d calls for the ring, then 80 calls while playing): highlight available %d%% of the time, wrong (>2.5 s) %d of %d shown, median error %.2f s, 95th pct %.2f s, worst %.1f s%n",
+                    ringCalls, total2 == 0 ? 0 : shown * 100 / total2, wrong, shown, med, p95, worstShown);
+            if (total2 == 0 || shown * 100 / total2 < 90 || wrong * 100 > Math.max(1, shown) * 3) bad++;
+        }
+
         // ---- 2. Play this page: find a far-away page from nothing (no sync data at all) ----
         Random r = new Random(11);
         int ok = 0, tests = 0, maxCalls = 0; double sumCalls = 0, worst = 0;
@@ -152,17 +194,28 @@ public class SyncSim {
                 ok, tests, sumCalls / Math.max(1, ok), sumCalls / Math.max(1, ok) * callSec, maxCalls, maxCalls * callSec, worst);
         if (ok * 100 / tests < 90) bad++;
 
-        // ---- 3. Play this page when the playhead window is already mapped (typical: user reads on) ----
+        // ---- 3. Play this page when the area around the playhead is already mapped (the usual case while listening) ----
         build(77, hours, callSec);
         int[] ps = {0, N};
         Aligner al = new Aligner(new BookIndex(book, ps, new float[N * 4], new byte[N]));
-        SyncPlanner p = new SyncPlanner(total, 0.37 * total, N, new int[0], new double[0]);
-        p.reach = 600;
+        double here = 0.37 * total;
+        SyncPlanner p = new SyncPlanner(total, here, N, new int[0], new double[0]);
+        p.reach = 150;
+        calls = 0;
         while (step(p, al)) if (calls > 3000) break;
-        int near = (int) (0.37 * total * 2.6) + 900;       // a page ~6 min ahead, inside the window
-        p.setGoal(near);
-        System.out.printf("play page inside the mapped window: answered with %s%n", p.goalTime >= 0 ? "no listening (instant), error " + String.format("%.1f s", Math.abs(p.goalTime - tw[near])) : "NO ANSWER");
-        if (p.goalTime < 0) bad++;
+        p.widen(600); p.dense = true;
+        while (step(p, al)) if (calls > 3000) break;
+        int nearW = trueWordAt(here + 100), farW = trueWordAt(here + 420);
+        p.setGoal(nearW);
+        boolean instant = p.goalTime >= 0;
+        double nearErr = instant ? Math.abs(p.goalTime - tw[nearW]) : -1;
+        System.out.printf("play page 100 s ahead of the playhead: %s%n", instant ? "instant, error " + String.format("%.2f s", nearErr) : "NOT instant");
+        p.clearGoal();
+        p.setGoal(farW);
+        int c0 = calls;
+        while (p.goalTime == -1 && step(p, al)) if (calls - c0 > 8) break;
+        System.out.printf("play page 7 min ahead (outside the dense zone): %s after %d call(s)%n", p.goalTime >= 0 ? "answered, error " + String.format("%.2f s", Math.abs(p.goalTime - tw[farW])) : "NO ANSWER", calls - c0);
+        if (!instant || nearErr > 1.5 || p.goalTime < 0 || Math.abs(p.goalTime - tw[farW]) > 2.5) bad++;
 
         System.out.println(bad == 0 ? "ALL SIM RUNS OK" : bad + " SIM CHECKS BAD");
         System.exit(bad == 0 ? 0 : 1);

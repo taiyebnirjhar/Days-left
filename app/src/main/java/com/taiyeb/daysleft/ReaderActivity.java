@@ -68,6 +68,7 @@ public class ReaderActivity extends Activity {
     int goPage;
     boolean jumpToAudio;
     double aT, aDur;
+    static final double HL_GAP = 25, FLIP_GAP = 60;   // max seconds between mapped probes for a sentence highlight / an automatic page turn
     long lastFollowStart;
     int aState = -1, speedIdx, bottomInset, chromeBg;
     long lastSave;
@@ -290,12 +291,43 @@ public class ReaderActivity extends Activity {
         if (playGlyph.type != t) { playGlyph.type = t; playGlyph.invalidate(); }
     }
 
+    boolean askedSyncThisSession, waitingReady, autoHidePanel;
+
+    /** Ask once per visit, and never again if the user said so, for a book that has no sync yet. */
+    boolean shouldAskSync() {
+        return item != null && fileMode && !askedSyncThisSession && !SyncService.running
+                && !SyncService.wanted(this, item.id) && !SyncService.winReady(this, item.id)
+                && !Store.sp(this).getBoolean("syncNever_" + item.id, false);
+    }
+
+    /** The first time the user presses Play on an unsynced book: explain what syncing gives, and be honest about the wait. */
+    void askSync() {
+        askedSyncThisSession = true;
+        openPanel("Sync this book with the audio?");
+        setMsg("Hi Taiyeb! Want me to sync this audiobook with the book first?\n\n"
+                + "What you get:\n"
+                + "•  the sentence being read is highlighted\n"
+                + "•  pages turn by themselves as you listen" + (followOn ? "" : " (turn on “Turn pages with the audio” in the settings)") + "\n"
+                + "•  Play page and Find page become instant\n\n"
+                + "It works quietly in the background and takes a few minutes the first time, so please be patient. "
+                + "You can keep listening or reading while I work, and I'll tell you when it's ready.", -1);
+        setBtns("Sync and play", (Runnable) () -> {
+                    autoHidePanel = true;
+                    openPanel("Sync with the book");
+                    startSync(Whisper.which(this));
+                    Player.toggle(this);
+                },
+                "Just play", (Runnable) () -> { closePanel(); Player.toggle(this); },
+                "Don't ask", (Runnable) () -> { Store.sp(this).edit().putBoolean("syncNever_" + item.id, true).apply(); closePanel(); Player.toggle(this); });
+    }
+
     void togglePlay() {
         playBtn.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY);
         if (fileMode) {
             if (!mpReady) { Toast.makeText(this, "Loading the audio…", Toast.LENGTH_SHORT).show(); return; }
             if (!Player.isPlaying() && Build.VERSION.SDK_INT >= 33 && checkSelfPermission("android.permission.POST_NOTIFICATIONS") != android.content.pm.PackageManager.PERMISSION_GRANTED)
                 requestPermissions(new String[]{"android.permission.POST_NOTIFICATIONS"}, 92);
+            if (!Player.isPlaying() && shouldAskSync()) { askSync(); return; }
             Player.toggle(this);
             return;
         }
@@ -322,16 +354,25 @@ public class ReaderActivity extends Activity {
         if (now - lastSave > 5000 && t > 1) { lastSave = now; Learn.setAudio(this, item.id, (int) t, null); }
         if (al.size() > 0 && bi != null) {
             int j = al.wordAtTime(t);
-            if (j >= 0) {
+            double gap = al.gapAt(t);
+            if (j >= 0 && gap <= HL_GAP) {
                 int[] r = bi.sentenceAround(j);
                 if (r[0] != hlFrom) { hlFrom = r[0]; hlTo = r[1]; if (hlOn && pv != null) pv.invalidate(); }
-                if (followOn && st == 1 && now - lastManual > 5000 && pv != null && !pv.dragging && pv.zoom <= 1.01f && settings.getVisibility() != View.VISIBLE) {
-                    int pg = bi.pageOf(j);
-                    if (pg != cur) goTo(pg, false);
-                }
+            } else if (hlFrom >= 0) {
+                hlFrom = hlTo = -1;   // better no highlight than a wrong one: the probes around here are too far apart (yet)
+                if (pv != null) pv.invalidate();
+            }
+            if (j >= 0 && gap <= FLIP_GAP && followOn && st == 1 && now - lastManual > 5000 && pv != null && !pv.dragging && pv.zoom <= 1.01f && settings.getVisibility() != View.VISIBLE) {
+                int pg = bi.pageOf(j);
+                if (pg != cur) goTo(pg, false);
             }
         }
         if (SyncService.running && SyncService.itemId == item.id && now - alReloaded > 10000) loadSyncData();
+        if (waitingReady && SyncService.running && SyncService.idle && SyncService.itemId == item.id) {
+            waitingReady = false;
+            loadSyncData();
+            Toast.makeText(this, "Ready! The sentence being read is highlighted" + (followOn ? " and pages turn by themselves." : "."), Toast.LENGTH_LONG).show();
+        }
         // listening on: when the mapped area is running out ahead of the playhead, wake the service so it maps the next part
         if (st == 1 && !SyncService.running && now - lastFollowStart > 60000 && bi != null && al.size() > 0
                 && SyncService.wanted(this, item.id) && Whisper.hasModel(this) && al.wordAtTime(t + 120) < 0) {
@@ -575,7 +616,7 @@ public class ReaderActivity extends Activity {
             setMsg("Synced around where you are listening.\n\nPlay page, Find page and the sentence highlight work here. It follows you as you play, and maps the new place within a minute or two if you jump somewhere else.", -1);
             setBtns("Close", (Runnable) this::closePanel, "Stop", (Runnable) () -> { SyncService.stop(this); showSyncState(); });
         } else if (syncing()) {
-            setMsg("Syncing around your position… " + syncPct() + "%" + etaText() + "\n\nYou can leave this screen or turn the screen off. It keeps going in the background and shows a notification. Stopping is safe: it continues from where it stopped.", syncPct());
+            setMsg("Syncing around your position… " + syncPct() + "%" + etaText() + "\n\nPlease be patient, it takes a few minutes. You can keep listening or reading meanwhile, leave this screen, or turn the screen off: it keeps going in the background and shows a notification. Stopping is safe: it continues from where it stopped.", syncPct());
             setBtns("Hide", (Runnable) this::closePanel, "Stop", (Runnable) () -> { SyncService.stop(this); showSyncState(); });
         } else if (SyncService.fullFor(this, item.id)) {
             setMsg("This audiobook is synced.\n\nPlay page and Find page are instant now, and the sentence being read is highlighted in the book.", -1);
@@ -609,6 +650,7 @@ public class ReaderActivity extends Activity {
     void startSync(int model) {
         Dbg.i("Sync", "start tapped, model " + (model == 0 ? "accurate" : "faster") + ", item " + item.id);
         Whisper.setWhich(this, model);
+        waitingReady = true;
         syncPanel = false;
         h.removeCallbacks(syncPoll);
         ensureModel(() -> ensureText(() -> {
@@ -618,6 +660,16 @@ public class ReaderActivity extends Activity {
             h.postDelayed(this::askBackground, 1800);
             syncPanel = true;
             h.postDelayed(() -> { showSyncState(); h.postDelayed(syncPoll, 1000); }, 700);
+            if (autoHidePanel) {
+                autoHidePanel = false;
+                final boolean[] mine = fcancel;
+                h.postDelayed(() -> {
+                    if (fcancel == mine && !mine[0] && SyncService.running) {
+                        closePanel();
+                        Toast.makeText(this, "Syncing in the background. Keep listening or reading, I'll tell you when it's ready.", Toast.LENGTH_LONG).show();
+                    }
+                }, 9000);
+            }
         }));
     }
 
@@ -761,6 +813,7 @@ public class ReaderActivity extends Activity {
         try {
             if (isFinishing() || fdlg != null || bi == null || item == null || !mpReady || !fileMode) return;
             if (!SyncService.wanted(this, item.id) || !Whisper.hasModel(this) || pinFor(cur) != null) return;
+            if (SyncService.running && !SyncService.idle) return;   // still mapping around the playhead: don't compete with it
             if (al.size() > 0 && al.timeOfWord(bi.pageStart[cur]) >= 0) return;
             if (SyncService.goalWordReq == bi.pageStart[cur]) return;
             Dbg.i("Prefetch", "locating page " + (cur + 1) + " in the background");
