@@ -131,7 +131,7 @@ public class Updater {
                 for (int k; (k = in.read(b)) > 0; ) out.write(b, 0, k);
                 s.fsync(out);
             }
-            Intent i = new Intent(ACTION).setPackage(c.getPackageName());
+            Intent i = new Intent(c, Receiver.class).setAction(ACTION);   // explicit component: the manifest receiver has no intent filter
             PendingIntent pend = PendingIntent.getBroadcast(c, id, i, PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_MUTABLE);
             s.commit(pend.getIntentSender());
         }
@@ -144,6 +144,7 @@ public class Updater {
             String msg = i.getStringExtra(PackageInstaller.EXTRA_STATUS_MESSAGE);
             if (st == PackageInstaller.STATUS_PENDING_USER_ACTION) {
                 Intent confirm = i.getParcelableExtra(Intent.EXTRA_INTENT);
+                Dbg.i("Update", "installer asks the user to confirm" + (confirm == null ? " (no intent!)" : ""));
                 if (confirm != null) c.startActivity(confirm.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
             } else if (st == PackageInstaller.STATUS_SUCCESS) {
                 Dbg.i("Update", "installed");
