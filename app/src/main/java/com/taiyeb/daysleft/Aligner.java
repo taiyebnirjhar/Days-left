@@ -68,6 +68,41 @@ class Aligner {
         for (int k = 0; k < len; k++) { int[] pr = cand.get(seq[k]); o.pos[k] = pr[1]; o.time[k] = times[pr[0]]; }
         o.votes = bestV;
         o.end = o.pos[len - 1] + 2;
-        return o;
+        return consistent(o);
+    }
+
+    /**
+     * Over a few seconds the narrator's pace is nearly constant, so the matched words must lie on a straight line
+     * (time against book position). A common word pair matched at the wrong place does not: drop it. Uses the median
+     * slope (Theil-Sen), so a few wrong points cannot drag the line. Null if too little is left or the pace is absurd.
+     */
+    static Out consistent(Out o) {
+        int n = o.pos.length;
+        if (n < 4) return n >= 3 ? o : null;
+        double[] sl = new double[n * (n - 1) / 2];
+        int c = 0;
+        for (int i = 0; i < n; i++) for (int j = i + 1; j < n; j++)
+            if (o.pos[j] > o.pos[i]) sl[c++] = (o.time[j] - o.time[i]) / (o.pos[j] - o.pos[i]);
+        if (c < 3) return null;
+        double[] ss = Arrays.copyOf(sl, c);
+        Arrays.sort(ss);
+        double m = ss[c / 2];
+        if (m < 0.12 || m > 1.6) return null;       // outside 0.6..8 words per second: not speech matching the book
+        double[] ic = new double[n];
+        for (int i = 0; i < n; i++) ic[i] = o.time[i] - m * o.pos[i];
+        double[] sc = ic.clone();
+        Arrays.sort(sc);
+        double b = sc[n / 2];
+        int keep = 0;
+        boolean[] ok = new boolean[n];
+        for (int i = 0; i < n; i++) if (Math.abs(ic[i] - b) <= 1.5) { ok[i] = true; keep++; }
+        if (keep < 3) return null;
+        if (keep == n) return o;
+        Out r = new Out();
+        r.pos = new int[keep]; r.time = new double[keep];
+        for (int i = 0, k = 0; i < n; i++) if (ok[i]) { r.pos[k] = o.pos[i]; r.time[k] = o.time[i]; k++; }
+        r.votes = o.votes;
+        r.end = r.pos[keep - 1] + 2;
+        return r;
     }
 }

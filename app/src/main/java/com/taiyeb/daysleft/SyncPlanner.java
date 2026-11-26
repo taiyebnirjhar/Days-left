@@ -16,10 +16,10 @@ import java.util.*;
  */
 final class SyncPlanner {
     static final double PROBE = 9, LONG_PROBE = 9, DENSE_GAP = 90, MAX_STRIDE = 150, MIN_STRIDE = 20;
-    /** Highlighting a sentence needs probes close together right around the playhead: 12 s apart from 40 s behind to 150 s ahead of it, 30 s apart within 5 min, else DENSE_GAP. */
+    /** Highlighting a sentence needs probes close together right around the playhead: 20 s apart from 40 s behind to 150 s ahead of it (swept in tests/host/simrun.sh: 20 s keeps 0 wrong highlights and shows the first one a call sooner than 12 s), 30 s apart within 5 min, else DENSE_GAP. */
     /** A page start is only answered when the two probes around it are this close (seconds): then it is right to well under a second. */
     static final double GOAL_GAP = 25;
-    static final double NEAR_BEHIND = 40, NEAR_AHEAD = 150, DENSE_NEAR = 12, DENSE_MID = 30;
+    static double NEAR_BEHIND = 40, NEAR_AHEAD = 150, DENSE_NEAR = 20, DENSE_MID = 30;
     static final int EXT_FAILS_WIDE = 4, EXT_FAILS_GIVE_UP = 8, SEED_TRIES = 12, GAP_TRIES = 2;
 
     /** What to listen to. Fill in the result with feed(). */
@@ -187,8 +187,11 @@ final class SyncPlanner {
             for (int i = 0; i < max; i++) { Req r = seed(); if (r == null) break; out.add(r); }
             return out;
         }
-        if (!fwdDone) { Req f = forward(); if (f != null) out.add(f); }
-        if (!bwdDone && out.size() < max) { Req b = backward(); if (b != null) out.add(b); }
+        // dense mode: fill the zone in front of the playhead first (two of the three slots while the zone behind it needs work too)
+        boolean fz = dense && !fwdDone && inFwdZone(), bz = dense && !bwdDone && inBwdZone();
+        int fMax = !dense ? 1 : (fz && bz ? Math.max(1, max - 1) : max);
+        if (!fwdDone) out.addAll(forwardPieces(fMax));
+        if (!bwdDone && out.size() < max) out.addAll(backwardPieces(dense ? max - out.size() : 1));
         while (out.size() < max) { Req g = gap(); if (g == null) break; out.add(g); }
         return out;
     }
@@ -270,23 +273,83 @@ final class SyncPlanner {
         return null;
     }
 
+    private boolean inFwdZone() { return dense && fwdCursor < focus + NEAR_AHEAD; }
+    private boolean inBwdZone() { return dense && bwdEnd > focus - NEAR_BEHIND; }
+
+    /**
+     * Pieces going forward. Inside the dense zone (probes DENSE_NEAR apart up to NEAR_AHEAD in front of the playhead) up to
+     * max of them are planned at once, spaced like that, so the area in front of the user fills three probes per model call.
+     */
+    private List<Req> forwardPieces(int max) {
+        List<Req> out = new ArrayList<>();
+        Req first = forward();
+        if (first == null) return out;
+        out.add(first);
+        if (inFwdZone()) {
+            for (int k = 1; k < max; k++) {
+                double c = fwdCursor + k * (PROBE + DENSE_NEAR);
+                if (c >= total - 8 || c > startSec + reach || c > focus + NEAR_AHEAD + PROBE) break;
+                out.add(fwdAt(c, first.prevT, first.prevW));
+            }
+        }
+        return out;
+    }
+
+    private Req fwdAt(double start, double lastT, int lastW) {
+        Req r = new Req();
+        r.kind = 1; r.start = start;
+        r.len = Math.min(PROBE, total - r.start);
+        double delta = Math.max(0, r.start - lastT);
+        double rate = rate();
+        r.wide = fwdFails >= EXT_FAILS_WIDE;
+        // where the piece should land, with a margin that grows with the distance (pace drifts a few tens of percent, pauses eat words).
+        // A small window keeps repeated common phrases elsewhere in the book from outvoting the real match.
+        double margin = 40 + (delta > 60 ? 0.4 : 0.3) * rate * delta;
+        double expect = lastW + rate * delta;
+        r.lo = r.wide ? 0 : (int) Math.max(0, Math.min(lastW - 10, expect - margin));
+        r.hi = r.wide ? words : (int) Math.min(words, expect + rate * r.len + margin);
+        r.prevT = lastT; r.prevW = lastW;
+        r.why = (inFwdZone() ? "ahead of you" : "forward, step " + (int) fwdStride + " s") + (r.wide ? ", whole book" : "");
+        return r;
+    }
+
     private Req forward() {
         skipMappedAhead();
         Map.Entry<Double, Integer> ref = anchors.floorEntry(fwdCursor);
         if (ref == null) ref = anchors.firstEntry();
-        double lastT = ref.getKey();
-        int lastW = ref.getValue();
         if (fwdCursor >= total - 8 || fwdCursor > startSec + reach) { fwdDone = true; return null; }
+        return fwdAt(fwdCursor, ref.getKey(), ref.getValue());
+    }
+
+    private List<Req> backwardPieces(int max) {
+        List<Req> out = new ArrayList<>();
+        Req first = backward();
+        if (first == null) return out;
+        out.add(first);
+        if (inBwdZone()) {
+            for (int k = 1; k < max; k++) {
+                double end = bwdEnd - k * (PROBE + DENSE_NEAR);
+                if (end <= 8 || end < startSec - reach || end < focus - NEAR_BEHIND - PROBE) break;
+                out.add(bwdAt(end, first.prevT, first.prevW));
+            }
+        }
+        return out;
+    }
+
+    private Req bwdAt(double end, double firstT, int firstW) {
         Req r = new Req();
-        r.kind = 1; r.start = fwdCursor;
-        boolean dense = fwdN < 2 || fwdFails > 0;
-        r.len = Math.min(dense ? LONG_PROBE : PROBE, total - r.start);
-        double ahead = Math.max(0, r.start - lastT) + r.len;
-        r.wide = fwdFails >= EXT_FAILS_WIDE;
-        r.lo = r.wide ? 0 : Math.max(0, lastW - 40);
-        r.hi = r.wide ? words : (int) Math.min(words, lastW + rate() * ahead * 2 + 300);
-        r.prevT = lastT; r.prevW = lastW;
-        r.why = "forward, step " + (int) fwdStride + " s" + (r.wide ? ", whole book" : "");
+        r.kind = 2;
+        double len = Math.min(PROBE, end);
+        r.start = end - len; r.len = len;
+        double delta = Math.max(0, firstT - end);        // from the end of the piece to the known anchor
+        double rate = rate();
+        r.wide = bwdFails >= EXT_FAILS_WIDE;
+        double margin = 40 + (delta > 60 ? 0.4 : 0.3) * rate * delta;
+        double expectEnd = firstW - rate * delta;         // the book word at the end of the piece
+        r.hi = r.wide ? words : (int) Math.min(words, Math.max(firstW + 10, expectEnd + margin));
+        r.lo = r.wide ? 0 : (int) Math.max(0, expectEnd - rate * len - margin);
+        r.prevT = firstT; r.prevW = firstW;
+        r.why = (inBwdZone() ? "behind you" : "backward, step " + (int) bwdStride + " s") + (r.wide ? ", whole book" : "");
         return r;
     }
 
@@ -294,21 +357,8 @@ final class SyncPlanner {
         skipMappedBehind();
         Map.Entry<Double, Integer> ref = anchors.ceilingEntry(bwdEnd);
         if (ref == null) ref = anchors.lastEntry();
-        double firstT = ref.getKey();
-        int firstW = ref.getValue();
         if (bwdEnd <= 8 || bwdEnd < startSec - reach) { bwdDone = true; return null; }
-        Req r = new Req();
-        r.kind = 2;
-        boolean dense = bwdN < 2 || bwdFails > 0;
-        double len = Math.min(dense ? LONG_PROBE : PROBE, bwdEnd);
-        r.start = bwdEnd - len; r.len = len;
-        double back = Math.max(0, firstT - r.start);
-        r.wide = bwdFails >= EXT_FAILS_WIDE;
-        r.hi = r.wide ? words : Math.min(words, firstW + 40);
-        r.lo = r.wide ? 0 : (int) Math.max(0, firstW - rate() * back * 2 - 300);
-        r.prevT = firstT; r.prevW = firstW;
-        r.why = "backward, step " + (int) bwdStride + " s" + (r.wide ? ", whole book" : "");
-        return r;
+        return bwdAt(bwdEnd, ref.getKey(), ref.getValue());
     }
 
     /** If the cursor runs into a stretch that is already mapped, jump to its far edge instead of listening again. */
@@ -337,13 +387,30 @@ final class SyncPlanner {
         return DENSE_GAP;
     }
 
+    private double typCache; private int typSize = -1;
+
+    /** The narrator's usual pace (median over close probe pairs), cached per anchor count. */
+    private double typicalRate() {
+        if (typSize != anchors.size()) {
+            int n = anchors.size();
+            int[] w = new int[n]; double[] t = new double[n];
+            int i = 0;
+            for (Map.Entry<Double, Integer> e : anchors.entrySet()) { t[i] = e.getKey(); w[i] = e.getValue(); i++; }
+            typCache = Alignment.typicalRate(w, t);
+            typSize = n;
+        }
+        return typCache;
+    }
+
     private Req gap() {
         double bestD = Double.MAX_VALUE, lt = 0, rt = 0;
         int lw = 0, rw = 0;
         double pt = -1; int pw = 0;
+        final double typ = dense ? typicalRate() : 0;
         for (Map.Entry<Double, Integer> e : anchors.entrySet()) {
             double t = e.getKey();
-            if (pt >= 0 && t - pt > gapLimit((pt + t) / 2) && !badGaps.contains(Math.round(pt * 10)) && !inFlightGaps.contains(Math.round(pt * 10)) && pt < startSec + reach && t > startSec - reach) {
+            boolean pauseGap = dense && pt >= 0 && t - pt > 7 && typ > 0 && (e.getValue() - pw) / (t - pt) < 0.55 * typ;   // a pause or music sits in here: look inside
+            if (pt >= 0 && (t - pt > gapLimit((pt + t) / 2) || pauseGap) && !badGaps.contains(Math.round(pt * 10)) && !inFlightGaps.contains(Math.round(pt * 10)) && pt < startSec + reach && t > startSec - reach) {
                 double d = Math.abs((pt + t) / 2 - focus);
                 if (d < bestD) { bestD = d; lt = pt; rt = t; lw = pw; rw = e.getValue(); }
             }
@@ -405,11 +472,15 @@ final class SyncPlanner {
         if (fwd) {
             fwdFails = 0; fwdN++;
             fwdStride = fwdN < 2 ? 0 : good ? (fwdStride == 0 ? MIN_STRIDE : Math.min(MAX_STRIDE, fwdStride * 1.6)) : Math.max(MIN_STRIDE, fwdStride / 2);
-            fwdCursor = (anchors.floorKey(o.time[o.time.length - 1]) == null ? o.time[o.time.length - 1] : anchors.floorKey(o.time[o.time.length - 1])) + fwdStride;
+            double endT = anchors.floorKey(o.time[o.time.length - 1]) == null ? o.time[o.time.length - 1] : anchors.floorKey(o.time[o.time.length - 1]);
+            if (dense && endT < focus + NEAR_AHEAD) fwdStride = DENSE_NEAR;   // inside the dense zone the spacing is fixed
+            fwdCursor = Math.max(fwdCursor, endT + fwdStride);
         } else {
             bwdFails = 0; bwdN++;
             bwdStride = bwdN < 2 ? 0 : good ? (bwdStride == 0 ? MIN_STRIDE : Math.min(MAX_STRIDE, bwdStride * 1.6)) : Math.max(MIN_STRIDE, bwdStride / 2);
-            bwdEnd = (anchors.ceilingKey(o.time[0]) == null ? o.time[0] : anchors.ceilingKey(o.time[0])) - bwdStride;
+            double begT = anchors.ceilingKey(o.time[0]) == null ? o.time[0] : anchors.ceilingKey(o.time[0]);
+            if (dense && begT > focus - NEAR_BEHIND) bwdStride = DENSE_NEAR;
+            bwdEnd = Math.min(bwdEnd, begT - bwdStride);
         }
         return kept;
     }

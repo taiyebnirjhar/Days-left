@@ -125,47 +125,48 @@ public class SyncSim {
             if (wide[0] < 95) bad++;
         }
 
-        // ---- 1c. listening along: the dense zone must travel with the playhead so the sentence highlight is there and right ----
-        build(41, hours, callSec);
-        {
+        // ---- 1c. press play on an unsynced book and listen: how soon is the highlight there, and is it right? ----
+        SyncPlanner.DENSE_NEAR = Double.parseDouble(System.getProperty("dn", "20"));
+        SyncPlanner.NEAR_AHEAD = Double.parseDouble(System.getProperty("na", "150"));
+        double sumFirst = 0, sumAvail = 0; int runs = 0, wrongAll = 0, shownAll = 0; double worstAll = 0; List<Double> allErrs = new ArrayList<>();
+        for (long seed = 41; seed <= 45; seed++) {
+            build(seed, hours, callSec);
             int[] ps2 = {0, N};
             Aligner al2 = new Aligner(new BookIndex(book, ps2, new float[N * 4], new byte[N]));
             double playhead = 0.37 * total;
             SyncPlanner p = new SyncPlanner(total, playhead, N, new int[0], new double[0]);
-            p.reach = 150;
-            calls = 0; listened = 0;
-            while (step(p, al2)) if (calls > 3000) break;
-            int ringCalls = calls;
-            p.widen(600); p.dense = Boolean.parseBoolean(System.getProperty("dense", "true"));
-            int shown = 0, total2 = 0, wrong = 0; double worstShown = 0; List<Double> errs = new ArrayList<>();
-            int readyAfter = -1;
-            for (int i = 0; i < 80; i++) {
+            p.reach = 150; p.dense = true;
+            int firstShow = -1, shown = 0, seen = 0; boolean widened = false;
+            for (int i = 0; i < 100; i++) {
                 p.recenter(playhead);
-                step(p, al2);                      // one speech call; the audio plays on meanwhile
+                boolean work = step(p, al2);          // one speech call; the audio plays on meanwhile
+                if (!work && !widened) { p.widen(600); widened = true; }
                 playhead += callSec;
                 p.recenter(playhead);
                 Alignment fa = snapshot(p);
-                double gap = fa.gapAt(playhead);
-                boolean show = gap <= 25;
-                if (show && readyAfter < 0) readyAfter = i;
-                if (i >= 10) {
-                    total2++;
+                boolean show = fa.gapAt(playhead) <= 25;
+                if (show && firstShow < 0) firstShow = i + 1;
+                if (firstShow >= 0 && i >= firstShow + 4) {
+                    seen++;
                     if (show) {
                         shown++;
                         int w = trueWordAt(playhead);
                         double est = fa.timeOfWord(w);
                         double e = est < 0 ? 99 : Math.abs(est - tw[w]);
-                        errs.add(e); worstShown = Math.max(worstShown, e);
-                        if (e > 2.5) wrong++;
+                        allErrs.add(e); worstAll = Math.max(worstAll, e);
+                        if (e > 2.5) wrongAll++;
+                        shownAll++;
                     }
                 }
             }
-            Collections.sort(errs);
-            double med = errs.isEmpty() ? -1 : errs.get(errs.size() / 2), p95 = errs.isEmpty() ? -1 : errs.get((int) (errs.size() * 0.95));
-            System.out.printf("listening along (%d calls for the ring, then 80 calls while playing): highlight available %d%% of the time, wrong (>2.5 s) %d of %d shown, median error %.2f s, 95th pct %.2f s, worst %.1f s%n",
-                    ringCalls, total2 == 0 ? 0 : shown * 100 / total2, wrong, shown, med, p95, worstShown);
-            if (total2 == 0 || shown * 100 / total2 < 90 || wrong * 100 > Math.max(1, shown) * 3) bad++;
+            sumFirst += firstShow < 0 ? 999 : firstShow; sumAvail += seen == 0 ? 0 : shown * 100.0 / seen; runs++;
         }
+        Collections.sort(allErrs);
+        double med = allErrs.isEmpty() ? -1 : allErrs.get(allErrs.size() / 2), p95 = allErrs.isEmpty() ? -1 : allErrs.get((int) (allErrs.size() * 0.95));
+        System.out.printf("press play on an unsynced book (dense %.0f s, ahead %.0f s, %.0f s per call): first highlight after %.1f calls (~%.0f s), then available %.0f%% of the time, wrong (>2.5 s) %d of %d, median error %.2f s, 95th pct %.2f s, worst %.1f s%n",
+                SyncPlanner.DENSE_NEAR, SyncPlanner.NEAR_AHEAD, callSec, sumFirst / runs, sumFirst / runs * callSec, sumAvail / runs, wrongAll, shownAll, med, p95, worstAll);
+        if (sumFirst / runs > 6 || sumAvail / runs < 90 || wrongAll * 100 > Math.max(1, shownAll) * 3) bad++;
+        SyncPlanner.DENSE_NEAR = 20; SyncPlanner.NEAR_AHEAD = 150;
 
         // ---- 2. Play this page: find a far-away page from nothing (no sync data at all) ----
         Random r = new Random(11);

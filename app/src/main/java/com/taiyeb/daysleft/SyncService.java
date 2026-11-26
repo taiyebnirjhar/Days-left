@@ -27,6 +27,8 @@ public class SyncService extends Service {
     static volatile boolean idle;
     /** Speech model download progress (0..100) while the service is downloading, else -1. */
     static volatile int dlPct = -1;
+    /** The phone is in battery saver, which slows the processor (and so the sync). */
+    static volatile boolean powerSaving;
     /** Book text reading progress (0..100) while the service is reading it, else -1. */
     static volatile int textPct = -1;
     /** The reader asks: when is this book word spoken? (-1 none). The answer appears in goalTimeOut (-1 working, -2 not found). */
@@ -69,6 +71,13 @@ public class SyncService extends Service {
         return (int) Math.ceil((totalSec - doneSec) / (got / el) / 60.0);
     }
 
+    /** Seconds left in the current stage, from the speed so far; -1 while unknown. */
+    static int etaSeconds() {
+        double got = doneSec - startedFrom, el = (System.currentTimeMillis() - startedMs) / 1000.0;
+        if (got < 5 || el < 6) return -1;
+        return (int) Math.ceil(Math.max(0, totalSec - doneSec) / (got / el));
+    }
+
     @Override public IBinder onBind(Intent i) { return null; }
 
     @Override public int onStartCommand(Intent in, int flags, int startId) {
@@ -77,7 +86,7 @@ public class SyncService extends Service {
         final int id = in == null ? -1 : in.getIntExtra("id", -1);
         nm = getSystemService(NotificationManager.class);
         nm.createNotificationChannel(new NotificationChannel("sync", "Syncing audiobook", NotificationManager.IMPORTANCE_LOW));
-        running = true; cancel = false; idle = false; error = ""; itemId = id; hereWord = -1; goalTimeOut = -1;
+        running = true; cancel = false; idle = false; try { powerSaving = getSystemService(PowerManager.class).isPowerSaveMode(); } catch (Exception ignored) {} error = ""; itemId = id; hereWord = -1; goalTimeOut = -1;
         Whisper.abort(false);
         Store.sp(this).edit().putBoolean("syncWant_" + id, true).apply();
         Notification n = note("Getting ready…", 0, true);
@@ -86,7 +95,11 @@ public class SyncService extends Service {
         PowerManager pm = getSystemService(PowerManager.class);
         wl = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "daysleft:sync");
         wl.acquire(8 * 60 * 60 * 1000L);
-        new Thread(() -> work(id), "sync").start();
+        new Thread(() -> {
+            // the speech threads inherit this: fewer preemptions, steadier call times (they varied 4 to 13 s for the same work)
+            try { android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_DISPLAY); } catch (Exception ignored) {}
+            work(id);
+        }, "sync").start();
         return START_REDELIVER_INTENT;   // if the system kills the app, it restarts and carries on
     }
 
@@ -179,6 +192,7 @@ public class SyncService extends Service {
             int stage = 0;
             boolean widening = false;
             pl.reach = STAGES[0];
+            pl.dense = true;   // fill the zone around the playhead first, with probes close enough for a sentence highlight
             idle = winReady(this, id);   // was ready last time: stays "Synced" unless new work turns up
             totalSec = pl.windowProgress()[1];   // the progress bar is about the window around the playhead
             doneSec = pl.windowProgress()[0]; startedFrom = doneSec; startedMs = System.currentTimeMillis();
@@ -195,7 +209,7 @@ public class SyncService extends Service {
                     // the window and the dense zone follow the playhead; a jump to an unmapped place starts over there
                     int rc = pl.recenter(Player.pos());
                     if (rc == 2) {
-                        stage = 0; pl.reach = STAGES[0]; pl.dense = false; widening = false; idleSince = 0; idle = false;
+                        stage = 0; pl.reach = STAGES[0]; pl.dense = true; widening = false; idleSince = 0; idle = false;
                         Dbg.i("Sync", "playhead jumped to " + (int) Player.pos() + " s, mapping around it");
                         totalSec = pl.windowProgress()[1];
                     }

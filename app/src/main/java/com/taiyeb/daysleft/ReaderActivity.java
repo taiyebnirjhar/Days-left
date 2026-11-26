@@ -281,9 +281,35 @@ public class ReaderActivity extends Activity {
     final Runnable poll = new Runnable() {
         @Override public void run() {
             if (!ui) refreshPlay();
+            updateBanner();
             h.postDelayed(this, 1200);
         }
     };
+
+    /** The status line above the player. Calm wording, honest numbers. */
+    void updateBanner() {
+        if (bannerWrap == null || item == null || !fileMode) return;
+        long now = System.currentTimeMillis();
+        boolean mine = SyncService.running && SyncService.itemId == item.id;
+        String t = null;
+        if (syncPanel) t = null;   // the panel already says it
+        else if (mine && SyncService.dlPct >= 0) t = "Downloading the speech model… " + SyncService.dlPct + "%";
+        else if (mine && SyncService.textPct >= 0) t = "Reading the book… " + SyncService.textPct + "%";
+        else if (mine && !SyncService.idle) {
+            int sec = SyncService.etaSeconds();
+            t = "Syncing around you… " + syncPct() + "%" + (sec > 0 ? " · about " + (sec >= 90 ? (sec + 30) / 60 + " min" : sec + " s") : "");
+            if (SyncService.powerSaving) t += "\nBattery saver is on, so this is slower";
+        } else if (now < readyFlashUntil) t = "Ready ✓  highlight" + (followOn ? " and page turns" : "") + " are on";
+        else if (!SyncService.running && !SyncService.error.isEmpty() && SyncService.wanted(this, item.id) && !SyncService.winReady(this, item.id))
+            t = "Sync paused: " + SyncService.error + "\nTap to try again";
+        if (t == null) { if (bannerWrap.getVisibility() != View.GONE) bannerWrap.setVisibility(View.GONE); return; }
+        int ink = INK[theme], paper = PAPER[theme];
+        syncBanner.setTextColor(ink);
+        syncBanner.setBackground(rr((ink & 0x00FFFFFF) | 0x26000000, 20));
+        syncBanner.setGravity(Gravity.CENTER);
+        if (!t.contentEquals(syncBanner.getText())) syncBanner.setText(t);
+        if (bannerWrap.getVisibility() != View.VISIBLE) bannerWrap.setVisibility(View.VISIBLE);
+    }
 
     void refreshPlay() {
         if (playGlyph == null || am == null) return;
@@ -292,10 +318,13 @@ public class ReaderActivity extends Activity {
     }
 
     boolean askedSyncThisSession, waitingReady, autoHidePanel;
+    LinearLayout bannerWrap;
+    TextView syncBanner;
+    long readyFlashUntil;
 
     /** Ask once per visit, and never again if the user said so, for a book that has no sync yet. */
     boolean shouldAskSync() {
-        return item != null && fileMode && !askedSyncThisSession && !SyncService.running
+        return item != null && fileMode && Store.flag(this, "syncAsk", true) && !askedSyncThisSession && !SyncService.running
                 && !SyncService.wanted(this, item.id) && !SyncService.winReady(this, item.id)
                 && !Store.sp(this).getBoolean("syncNever_" + item.id, false);
     }
@@ -371,6 +400,9 @@ public class ReaderActivity extends Activity {
         if (waitingReady && SyncService.running && SyncService.idle && SyncService.itemId == item.id) {
             waitingReady = false;
             loadSyncData();
+            readyFlashUntil = now + 4500;
+            if (playBtn != null) playBtn.performHapticFeedback(HapticFeedbackConstants.CONFIRM);
+            updateBanner();
             Toast.makeText(this, "Ready! The sentence being read is highlighted" + (followOn ? " and pages turn by themselves." : "."), Toast.LENGTH_LONG).show();
         }
         // listening on: when the mapped area is running out ahead of the playhead, wake the service so it maps the next part
@@ -545,8 +577,8 @@ public class ReaderActivity extends Activity {
     }
 
     String etaText() {
-        int e = SyncService.etaMinutes();
-        return e <= 0 ? "" : " · about " + (e >= 60 ? (e / 60) + " h " + (e % 60) + " min" : e + " min") + " left";
+        int sec = SyncService.etaSeconds();
+        return sec <= 0 ? "" : " · about " + (sec >= 90 ? (sec + 30) / 60 + " min" : sec + " s") + " left";
     }
 
     void updateSyncLabel() {
@@ -1147,6 +1179,22 @@ public class ReaderActivity extends Activity {
             Toast.makeText(this, "Marked done. Nice work!", Toast.LENGTH_SHORT).show();
         });
         stack.addView(donePill, lpm(-2, -2, 0, 0, 0, 10));
+        // a quiet status line for the sync: what is happening, how long it will take, and when it is ready
+        bannerWrap = new LinearLayout(this);
+        bannerWrap.setGravity(Gravity.CENTER);
+        syncBanner = new TextView(this);
+        syncBanner.setTextSize(13);
+        syncBanner.setTypeface(Typeface.DEFAULT_BOLD);
+        syncBanner.setPadding(dp(16), dp(9), dp(16), dp(9));
+        syncBanner.setTag("pill");
+        syncBanner.setMaxLines(2);
+        syncBanner.setOnClickListener(v -> {
+            if (!SyncService.running && !SyncService.error.isEmpty()) { SyncService.error = ""; SyncService.start(this, item.id); }
+            else showSync();
+        });
+        bannerWrap.addView(syncBanner);
+        bannerWrap.setVisibility(View.GONE);
+        stack.addView(bannerWrap, lpm(-1, -2, 12, 0, 12, 8));
 
         settings = new LinearLayout(this);
         settings.setOrientation(LinearLayout.VERTICAL);
@@ -1359,6 +1407,7 @@ public class ReaderActivity extends Activity {
         if (ui) {
             settings.addView(switchRow("Highlight the spoken sentence", hlOn, on -> { hlOn = on; Store.setFlag(this, "rdHl", on); if (pv != null) pv.invalidate(); }), lpm(-1, -2, 0, 12, 0, 0));
             settings.addView(switchRow("Turn pages with the audio", followOn, on -> { followOn = on; Store.setFlag(this, "rdFollow", on); }), lpm(-1, -2, 0, 12, 0, 0));
+            settings.addView(switchRow("Offer to sync when I press Play", Store.flag(this, "syncAsk", true), on -> Store.setFlag(this, "syncAsk", on)), lpm(-1, -2, 0, 12, 0, 0));
             TextView hs = new TextView(this);
             hs.setText("Highlight style: " + (hlStyle == 0 ? "Marker" : "Underline") + "  ›");
             hs.setTextSize(15);

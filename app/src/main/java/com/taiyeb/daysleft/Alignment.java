@@ -10,12 +10,34 @@ import java.util.*;
 class Alignment {
     private int[] aw = new int[0];
     private double[] at = new double[0];
+    private double typ;   // the narrator's usual words per second (median over close probe pairs); 0 if unknown
     static final double MAX_GAP_S = 200;    // sparse sync leaves gaps up to ~165 s; beyond this, do not trust interpolation
     static final int MAX_GAP_W = 900;
 
     int size() { return aw.length; }
     double firstTime() { return aw.length == 0 ? 0 : at[0]; }
     double lastTime() { return aw.length == 0 ? 0 : at[at.length - 1]; }
+
+    /** Median words per second between probes that are close together (0.5 to 4 s apart): the pace without long pauses. */
+    static double typicalRate(int[] w, double[] t) {
+        double[] r = new double[Math.max(0, w.length - 1)];
+        int c = 0;
+        for (int i = 0; i + 1 < w.length; i++) {
+            double dt = t[i + 1] - t[i];
+            int dw = w[i + 1] - w[i];
+            if (dt >= 0.5 && dt <= 4 && dw >= 2) r[c++] = dw / dt;
+        }
+        if (c < 3) return 0;
+        double[] x = java.util.Arrays.copyOf(r, c);
+        java.util.Arrays.sort(x);
+        return x[c / 2];
+    }
+
+    /** True when the words between two probes are far too few for the time between them: a pause or music sits in that gap. */
+    boolean pauseBetween(int i) {
+        double dt = at[i + 1] - at[i];
+        return typ > 0 && dt > 4 && (aw[i + 1] - aw[i]) / dt < 0.55 * typ;
+    }
 
     int[] words() { return aw.clone(); }
     double[] times() { return at.clone(); }
@@ -49,6 +71,7 @@ class Alignment {
         }
         a.aw = new int[len]; a.at = new double[len];
         for (int i = tail.length > 0 && len > 0 ? tail[len - 1] : -1, k = len - 1; i >= 0 && k >= 0; i = prev[i], k--) { a.aw[k] = cw[i]; a.at[k] = ct[i]; }
+        a.typ = typicalRate(a.aw, a.at);
         return a;
     }
 
@@ -98,6 +121,7 @@ class Alignment {
         int i = floorT(t);
         if (i < 0) return Double.MAX_VALUE;
         if (i + 1 >= at.length) return t - at[i] < 6 ? 0 : Double.MAX_VALUE;
+        if (pauseBetween(i)) return Double.MAX_VALUE;   // somewhere in here is a pause: where the narrator is cannot be told by interpolating
         return at[i + 1] - at[i];
     }
 
