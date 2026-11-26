@@ -178,14 +178,26 @@ public class ReaderActivity extends Activity {
         return true;
     }
 
-    // ====================== text view ======================
-    /** Pinch-out hands over to the text view when the printed words are available. False = keep the normal page zoom. */
+    // ====================== text size (bigger text that still fits) ======================
+    /** True when the zoomed view can be used: it needs the word boxes of the book (the words are cut out of the PDF's own rendering). */
     boolean tryEnterReflow() {
         if (!fileMode) return false;
-        if (bi != null) return true;   // the word boxes are all it needs: the words are cut out of the PDF's own rendering
-        if (rfBuilding) Toast.makeText(this, "Preparing the text view, a few seconds…", Toast.LENGTH_SHORT).show();
+        if (bi != null) return true;
+        if (rfBuilding) Toast.makeText(this, "Preparing the bigger text, a few seconds…", Toast.LENGTH_SHORT).show();
         else prepareText(true);
         return false;
+    }
+
+    /** The Text size setting, 1.0 = the page as it is, up to 2.0 = twice as big. */
+    float textZoom() { return Store.num(this, "rdRfZoom", 100) / 100f; }
+
+    /** Applies the Text size: 1.0 shows the normal page, more shows the same page with bigger text, wrapped to the screen. */
+    void applyTextZoom() {
+        float z = textZoom();
+        if (z <= 1.005f) { if (rfActive) exitReflow(); return; }
+        if (!tryEnterReflow()) return;
+        if (!rfActive) enterReflow();
+        rf.setZoom(z);
     }
 
     boolean prepTried;
@@ -197,7 +209,7 @@ public class ReaderActivity extends Activity {
     void prepareText(boolean say) {
         if (rfBuilding || item == null || !fileMode || SyncService.running && SyncService.itemId == item.id) return;
         rfBuilding = true; prepTried = true;
-        if (say) Toast.makeText(this, "Preparing the text view (about 15 s). Pinch again when it is ready.", Toast.LENGTH_LONG).show();
+        if (say) Toast.makeText(this, "Preparing the bigger text (about 15 s)…", Toast.LENGTH_LONG).show();
         final int id = item.id;
         new Thread(() -> {
             try {
@@ -205,21 +217,22 @@ public class ReaderActivity extends Activity {
                 BookText.Disp dw = nb == null ? null : BookText.display(this, id, nb.count());
                 if (dw == null) {
                     BookIndex fresh = BookText.extract(this, item, pc -> {}, new boolean[1]);   // same deterministic extraction: word numbers do not change
-                    if (BookText.looksScanned(fresh)) { ui(() -> { if (say) Toast.makeText(this, "This PDF is a scan (no text), so there is no text view.", Toast.LENGTH_LONG).show(); }); return; }
+                    if (BookText.looksScanned(fresh)) { ui(() -> { if (say) Toast.makeText(this, "This PDF is a scan (no text), so the text cannot be made bigger.", Toast.LENGTH_LONG).show(); }); return; }
                     if (nb != null && nb.count() != fresh.count()) { Dbg.i("Reader", "text view: the PDF changed, word counts differ"); return; }
                     nb = nb != null ? nb : fresh;
                     dw = BookText.display(this, id, nb.count());
                 }
                 final BookIndex fb = nb; final BookText.Disp fd = dw;
-                if (fd == null) { ui(() -> { if (say) Toast.makeText(this, "Could not prepare the text view for this PDF.", Toast.LENGTH_LONG).show(); }); return; }
+                if (fd == null) { ui(() -> { if (say) Toast.makeText(this, "Could not prepare the bigger text for this PDF.", Toast.LENGTH_LONG).show(); }); return; }
                 ui(() -> {
                     if (bi == null) { bi = fb; al.withBook(fb); }
                     disp = fd;
-                    if (say) Toast.makeText(this, "Text view ready: pinch out to zoom the text.", Toast.LENGTH_LONG).show();
+                    if (say) Toast.makeText(this, "Ready: move the Text size slider.", Toast.LENGTH_SHORT).show();
+                    applyTextZoom();
                 });
             } catch (Throwable e) {
                 Dbg.e("Reader", "text view prepare failed", e);
-                ui(() -> { if (say) Toast.makeText(this, "Could not prepare the text view for this PDF.", Toast.LENGTH_LONG).show(); });
+                ui(() -> { if (say) Toast.makeText(this, "Could not prepare the bigger text for this PDF.", Toast.LENGTH_LONG).show(); });
             } finally { rfBuilding = false; }
         }, "text-view").start();
     }
@@ -240,21 +253,23 @@ public class ReaderActivity extends Activity {
         return a;
     }
 
-    /** A strip of a page rendered at exactly the size it is shown (sc = pixels per page width), for the zoomed view. */
-    Bitmap renderBand(int page, float sc, int x, int y, int w, int h) {
-        synchronized (lock) {
-            PdfRenderer.Page pg = pr.openPage(page);
-            try {
-                float k = sc / pg.getWidth();
-                android.graphics.Matrix m = new android.graphics.Matrix();
-                m.setScale(k, k);
-                m.postTranslate(-x, -y);
-                Bitmap b = Bitmap.createBitmap(Math.max(1, w), Math.max(1, h), Bitmap.Config.ARGB_8888);
-                b.eraseColor(Color.WHITE);
-                pg.render(b, null, m, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY);
-                return b;
-            } finally { pg.close(); }
+    // one sharp picture per page for the bigger text, cached; the normal page picture is shown until it arrives
+    final LruCache<Integer, Bitmap> rfPics = new LruCache<>(3);
+    final Set<Integer> rfInflight = new HashSet<>();
+
+    Bitmap rfPicture(int i) {
+        Bitmap b = rfPics.get(i);
+        if (b != null) return b;
+        if (i >= 0 && i < n && rfInflight.add(i)) {
+            final int w = Math.min(2560, Math.max(renderW, 2200));
+            exec.submit(() -> {
+                try {
+                    Bitmap nb = render(i, w);
+                    h.post(() -> { rfPics.put(i, nb); rfInflight.remove(i); if (rf != null) rf.pictureReady(); });
+                } catch (Throwable t) { h.post(() -> rfInflight.remove(i)); }
+            });
         }
+        return cache.get(i);   // meanwhile the page the reader already has (a little softer)
     }
 
     void enterReflow() {
@@ -266,31 +281,26 @@ public class ReaderActivity extends Activity {
                     cur = p; updateLabel(cur); if (seek != null) seek.setProgress(cur);
                     h.removeCallbacks(saver); h.postDelayed(saver, 700);
                 }
-                @Override public void onUserScroll() { lastManual = System.currentTimeMillis(); if (chrome) showChrome(false); }
-                @Override public void onPinchOut() { exitReflow(); }
-                @Override public Bitmap renderBand(int page, float sc, int x, int y, int w, int h2) { return ReaderActivity.this.renderBand(page, sc, x, y, w, h2); }
+                @Override public void onUserScroll() { lastManual = System.currentTimeMillis(); if (chrome && settings.getVisibility() != View.VISIBLE) showChrome(false); }
+                @Override public Bitmap pageBitmap(int page) { return rfPicture(page); }
                 @Override public float aspect(int page) { return aspectOf(page); }
             });
-            rf.setZoom(Store.num(this, "rdRfZoom", 170) / 100f);
             root.addView(rf, 1, new FrameLayout.LayoutParams(-1, -1));
         }
         rf.setColors(INK[theme], PAPER[theme], theme);
         rf.setVisibility(View.VISIBLE);
         rfActive = true;
-        showChrome(false);
         int p = hlFrom >= 0 ? bi.pageOf(hlFrom) : cur;
         rf.showPage(p);
-        rf.setHighlight(hlOn ? hlFrom : -1, hlOn ? hlTo : -1, hlStyle, hlOn ? hlWord : -1);
+        rf.setHighlight(hlOn ? hlFrom : -1, hlOn ? hlTo : -1, hlStyle);
         if (hlFrom >= 0 && hlOn) rf.post(() -> rf.follow(hlFrom));
     }
 
     void exitReflow() {
         if (!rfActive) return;
-        Store.setNum(this, "rdRfZoom", Math.round(rf.zoom() * 100));
         rfActive = false;
         int p = rf.pageAtTop();
         rf.setVisibility(View.GONE);
-        if (pv != null) pv.noReflow = true;
         goTo(p, false);
     }
 
@@ -310,7 +320,6 @@ public class ReaderActivity extends Activity {
     }
 
     @Override public void onBackPressed() {
-        if (rfActive && !locked) { exitReflow(); return; }
         if (locked) { unlockBtn.setVisibility(View.VISIBLE); h.removeCallbacks(hideUnlock); h.postDelayed(hideUnlock, 3000); return; }
         if (settings != null && settings.getVisibility() == View.VISIBLE) { settings.setVisibility(View.GONE); return; }
         super.onBackPressed();
@@ -588,7 +597,7 @@ public class ReaderActivity extends Activity {
                 if (pv != null) pv.invalidate();
             }
             if (rfActive && rf != null) {
-                rf.setHighlight(hlOn ? hlFrom : -1, hlOn ? hlTo : -1, hlStyle, hlOn ? hlWord : -1);
+                rf.setHighlight(hlOn ? hlFrom : -1, hlOn ? hlTo : -1, hlStyle);
                 if (hw >= 0 && followOn && st == 1 && now - lastManual > 5000 && settings.getVisibility() != View.VISIBLE) rf.follow(hw);
             } else if (fw >= 0 && followOn && st == 1 && now - lastManual > 5000 && pv != null && !pv.dragging && pv.zoom <= 1.01f && settings.getVisibility() != View.VISIBLE) {
                 int pg = bi.pageOf(fw);
@@ -809,7 +818,8 @@ public class ReaderActivity extends Activity {
                 ui(() -> {
                     bi = b; al = a; seenLiveVer = -1; if (dw != null && disp == null) disp = dw; jumpToAudioPage();
                     updatePin(); if (pv != null) pv.invalidate();
-                    if (b == null && !prepTried) h.postDelayed(() -> prepareText(false), 1500);   // so the zoomed view is ready when you pinch
+                    if (b == null && !prepTried && textZoom() > 1.005f) h.postDelayed(() -> prepareText(false), 800);
+                    if (b != null && textZoom() > 1.005f && !rfActive) applyTextZoom();   // the saved Text size
                     // a sync that was interrupted (app closed by the system, low battery) carries on by itself
                     if (b != null && fileMode && !SyncService.running && SyncService.wanted(this, id) && !SyncService.fullFor(this, id) && Whisper.hasModel(this)) {
                         Dbg.i("Sync", "auto-resuming from the reader (was interrupted, not stopped by the user)");
@@ -1634,6 +1644,29 @@ public class ReaderActivity extends Activity {
         br.setTag("seek");
         settings.addView(br, lpm(-1, -2, 0, 2, 0, 0));
 
+        // Text size: bigger text that wraps to the next line instead of running off the screen (the look of the page never changes)
+        final TextView l3 = new TextView(this);
+        l3.setTag("sub");
+        l3.setTextSize(11);
+        l3.setLetterSpacing(0.1f);
+        settings.addView(l3, lpm(-2, -2, 0, 14, 0, 0));
+        SeekBar zs = new SeekBar(this);
+        zs.setMax(100);
+        zs.setProgress(Math.round((textZoom() - 1f) * 100));
+        l3.setText("TEXT SIZE  " + Math.round(textZoom() * 100) + "%");
+        zs.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            @Override public void onProgressChanged(SeekBar s, int p, boolean user) {
+                if (!user) return;
+                Store.setNum(ReaderActivity.this, "rdRfZoom", 100 + p);
+                l3.setText("TEXT SIZE  " + (100 + p) + "%");
+                applyTextZoom();
+            }
+            @Override public void onStartTrackingTouch(SeekBar s) {}
+            @Override public void onStopTrackingTouch(SeekBar s) {}
+        });
+        zs.setTag("seek");
+        settings.addView(zs, lpm(-1, -2, 0, 2, 0, 0));
+
         LinearLayout tr = new LinearLayout(this);
         tr.setGravity(Gravity.CENTER_VERTICAL);
         TextView tt = new TextView(this);
@@ -1655,7 +1688,7 @@ public class ReaderActivity extends Activity {
             hs.setTextSize(15);
             hs.setTag("txt");
             hs.setPadding(0, dp(14), 0, dp(4));
-            hs.setOnClickListener(v -> { hlStyle = 1 - hlStyle; Store.setNum(this, "rdHlStyle", hlStyle); if (rf != null) rf.setHighlight(rf == null ? -1 : (hlOn ? hlFrom : -1), hlOn ? hlTo : -1, hlStyle, hlOn ? hlWord : -1); hs.setText("Highlight style: " + (hlStyle == 0 ? "Marker" : "Underline") + "  ›"); if (pv != null) pv.invalidate(); });
+            hs.setOnClickListener(v -> { hlStyle = 1 - hlStyle; Store.setNum(this, "rdHlStyle", hlStyle); if (rf != null) rf.setHighlight(hlOn ? hlFrom : -1, hlOn ? hlTo : -1, hlStyle); hs.setText("Highlight style: " + (hlStyle == 0 ? "Marker" : "Underline") + "  ›"); if (pv != null) pv.invalidate(); });
             settings.addView(hs);
             TextView sy = new TextView(this);
             sy.setText("Sync with the book…");
@@ -1873,12 +1906,12 @@ public class ReaderActivity extends Activity {
     class PageView extends View {
         int th;
         float zoom = 1, px, py, dragX;
-        boolean scaling, dragging, flung, noReflow;
+        boolean scaling, dragging, flung;
         ValueAnimator anim;
         final Paint paperP = new Paint(Paint.ANTI_ALIAS_FLAG), bmpP = new Paint(Paint.FILTER_BITMAP_FLAG), shP = new Paint(Paint.ANTI_ALIAS_FLAG),
                 grainP = new Paint(), edgeP = new Paint(), dimP = new Paint(), gutP = new Paint();
         final RectF sheet = new RectF();
-        final ScaleGestureDetector sgd;
+        final ScaleGestureDetector sgd;   // unused: pinch zoom is off
         final GestureDetector gd;
 
         PageView() {
@@ -1887,21 +1920,7 @@ public class ReaderActivity extends Activity {
             Random r = new Random(7);
             for (int i = 0; i < 128 * 128 / 5; i++) g.setPixel(r.nextInt(128), r.nextInt(128), Color.argb(8 + r.nextInt(22), 70, 50, 20));
             grainP.setShader(new BitmapShader(g, Shader.TileMode.REPEAT, Shader.TileMode.REPEAT));
-            sgd = new ScaleGestureDetector(ReaderActivity.this, new ScaleGestureDetector.SimpleOnScaleGestureListener() {
-                @Override public boolean onScaleBegin(ScaleGestureDetector d) { scaling = true; noReflow = false; cancelAnim(); dragX = 0; return true; }
-                @Override public boolean onScale(ScaleGestureDetector d) {
-                    if (rfActive) { if (rf.scaleBy(d.getScaleFactor())) exitReflow(); return true; }   // the running pinch carries on in the text view
-                    if (noReflow) return true;
-                    if (zoom * d.getScaleFactor() > 1.25f && tryEnterReflow()) { enterReflow(); return true; }
-                    float nz = Math.max(1f, Math.min(5f, zoom * d.getScaleFactor()));
-                    px *= nz / zoom; py *= nz / zoom;
-                    zoom = nz;
-                    clampPan();
-                    invalidate();
-                    return true;
-                }
-                @Override public void onScaleEnd(ScaleGestureDetector d) { scaling = false; if (rfActive && rf != null) rf.endPinch(); if (zoom < 1.05f) resetZoom(); }
-            });
+            sgd = null;
             gd = new GestureDetector(ReaderActivity.this, new GestureDetector.SimpleOnGestureListener() {
                 @Override public boolean onDown(MotionEvent e) { flung = false; dragging = false; cancelAnim(); return true; }
                 @Override public boolean onSingleTapConfirmed(MotionEvent e) {
@@ -1911,18 +1930,7 @@ public class ReaderActivity extends Activity {
                     showChrome(!chrome);
                     return true;
                 }
-                @Override public boolean onDoubleTap(MotionEvent e) {
-                    if (zoom > 1.05f) resetZoom();
-                    else if (tryEnterReflow()) { enterReflow(); return true; }   // double-tap: the text, bigger, fitted to the screen
-                    else {
-                        zoom = 2.4f;
-                        px = (e.getX() - getWidth() / 2f) * (1 - zoom);
-                        py = (e.getY() - getHeight() / 2f) * (1 - zoom);
-                        clampPan();
-                    }
-                    invalidate();
-                    return true;
-                }
+                @Override public boolean onDoubleTap(MotionEvent e) { return true; }   // no double-tap zoom
                 @Override public boolean onScroll(MotionEvent a, MotionEvent b, float dx, float dy) {
                     if (scaling) return false;
                     if (zoom > 1.01f) { px -= dx; py -= dy; clampPan(); invalidate(); return true; }
@@ -2001,8 +2009,7 @@ public class ReaderActivity extends Activity {
         }
 
         @Override public boolean onTouchEvent(MotionEvent e) {
-            sgd.onTouchEvent(e);
-            if (!sgd.isInProgress()) gd.onTouchEvent(e);
+            gd.onTouchEvent(e);   // no pinch zoom: the Text size slider does it (and re-wraps the text so nothing runs off the screen)
             int a = e.getActionMasked();
             if ((a == MotionEvent.ACTION_UP || a == MotionEvent.ACTION_CANCEL) && dragging && !flung && zoom <= 1.01f)
                 settle(dragX < -getWidth() * 0.22f && cur < n - 1 ? 1 : dragX > getWidth() * 0.22f && cur > 0 ? -1 : 0);
@@ -2063,31 +2070,11 @@ public class ReaderActivity extends Activity {
                 }
             }
             if (open) mark(c, src, l, t, s, x0, y0, x1, y1, pad, rad);
-            // the word being spoken: where it sits in its printed line (the index keeps one box per line, so the place is found by letters)
-            if (hlWord >= from && hlWord <= to) {
-                int j = hlWord, k0 = j, k1 = j;
-                int pa = bi.pageStart[idx], pb = bi.pageStart[idx + 1] - 1;
-                while (k0 > pa && sameBox(k0 - 1, j)) k0--;
-                while (k1 < pb && sameBox(k1 + 1, j)) k1++;
-                int total = 0, before = 0;
-                for (int k = k0; k <= k1; k++) { if (k == j) before = total; total += bi.w[k].length() + 1; }
-                float f0 = total == 0 ? 0 : (float) before / total, f1 = total == 0 ? 1 : (float) (before + bi.w[j].length()) / total;
-                float bx0 = bi.box[j * 4] * bw, bx1 = bi.box[j * 4 + 2] * bw;
-                hlP.setColor((th == 3 ? 0xFFFFD54F : 0xFFD9822B) & 0x00FFFFFF | 0xB0000000);
-                markBox = true;
-                mark(c, src, l, t, s, bx0 + (bx1 - bx0) * f0, bi.box[j * 4 + 1] * bh, bx0 + (bx1 - bx0) * f1, bi.box[j * 4 + 3] * bh, pad, rad);
-                markBox = false;
-            }
         }
 
-        private boolean sameBox(int a, int b) {
-            return bi.box[a * 4] == bi.box[b * 4] && bi.box[a * 4 + 1] == bi.box[b * 4 + 1] && bi.box[a * 4 + 2] == bi.box[b * 4 + 2] && bi.box[a * 4 + 3] == bi.box[b * 4 + 3];
-        }
-
-        boolean markBox;   // true while drawing the word cursor: always a filled box, whatever the sentence style
         void mark(Canvas c, RectF src, float l, float t, float s, float x0, float y0, float x1, float y1, float pad, float rad) {
             float L = l + (x0 - src.left) * s - pad, R = l + (x1 - src.left) * s + pad, T = t + (y0 - src.top) * s - pad, B = t + (y1 - src.top) * s + pad;
-            if (hlStyle == 1 && !markBox) c.drawRoundRect(L, B - dp(2.2f), R, B, dp(1.1f), dp(1.1f), hlP);
+            if (hlStyle == 1) c.drawRoundRect(L, B - dp(2.2f), R, B, dp(1.1f), dp(1.1f), hlP);
             else c.drawRoundRect(L, T, R, B, rad, rad, hlP);
         }
 

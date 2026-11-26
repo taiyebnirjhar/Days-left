@@ -11,38 +11,27 @@ import android.graphics.RectF;
 import android.util.LruCache;
 import android.view.GestureDetector;
 import android.view.MotionEvent;
-import android.view.ScaleGestureDetector;
 import android.view.View;
 import android.view.ViewGroup;
 import android.widget.AbsListView;
 import android.widget.BaseAdapter;
 import android.widget.ListView;
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.Map;
-import java.util.Set;
-import java.util.TreeSet;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
 
 /**
- * The zoomed book. Zooming does not change how anything looks: every word is cut out of the PDF's own rendering (same font, weight, colour, italics,
- * footnote numbers, headings) and only its size and place change, so the text gets bigger and wraps to the next line when it no longer fits
- * (see WordFlow). One row per PDF page, in reading order. The page is rendered in horizontal bands at exactly the size on screen, so the words are
- * sharp at any zoom. The spoken sentence and word are drawn over the words.
+ * The page with bigger text (the "Text size" slider). Nothing about the look changes: every word is cut out of the PDF's own rendering (same font,
+ * weight, colour, italics, footnote numbers, headings) and only its size and place change, so the text gets bigger and wraps to the next line when
+ * it no longer fits (see WordFlow). One row per PDF page, in reading order, with the spoken sentence marked. The page pictures come from the host
+ * (one picture per page, cached, so moving the slider only re-places words: no new rendering, nothing to wait for).
  */
 class ReflowView extends ListView {
-    static final float MIN_Z = 1.0f, MAX_Z = 3.4f;
-    private static final int BAND = 512, OVERLAP = 192;
+    static final float MIN_Z = 1.0f, MAX_Z = 2.0f;
 
     interface Host {
         void onTap();
         void onPage(int page);
         void onUserScroll();
-        /** The pinch went below the original size: go back to the page. */
-        void onPinchOut();
-        /** Renders a part of a page at {@code sc} pixels per page width: rectangle (x, y, w, h) in those pixels. Background thread. */
-        Bitmap renderBand(int page, float sc, int x, int y, int w, int h);
+        /** The page picture (any resolution: coordinates are fractions of the page), or null while it is being rendered; the host calls {@link #pictureReady()} then. */
+        Bitmap pageBitmap(int page);
         /** Page height / page width. */
         float aspect(int page);
     }
@@ -50,23 +39,15 @@ class ReflowView extends ListView {
     private final BookIndex bi;
     private final String[] tok;       // printed words, may be null (then no hyphen joining)
     private final Host host;
-    private final ScaleGestureDetector sgd;
     private final GestureDetector gd;
-    private float zoom = 1.6f;
-    private boolean pinching;
-    private float bookTw = 0.8f;      // width of the body text as a fraction of the page: the zoom is relative to "the text fills the line"
+    private float zoom = 1.3f;
+    private float bookTw = 0.8f;      // width of the body text as a fraction of the page: 1.0x = "the text fills the line"
     private int theme;
-    private int hlFrom = -1, hlTo = -1, hlStyle, hlWord = -1;
+    private int hlFrom = -1, hlTo = -1, hlStyle;
     private int lastPage = -1;
-    private final Paint bmpP = new Paint(Paint.FILTER_BITMAP_FLAG), bandP = new Paint(Paint.ANTI_ALIAS_FLAG), lblP = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint bmpP = new Paint(Paint.FILTER_BITMAP_FLAG | Paint.ANTI_ALIAS_FLAG), bandP = new Paint(Paint.ANTI_ALIAS_FLAG), lblP = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final BaseAdapter adapter;
     private final LruCache<Integer, WordFlow.Flow> flows = new LruCache<>(10);
-    private final LruCache<Long, Bitmap> bands = new LruCache<Long, Bitmap>(96 * 1024) {
-        @Override protected int sizeOf(Long k, Bitmap b) { return b.getByteCount() / 1024; }
-    };
-    private final Map<Integer, TreeSet<Integer>> scalesOf = new HashMap<>();   // page -> source scales that have bands
-    private final Set<Long> pending = new HashSet<>();
-    private final ExecutorService exec = Executors.newSingleThreadExecutor();
     private final float density;
 
     ReflowView(Context c, BookIndex bi, String[] tok, Host host) {
@@ -94,11 +75,6 @@ class ReflowView extends ListView {
             }
         };
         setAdapter(adapter);
-        sgd = new ScaleGestureDetector(c, new ScaleGestureDetector.SimpleOnScaleGestureListener() {
-            @Override public boolean onScaleBegin(ScaleGestureDetector d) { pinching = true; return true; }
-            @Override public boolean onScale(ScaleGestureDetector d) { if (scaleBy(d.getScaleFactor())) host.onPinchOut(); return true; }
-            @Override public void onScaleEnd(ScaleGestureDetector d) { endPinch(); }
-        });
         gd = new GestureDetector(c, new GestureDetector.SimpleOnGestureListener() {
             @Override public boolean onSingleTapConfirmed(MotionEvent e) { host.onTap(); return true; }
         });
@@ -113,7 +89,7 @@ class ReflowView extends ListView {
 
     private int dp(float v) { return (int) (v * density + 0.5f); }
 
-    /** The body text width of the book (median over a sample of pages), so the zoom means the same on every page. */
+    /** The body text width of the book (median over a sample of pages), so the size means the same on every page. */
     private float measureBookWidth() {
         java.util.ArrayList<Float> w = new java.util.ArrayList<>();
         int step = Math.max(1, bi.pages / 24);
@@ -129,31 +105,16 @@ class ReflowView extends ListView {
         return Math.max(0.3f, Math.min(1f, w.get(w.size() / 2)));
     }
 
-    // ---------- zoom ----------
     @Override public boolean onTouchEvent(MotionEvent e) {
-        sgd.onTouchEvent(e);
         gd.onTouchEvent(e);
-        if (sgd.isInProgress()) return true;
         return super.onTouchEvent(e);
     }
 
     float zoom() { return zoom; }
 
-    /** A pinch step (also fed by the page view's running gesture). True = smaller than the original size: leave. */
-    boolean scaleBy(float f) {
-        pinching = true;
-        float nz = zoom * f;
-        if (nz < MIN_Z) { if (f < 1) return true; nz = MIN_Z; }
-        setZoom(Math.min(MAX_Z, nz));
-        return false;
-    }
-
-    void endPinch() {
-        pinching = false;
-        invalidateRows();   // now the bands are fetched at the exact size
-    }
-
+    /** 1.0 = the text as the page has it (filling the line); up to 2.0 = twice as big. Only re-places words, so it can follow a slider live. */
     void setZoom(float z) {
+        z = Math.max(MIN_Z, Math.min(MAX_Z, z));
         if (Math.abs(z - zoom) < 0.004f) return;
         float ratio = z / zoom;
         zoom = z;
@@ -177,10 +138,11 @@ class ReflowView extends ListView {
                 0, 0, 0, 1, 0})));
         lblP.setColor((ink & 0x00FFFFFF) | 0x66000000);
         setBackgroundColor(paper);
-        invalidateRows();
+        pictureReady();
     }
 
-    private void invalidateRows() { for (int i = 0; i < getChildCount(); i++) getChildAt(i).invalidate(); }
+    /** A page picture arrived (or the colours changed): draw again. */
+    void pictureReady() { for (int i = 0; i < getChildCount(); i++) getChildAt(i).invalidate(); }
 
     int pageAtTop() {
         int p = pointToPosition(getWidth() / 2, getHeight() / 3);
@@ -189,7 +151,6 @@ class ReflowView extends ListView {
 
     void showPage(int p) { setSelectionFromTop(Math.max(0, Math.min(bi.pages - 1, p)), 0); }
 
-    // ---------- layout of a page ----------
     private float lineWidth() { int w = getWidth() > 0 ? getWidth() : getResources().getDisplayMetrics().widthPixels; return w - 2 * dp(12); }
 
     private WordFlow.Flow flow(int p) {
@@ -202,68 +163,12 @@ class ReflowView extends ListView {
         return f;
     }
 
-    /** The scale bands are rendered at: the exact one, or while pinching a coarse step (so a pinch does not render a new set every frame). */
-    private int srcScale(float sc) {
-        if (!pinching) return Math.max(64, Math.round(sc));
-        double step = Math.log(1.1);
-        return (int) Math.round(Math.exp(Math.round(Math.log(sc) / step) * step));
-    }
-
-    private static long key(int page, int sc, int band) { return ((long) page << 40) | ((long) sc << 16) | band; }
-
-    private int bandX0(WordFlow.Flow f, int sc) { return Math.max(0, Math.round((f.wholePage ? 0 : f.minX - 0.01f) * sc)); }
-
-    /** The bitmap holding band {@code band} of the page at scale sc, or null (and a request is queued). */
-    private Bitmap band(WordFlow.Flow f, int page, int sc, int band) {
-        long k = key(page, sc, band);
-        Bitmap bm = bands.get(k);
-        if (bm != null) return bm;
-        synchronized (pending) { if (!pending.add(k)) return null; }
-        final float asp = host.aspect(page);
-        final int x0 = bandX0(f, sc);
-        final int x1 = Math.min(sc, Math.round((f.wholePage ? 1 : f.maxX + 0.01f) * sc));
-        final int pageH = Math.max(1, Math.round(asp * sc));
-        final int y0 = f.wholePage ? 0 : band * BAND;
-        final int h = f.wholePage ? pageH : Math.min(pageH - y0, BAND + OVERLAP);
-        if (h <= 0 || x1 <= x0) { synchronized (pending) { pending.remove(k); } return null; }
-        exec.submit(() -> {
-            try {
-                Bitmap nb = host.renderBand(page, sc, x0, y0, x1 - x0, h);
-                if (nb != null) {
-                    post(() -> {
-                        bands.put(k, nb);
-                        TreeSet<Integer> ts = scalesOf.get(page);
-                        if (ts == null) { ts = new TreeSet<>(); scalesOf.put(page, ts); }
-                        ts.add(sc);
-                        synchronized (pending) { pending.remove(k); }
-                        invalidateRows();
-                    });
-                    return;
-                }
-            } catch (Throwable ignored) {}
-            synchronized (pending) { pending.remove(k); }
-        });
-        return null;
-    }
-
-    /** Any band that already covers this source row, from another scale: used while the exact one is being rendered (blurry for a moment, never blank). */
-    private Bitmap fallback(WordFlow.Flow f, int page, int wantSc, float srcTopUnits, int[] out) {
-        TreeSet<Integer> ts = scalesOf.get(page);
-        if (ts == null) return null;
-        Bitmap best = null; int bestD = Integer.MAX_VALUE;
-        for (int s2 : ts) {
-            int band2 = f.wholePage ? 0 : Math.max(0, (int) (srcTopUnits * s2) / BAND);
-            Bitmap b2 = bands.get(key(page, s2, band2));
-            if (b2 != null && Math.abs(s2 - wantSc) < bestD) { best = b2; bestD = Math.abs(s2 - wantSc); out[0] = s2; out[1] = band2; }
-        }
-        return best;
-    }
-
-    // ---------- the spoken sentence and word ----------
-    void setHighlight(int from, int to, int style, int word) {
-        if (from == hlFrom && to == hlTo && style == hlStyle && word == hlWord) return;
-        hlFrom = from; hlTo = to; hlStyle = style; hlWord = word;
-        invalidateRows();
+    // ---------- the spoken sentence ----------
+    /** The sentence being read. (The word inside it is tracked by the reader but not shown.) */
+    void setHighlight(int from, int to, int style) {
+        if (from == hlFrom && to == hlTo && style == hlStyle) return;
+        hlFrom = from; hlTo = to; hlStyle = style;
+        pictureReady();
     }
 
     /** Keeps the word being read on screen (not at the very top or bottom). */
@@ -309,33 +214,28 @@ class ReflowView extends ListView {
         @Override protected void onDraw(Canvas c) {
             if (f == null) return;
             c.drawText("— " + (page + 1) + " —", getWidth() / 2f, topPad * 0.72f, lblP);
-            Rect clip = c.getClipBounds();
-            int sc = f.wholePage ? Math.max(64, Math.round(f.scale)) : srcScale(f.scale);
-            int[] fb = new int[2];
-            for (int i = 0; i < f.n; i++) {
-                float dy = topPad + f.y[i];
-                if (dy + f.h[i] < clip.top - 2 || dy > clip.bottom + 2) continue;
-                float topU = Math.max(0, f.sy0[i]);
-                int band = f.wholePage ? 0 : (int) (topU * sc) / BAND;
-                Bitmap bm = band(f, page, sc, band);
-                int useSc = sc, useBand = band;
-                if (bm == null) { bm = fallback(f, page, sc, topU, fb); if (bm != null) { useSc = fb[0]; useBand = fb[1]; } }
-                if (bm == null) continue;
-                if (f.wholePage) { dst.set(f.x[i], dy, f.x[i] + f.w[i], dy + f.h[i]); c.drawBitmap(bm, null, dst, bmpP); continue; }
-                int bx0 = bandX0(f, useSc), by0 = useBand * BAND;
-                float k = f.w[i] / Math.max(1f, (f.sx1[i] - f.sx0[i]) * useSc);      // destination pixels per source pixel (1 at the exact scale)
-                int l = Math.round(f.sx0[i] * useSc) - bx0 - 1, r = Math.round(f.sx1[i] * useSc) - bx0 + 1;
-                int t = Math.round(f.sy0[i] * useSc) - by0, b = Math.round(f.sy1[i] * useSc) - by0;
-                srcR.set(Math.max(0, l), Math.max(0, t), Math.min(bm.getWidth(), r), Math.min(bm.getHeight(), b));
-                if (srcR.width() <= 0 || srcR.height() <= 0) continue;
-                // the destination follows the source clipping so nothing stretches
-                dst.set(f.x[i] + (srcR.left - (l + 1)) * k, dy + (srcR.top - t) * k, f.x[i] + (srcR.right - (l + 1)) * k, dy + (srcR.bottom - t) * k);
-                c.drawBitmap(bm, srcR, dst, bmpP);
+            Bitmap bm = host.pageBitmap(page);
+            if (bm != null) {
+                Rect clip = c.getClipBounds();
+                int bw = bm.getWidth();      // y units are page widths, so pixels = units * bitmap width
+                for (int i = 0; i < f.n; i++) {
+                    float dy = topPad + f.y[i];
+                    if (dy + f.h[i] < clip.top - 2 || dy > clip.bottom + 2) continue;
+                    if (f.wholePage) { dst.set(f.x[i], dy, f.x[i] + f.w[i], dy + f.h[i]); c.drawBitmap(bm, null, dst, bmpP); continue; }
+                    int l = Math.max(0, Math.round(f.sx0[i] * bw) - 1), r = Math.min(bm.getWidth(), Math.round(f.sx1[i] * bw) + 1);
+                    int t = Math.max(0, Math.round(f.sy0[i] * bw)), b = Math.min(bm.getHeight(), Math.round(f.sy1[i] * bw));
+                    if (r <= l || b <= t) continue;
+                    float k = f.w[i] / Math.max(1f, (f.sx1[i] - f.sx0[i]) * bw);   // destination pixels per source pixel
+                    float sy0 = f.sy0[i] * bw;
+                    dst.set(f.x[i] - (Math.round(f.sx0[i] * bw) - l) * k, dy + (t - sy0) * k, f.x[i] + (r - Math.round(f.sx0[i] * bw)) * k, dy + (b - sy0) * k);
+                    srcR.set(l, t, r, b);
+                    c.drawBitmap(bm, srcR, dst, bmpP);
+                }
             }
-            drawHighlight(c);
+            drawSentence(c);
         }
 
-        private void drawHighlight(Canvas c) {
+        private void drawSentence(Canvas c) {
             if (hlFrom < 0 || f.wholePage) return;
             int a = f.a, b = a + f.itemOfWord.length;
             int lo = Math.max(hlFrom, a), hi = Math.min(hlTo, b - 1);
@@ -345,7 +245,7 @@ class ReflowView extends ListView {
             bandP.setColor(hlStyle == 1 ? (dark ? 0xFFFFD54F : 0xFFD9822B) : (dark ? 0x55FFD54F : 0x70F2B93B));
             float pad = dp(1.5f);
             int i = itemLo;
-            while (i <= itemHi) {   // the sentence: one band per printed line (neighbouring words are merged)
+            while (i <= itemHi) {   // one band per printed line (neighbouring words are merged)
                 float yTop = topPad + f.y[i] + 0.2f * f.h[i], yBot = topPad + f.y[i] + 0.96f * f.h[i];
                 float x0 = f.x[i], x1 = f.x[i] + f.w[i];
                 int j = i + 1;
@@ -353,11 +253,6 @@ class ReflowView extends ListView {
                 if (hlStyle == 1) c.drawRoundRect(x0 - pad, yBot - dp(2.2f), x1 + pad, yBot, dp(1.1f), dp(1.1f), bandP);
                 else c.drawRoundRect(x0 - pad, yTop - pad, x1 + pad, yBot + pad, dp(3), dp(3), bandP);
                 i = j;
-            }
-            if (hlWord >= lo && hlWord <= hi) {   // the word being spoken: a filled box in both styles
-                int w = f.itemOfWord[hlWord - a];
-                bandP.setColor(((dark ? 0xFFFFD54F : 0xFFD9822B) & 0x00FFFFFF) | 0xB0000000);
-                c.drawRoundRect(f.x[w] - pad, topPad + f.y[w] + 0.2f * f.h[w] - pad, f.x[w] + f.w[w] + pad, topPad + f.y[w] + 0.96f * f.h[w] + pad, dp(3), dp(3), bandP);
             }
         }
     }
