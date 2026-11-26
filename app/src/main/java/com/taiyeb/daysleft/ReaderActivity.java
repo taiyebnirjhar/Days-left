@@ -2,6 +2,7 @@ package com.taiyeb.daysleft;
 
 import android.animation.ValueAnimator;
 import android.app.Activity;
+import android.content.Context;
 import android.content.Intent;
 import android.content.res.ColorStateList;
 import android.graphics.*;
@@ -48,6 +49,8 @@ public class ReaderActivity extends Activity {
     FrameLayout playBtn;
     TextView audioBtn;
     boolean chrome = true, finishedToastShown;
+    ScrollPages sp;            // rotated phone: pages one after the other, scrolling flows from a page into the next
+    boolean scrollMode;
     boolean readingText, textTried;   // the book's text is being read quietly in the background (once per opening)
     boolean locked;                 // touch lock (like VLC): the screen ignores touches until the padlock is tapped
     Glyph lockBtn, unlockBtn;       // padlock in the top bar; the one that appears after a tap while locked
@@ -195,6 +198,32 @@ public class ReaderActivity extends Activity {
         }, "book-text").start();
     }
 
+    /** Phone on its side: pages stacked and scrolled as one; upright: the page view with swipes. */
+    int upRenderW;   // the picture width used with the phone upright
+
+    void updateMode() {
+        if (pv == null || root == null || item == null) return;
+        boolean land = getResources().getConfiguration().orientation == android.content.res.Configuration.ORIENTATION_LANDSCAPE;
+        if (land == scrollMode) return;
+        scrollMode = land;
+        if (upRenderW == 0) upRenderW = renderW;
+        // pictures are shown across the whole (wide) screen: render them that wide (up to the size the renderer allows) and take new ones
+        int wide = Math.max(root.getWidth(), root.getHeight());
+        renderW = land ? Math.min(2560, Math.max(upRenderW, (int) (wide * 1.1f))) : upRenderW;
+        cache.evictAll(); inflight.clear();
+        for (int k = -1; k <= 2; k++) ensure(cur + k);
+        if (land) {
+            if (sp == null) { sp = new ScrollPages(this); root.addView(sp, 1, new FrameLayout.LayoutParams(-1, -1)); }
+            sp.setBackgroundColor(DESK[theme]);
+            sp.setVisibility(View.VISIBLE);
+            sp.showPage(cur);
+        } else if (sp != null) {
+            int p = sp.pageAtTop();
+            sp.setVisibility(View.GONE);
+            goTo(p, false);
+        }
+    }
+
     void setLocked(boolean on) {
         locked = on;
         h.removeCallbacks(hideUnlock);
@@ -259,10 +288,16 @@ public class ReaderActivity extends Activity {
 
     void ensure(int i) {
         if (i < 0 || i >= n || cache.get(i) != null || !inflight.add(i)) return;
+        final int w = renderW;   // the width this picture is for (the phone may be turned meanwhile)
         exec.submit(() -> {
             try {
-                Bitmap b = render(i, renderW);
-                h.post(() -> { cache.put(i, b); inflight.remove(i); if (pv != null) pv.invalidate(); });
+                Bitmap b = render(i, w);
+                h.post(() -> {
+                    inflight.remove(i);
+                    if (w == renderW) cache.put(i, b);   // a picture for the other shape is dropped; the right one has been asked for
+                    if (pv != null) pv.invalidate();
+                    if (sp != null) sp.pictureReady();
+                });
             } catch (Throwable t) { inflight.remove(i); }
         });
     }
@@ -292,10 +327,11 @@ public class ReaderActivity extends Activity {
         cl = l; ct = t; cr = r; cb = b;
         if (save && item != null) Store.sp(this).edit().putString("trim_" + item.id, l + "," + t + "," + r + "," + b).apply();
         if (pv != null) pv.invalidate();
+        if (sp != null) sp.relayout();
     }
 
     void computeCrop() {
-        if (!trim) { cl = ct = cr = cb = 0; if (pv != null) pv.invalidate(); return; }
+        if (!trim) { cl = ct = cr = cb = 0; if (pv != null) pv.invalidate(); if (sp != null) sp.relayout(); return; }
         // 1. what was found last time: shown at once, no jump when the book opens
         boolean saved = false;
         try {
@@ -354,6 +390,7 @@ public class ReaderActivity extends Activity {
         for (int k = -1; k <= 2; k++) ensure(cur + k);
         ensure(cur);
         if (pv != null) { pv.resetZoom(); pv.invalidate(); }
+        if (scrollMode && sp != null && sp.pageAtTop() != cur) sp.showPage(cur);
         updateLabel(cur);
         if (seek != null) seek.setProgress(cur);
         h.removeCallbacks(saver);
@@ -521,10 +558,13 @@ public class ReaderActivity extends Activity {
         if (al.size() > 0 && bi != null) {
             int fw = al.flipWordAt(t);   // the rules live in Alignment/MarkerTrack, so the tests use the same ones
             // MarkerTrack: never loses the marker while playing (dead reckoning through gaps), never flickers or steps back, shows nothing after a seek into unknown audio
-            if (mt.update(al, bi, t, st == 1, now)) { hlFrom = mt.from; hlTo = mt.to; if (hlOn && pv != null) pv.invalidate(); }
+            if (mt.update(al, bi, t, st == 1, now)) { hlFrom = mt.from; hlTo = mt.to; if (hlOn && pv != null) pv.invalidate(); if (sp != null) sp.pictureReady(); }
             int hw = mt.word;
             if (fw < 0 && mt.estimated) fw = mt.word;   // the page follows the marker too
-            if (fw >= 0 && followOn && st == 1 && now - lastManual > 5000 && pv != null && !pv.dragging && pv.zoom <= 1.01f && settings.getVisibility() != View.VISIBLE) {
+            if (scrollMode && sp != null) {
+                // on its side the marker is followed by scrolling (the page changes inside the scroll), not by page turns
+                if (followOn && st == 1 && now - lastManual > 5000 && hlFrom >= 0 && settings.getVisibility() != View.VISIBLE) sp.follow(hlFrom);
+            } else if (fw >= 0 && followOn && st == 1 && now - lastManual > 5000 && pv != null && !pv.dragging && pv.zoom <= 1.01f && settings.getVisibility() != View.VISIBLE) {
                 int pg = bi.pageOf(fw);
                 if (pg != cur) goTo(pg, false);
             }
@@ -1654,6 +1694,7 @@ public class ReaderActivity extends Activity {
 
     void skin() {
         int ink = INK[theme], paper = PAPER[theme], desk = DESK[theme];
+        if (sp != null) { sp.setBackgroundColor(desk); sp.pictureReady(); }
         chromeBg = (desk & 0x00FFFFFF) | 0xF2000000;
         top.setBackgroundColor(chromeBg);
         bottom.setBackground(box(chromeBg, 24, 24));
@@ -1804,6 +1845,153 @@ public class ReaderActivity extends Activity {
     }
 
     // ====================== the page ======================
+    // ====================== rotated phone: one long scroll ======================
+    /**
+     * With the phone on its side a page fitted to the height is tiny, so the pages are fitted to the WIDTH and stacked: scrolling down runs straight
+     * from the end of a page into the top of the next one (and back), the page counter and the saved place follow, the marker is followed smoothly.
+     * Same margin trim, same pictures (the page cache), same marker as the portrait view.
+     */
+    class ScrollPages extends ListView {
+        final GestureDetector sgd2;
+        final float[] rowH = new float[Math.max(1, n)];   // known row heights, so a row does not jump when its picture arrives
+        float lastKnownH;
+        final BaseAdapter ad;
+        int lastP = -1;
+        boolean auto;   // the scroll in progress is ours (following the marker), not the reader's finger
+
+        ScrollPages(Context c) {
+            super(c);
+            setDivider(null);
+            setVerticalScrollBarEnabled(false);
+            setOverScrollMode(OVER_SCROLL_NEVER);
+            setSelector(android.R.color.transparent);
+            setCacheColorHint(0);
+            setPadding(0, dp(28), 0, dp(24));
+            setClipToPadding(false);
+            ad = new BaseAdapter() {
+                @Override public int getCount() { return n; }
+                @Override public Object getItem(int i) { return null; }
+                @Override public long getItemId(int i) { return i; }
+                @Override public boolean areAllItemsEnabled() { return false; }
+                @Override public boolean isEnabled(int i) { return false; }
+                @Override public View getView(int p, View v, ViewGroup parent) {
+                    Row r = v instanceof Row ? (Row) v : new Row(getContext());
+                    r.bind(p);
+                    ensure(p - 1); ensure(p); ensure(p + 1);
+                    return r;
+                }
+            };
+            setAdapter(ad);
+            sgd2 = new GestureDetector(c, new GestureDetector.SimpleOnGestureListener() {
+                @Override public boolean onSingleTapConfirmed(MotionEvent e) {
+                    if (settings.getVisibility() == View.VISIBLE) settings.setVisibility(View.GONE); else showChrome(!chrome);
+                    return true;
+                }
+            });
+            setOnScrollListener(new OnScrollListener() {
+                @Override public void onScrollStateChanged(AbsListView v, int st) {
+                    if (st == SCROLL_STATE_IDLE) { auto = false; return; }
+                    if (st == SCROLL_STATE_TOUCH_SCROLL || !auto) { auto = false; lastManual = System.currentTimeMillis(); if (chrome && settings.getVisibility() != View.VISIBLE) showChrome(false); }
+                }
+                @Override public void onScroll(AbsListView v, int first, int count, int total) {
+                    int pg = pageAtTop();
+                    if (pg != lastP && pg >= 0 && pg < n) {
+                        lastP = pg;
+                        if (pg != cur) {
+                            cur = pg; updateLabel(cur); if (seek != null) seek.setProgress(cur);
+                            h.removeCallbacks(saver); h.postDelayed(saver, 700);
+                            h.removeCallbacks(prefetch); h.postDelayed(prefetch, 2500);
+                        }
+                    }
+                }
+            });
+        }
+
+        @Override public boolean onTouchEvent(MotionEvent e) {
+            sgd2.onTouchEvent(e);
+            return super.onTouchEvent(e);
+        }
+
+        int pageAtTop() {
+            int p = pointToPosition(getWidth() / 2, getHeight() / 3);
+            return p == INVALID_POSITION ? Math.max(0, getFirstVisiblePosition()) : p;
+        }
+
+        void showPage(int p) { setSelectionFromTop(Math.max(0, Math.min(n - 1, p)), 0); lastP = -1; }
+
+        /** A picture arrived, the marker moved, the margins changed: draw again (heights are re-measured only for rows whose picture just arrived). */
+        void pictureReady() {
+            for (int i = 0; i < getChildCount(); i++) { View c = getChildAt(i); if (c instanceof Row) ((Row) c).refresh(); c.invalidate(); }
+        }
+
+        /** The margins (trim) changed: every row has another height. */
+        void relayout() { java.util.Arrays.fill(rowH, 0); ad.notifyDataSetChanged(); }
+
+        /** Keeps the sentence being read in the comfortable part of the screen: scrolls only when it leaves it, smoothly, across pages. */
+        void follow(int word) {
+            if (word < 0 || getHeight() == 0 || bi == null || auto) return;   // one automatic scroll at a time
+            int p = bi.pageOf(word);
+            int first = getFirstVisiblePosition(), last = getLastVisiblePosition();
+            if (p < first || p > last) { showPage(p); return; }
+            View row = getChildAt(p - first);
+            if (!(row instanceof Row)) return;
+            float y = ((Row) row).yOfWord(word);
+            if (y < 0) return;
+            int hh = getHeight();
+            float yy = row.getTop() + y;
+            if (yy < hh * 0.12f || yy > hh * 0.6f) { auto = true; smoothScrollBy((int) (yy - hh * 0.3f), 450); }
+        }
+
+        class Row extends View {
+            int page = -1;
+            Bitmap b;
+            RectF src = new RectF();
+            float sc = 1;
+            final int gap = dp(8);
+            final RectF dst = new RectF();
+
+            Row(Context c) { super(c); }
+
+            void bind(int p) { page = p; refresh(); requestLayout(); invalidate(); }
+
+            void refresh() {
+                Bitmap nb = cache.get(page);
+                if (nb != null && nb != b) { b = nb; requestLayout(); }
+                else if (nb == null && b != null && cache.get(page) == null) { /* evicted: keep the old size and the old picture until it is back */ }
+            }
+
+            @Override protected void onMeasure(int wms, int hms) {
+                int W = MeasureSpec.getSize(wms);
+                float hgt;
+                if (b != null && pv != null) {
+                    src = pv.cropOf(b, page);
+                    sc = W / Math.max(1f, src.width());
+                    hgt = src.height() * sc + gap;
+                    rowH[page] = hgt; lastKnownH = hgt;
+                } else hgt = rowH[page] > 0 ? rowH[page] : lastKnownH > 0 ? lastKnownH : W * 1.35f;
+                setMeasuredDimension(W, (int) Math.ceil(hgt));
+            }
+
+            /** y of a word inside this row, or -1 while the picture is missing. */
+            float yOfWord(int word) {
+                if (b == null || bi == null || word < 0 || word >= bi.count()) return -1;
+                return (bi.box[word * 4 + 1] * b.getHeight() - src.top) * sc;
+            }
+
+            @Override protected void onDraw(Canvas c) {
+                c.drawColor(DESK[theme]);
+                Bitmap bm = cache.get(page);
+                if (bm == null) { ensure(page); bm = b; }
+                if (bm == null || pv == null) return;
+                if (bm != b) { b = bm; src = pv.cropOf(b, page); sc = getWidth() / Math.max(1f, src.width()); }
+                dst.set(0, 0, getWidth(), src.height() * sc);
+                c.drawBitmap(bm, new Rect((int) src.left, (int) src.top, (int) src.right, (int) src.bottom), dst, pv.bmpP);
+                if (hlOn && bi != null && hlFrom >= 0) pv.drawHighlight(c, page, bm, src, 0, 0, sc);
+            }
+        }
+    }
+
+    // ====================== the pages ======================
     class PageView extends View {
         int th;
         float zoom = 1, px, py, dragX;
@@ -1900,6 +2088,7 @@ public class ReaderActivity extends Activity {
         @Override protected void onSizeChanged(int w, int h2, int ow, int oh) {
             super.onSizeChanged(w, h2, ow, oh);
             if (ow != 0 || oh != 0) { zoom = 1; px = py = 0; dragX = 0; }
+            post(ReaderActivity.this::updateMode);   // also the first time: a book opened with the phone already on its side
         }
 
         void clampPan() {
