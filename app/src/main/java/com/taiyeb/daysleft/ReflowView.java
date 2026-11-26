@@ -43,7 +43,6 @@ class ReflowView extends ListView {
     private static class PageText {
         SpannableStringBuilder sb;
         int[] ws, we;               // char range of every word of the page
-        final java.util.ArrayList<Object> marks = new java.util.ArrayList<>();
     }
 
     private final BookIndex bi;
@@ -56,7 +55,7 @@ class ReflowView extends ListView {
     };
     private float sizeSp = 20;
     private int ink = 0xFF222222, paper = 0xFFF4ECD8, hlColor = 0x70F2B93B;
-    private int hlFrom = -1, hlTo = -1, hlStyle;
+    private int hlFrom = -1, hlTo = -1, hlStyle, hlWord = -1;
     private int lastPage = -1;
     private final BaseAdapter adapter;
 
@@ -98,8 +97,8 @@ class ReflowView extends ListView {
                 body.setLineSpacing(0, 1.38f);
                 body.setTextColor(ink);
                 PageText pt = page(p);
-                applyMarks(pt, p);
-                body.setText(pt.sb);
+                marks(pt.sb, pt, p);
+                body.setText(pt.sb, TextView.BufferType.SPANNABLE);
                 return v;
             }
         };
@@ -245,12 +244,14 @@ class ReflowView extends ListView {
         return right < maxX - 0.1f;
     }
 
-    // ---------- the spoken sentence ----------
-    void setHighlight(int from, int to, int style) {
-        if (from == hlFrom && to == hlTo && style == hlStyle) return;
-        int of = hlFrom, ot = hlTo;
-        hlFrom = from; hlTo = to; hlStyle = style;
+    // ---------- the spoken sentence and word ----------
+    /** The sentence being read (band) and the word being read inside it (stronger band). word < 0: sentence only. */
+    void setHighlight(int from, int to, int style, int word) {
+        if (from == hlFrom && to == hlTo && style == hlStyle && word == hlWord) return;
+        int of = hlFrom, ot = hlTo, ow = hlWord;
+        hlFrom = from; hlTo = to; hlStyle = style; hlWord = word;
         refreshRange(of, ot);
+        if (ow >= 0 && (ow < of || ow > ot)) refreshRange(ow, ow);
         refreshRange(from, to);
     }
 
@@ -261,27 +262,31 @@ class ReflowView extends ListView {
         for (int p = p0; p <= p1; p++) {
             View v = getChildAt(p - first);
             if (v == null || p < first || p > getLastVisiblePosition()) continue;
-            PageText pt = page(p);
-            applyMarks(pt, p);
-            ((TextView) ((LinearLayout) v).getChildAt(1)).setText(pt.sb);
+            TextView body = (TextView) ((LinearLayout) v).getChildAt(1);
+            CharSequence cs = body.getText();
+            if (cs instanceof android.text.Spannable) { marks((android.text.Spannable) cs, page(p), p); body.invalidate(); }   // spans only: no new layout, so this is cheap enough to run several times a second
         }
     }
 
-    private void applyMarks(PageText pt, int p) {
-        for (Object o : pt.marks) pt.sb.removeSpan(o);
-        pt.marks.clear();
+    /** Puts the sentence band and the word marker on a page text (removing the old ones). */
+    private void marks(android.text.Spannable t, PageText pt, int p) {
+        for (BackgroundColorSpan x : t.getSpans(0, t.length(), BackgroundColorSpan.class)) t.removeSpan(x);
+        for (UnderlineSpan x : t.getSpans(0, t.length(), UnderlineSpan.class)) t.removeSpan(x);
         if (hlFrom < 0) return;
         int a = bi.pageStart[p], b = bi.pageStart[p + 1];
         int lo = Math.max(hlFrom, a), hi = Math.min(hlTo, b - 1);
         if (lo > hi || hi - a >= pt.we.length) return;
         int s = pt.ws[lo - a], e = pt.we[hi - a];
-        if (e <= s) return;
-        // marker: a tinted band; underline style: a lighter band plus the underline, so it can be seen on any theme
+        if (e <= s || e > t.length()) return;
+        // sentence: a tinted band (underline style: lighter band plus the underline, visible on any theme)
         int tint = hlStyle == 1 ? ((hlColor & 0x00FFFFFF) | 0x40000000) : hlColor;
-        Object band = new BackgroundColorSpan(tint);
-        pt.sb.setSpan(band, s, e, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
-        pt.marks.add(band);
-        if (hlStyle == 1) { Object u = new UnderlineSpan(); pt.sb.setSpan(u, s, e, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE); pt.marks.add(u); }
+        t.setSpan(new BackgroundColorSpan(tint), s, e, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+        if (hlStyle == 1) t.setSpan(new UnderlineSpan(), s, e, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+        // the word being spoken, stronger
+        if (hlWord >= lo && hlWord <= hi) {
+            int ws = pt.ws[hlWord - a], we = pt.we[hlWord - a];
+            if (we > ws && we <= t.length()) t.setSpan(new BackgroundColorSpan((hlColor & 0x00FFFFFF) | 0xB0000000), ws, we, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+        }
     }
 
     /** Keeps the word being read on screen (not at the very top or bottom). */

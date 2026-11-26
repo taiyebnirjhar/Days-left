@@ -67,7 +67,7 @@ public class ReaderActivity extends Activity {
     boolean clearArmed;
     BookIndex bi;
     Alignment al = new Alignment();
-    int hlFrom = -1, hlTo = -1;
+    int hlFrom = -1, hlTo = -1, hlWord = -1;   // sentence being read, and the word inside it
     boolean hlOn, followOn;
     int hlStyle;   // 0 marker, 1 underline
     long lastManual, alReloaded;
@@ -247,7 +247,7 @@ public class ReaderActivity extends Activity {
         showChrome(false);
         int p = hlFrom >= 0 ? bi.pageOf(hlFrom) : cur;
         rf.showPage(p);
-        rf.setHighlight(hlOn ? hlFrom : -1, hlOn ? hlTo : -1, hlStyle);
+        rf.setHighlight(hlOn ? hlFrom : -1, hlOn ? hlTo : -1, hlStyle, hlOn ? hlWord : -1);
         if (hlFrom >= 0 && hlOn) rf.post(() -> rf.follow(hlFrom));
     }
 
@@ -544,14 +544,18 @@ public class ReaderActivity extends Activity {
             int hw = al.highlightWordAt(t), fw = al.flipWordAt(t);   // the rules live in Alignment, so the end-to-end test uses the same ones
             if (hw >= 0) {
                 int[] r = Highlight.sentenceFor(bi, hw);   // null: nothing to read there (a page number or a lone figure)
-                if (r == null) { if (hlFrom >= 0) { hlFrom = hlTo = -1; if (pv != null) pv.invalidate(); } }
-                else if (r[0] != hlFrom) { hlFrom = r[0]; hlTo = r[1]; if (hlOn && pv != null) pv.invalidate(); }
+                if (r == null) { if (hlFrom >= 0) { hlFrom = hlTo = -1; hlWord = -1; if (pv != null) pv.invalidate(); } }
+                else {
+                    boolean ch = r[0] != hlFrom || hw != hlWord;
+                    hlFrom = r[0]; hlTo = r[1]; hlWord = hw;
+                    if (ch && hlOn && pv != null) pv.invalidate();
+                }
             } else if (hlFrom >= 0) {
-                hlFrom = hlTo = -1;   // better no highlight than a wrong one: the probes around here are too far apart (yet)
+                hlFrom = hlTo = -1; hlWord = -1;   // better no highlight than a wrong one: the probes around here are too far apart (yet)
                 if (pv != null) pv.invalidate();
             }
             if (rfActive && rf != null) {
-                rf.setHighlight(hlOn ? hlFrom : -1, hlOn ? hlTo : -1, hlStyle);
+                rf.setHighlight(hlOn ? hlFrom : -1, hlOn ? hlTo : -1, hlStyle, hlOn ? hlWord : -1);
                 if (hw >= 0 && followOn && st == 1 && now - lastManual > 5000 && settings.getVisibility() != View.VISIBLE) rf.follow(hw);
             } else if (fw >= 0 && followOn && st == 1 && now - lastManual > 5000 && pv != null && !pv.dragging && pv.zoom <= 1.01f && settings.getVisibility() != View.VISIBLE) {
                 int pg = bi.pageOf(fw);
@@ -2025,11 +2029,31 @@ public class ReaderActivity extends Activity {
                 }
             }
             if (open) mark(c, src, l, t, s, x0, y0, x1, y1, pad, rad);
+            // the word being spoken: where it sits in its printed line (the index keeps one box per line, so the place is found by letters)
+            if (hlWord >= from && hlWord <= to) {
+                int j = hlWord, k0 = j, k1 = j;
+                int pa = bi.pageStart[idx], pb = bi.pageStart[idx + 1] - 1;
+                while (k0 > pa && sameBox(k0 - 1, j)) k0--;
+                while (k1 < pb && sameBox(k1 + 1, j)) k1++;
+                int total = 0, before = 0;
+                for (int k = k0; k <= k1; k++) { if (k == j) before = total; total += bi.w[k].length() + 1; }
+                float f0 = total == 0 ? 0 : (float) before / total, f1 = total == 0 ? 1 : (float) (before + bi.w[j].length()) / total;
+                float bx0 = bi.box[j * 4] * bw, bx1 = bi.box[j * 4 + 2] * bw;
+                hlP.setColor((th == 3 ? 0xFFFFD54F : 0xFFD9822B) & 0x00FFFFFF | 0xB0000000);
+                markBox = true;
+                mark(c, src, l, t, s, bx0 + (bx1 - bx0) * f0, bi.box[j * 4 + 1] * bh, bx0 + (bx1 - bx0) * f1, bi.box[j * 4 + 3] * bh, pad, rad);
+                markBox = false;
+            }
         }
 
+        private boolean sameBox(int a, int b) {
+            return bi.box[a * 4] == bi.box[b * 4] && bi.box[a * 4 + 1] == bi.box[b * 4 + 1] && bi.box[a * 4 + 2] == bi.box[b * 4 + 2] && bi.box[a * 4 + 3] == bi.box[b * 4 + 3];
+        }
+
+        boolean markBox;   // true while drawing the word cursor: always a filled box, whatever the sentence style
         void mark(Canvas c, RectF src, float l, float t, float s, float x0, float y0, float x1, float y1, float pad, float rad) {
             float L = l + (x0 - src.left) * s - pad, R = l + (x1 - src.left) * s + pad, T = t + (y0 - src.top) * s - pad, B = t + (y1 - src.top) * s + pad;
-            if (hlStyle == 1) c.drawRoundRect(L, B - dp(2.2f), R, B, dp(1.1f), dp(1.1f), hlP);
+            if (hlStyle == 1 && !markBox) c.drawRoundRect(L, B - dp(2.2f), R, B, dp(1.1f), dp(1.1f), hlP);
             else c.drawRoundRect(L, T, R, B, rad, rad, hlP);
         }
 
