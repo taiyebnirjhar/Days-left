@@ -25,6 +25,11 @@ public class SyncService extends Service {
     static volatile boolean cancel;
     /** Everything around the playhead is mapped; the service is only waiting for the user to move. */
     static volatile boolean idle;
+    /** The reader asks: when is this book word spoken? (-1 none). The answer appears in goalTimeOut (-1 working, -2 not found). */
+    static volatile int goalWordReq = -1;
+    static volatile double goalTimeOut = -1;
+    /** Book word at the playhead once it is known (for Find page), else -1. */
+    static volatile int hereWord = -1;
     static final double WINDOW = 600;   // seconds mapped either side of the playhead
 
     static boolean winReady(Context c, int id) { return Store.sp(c).getBoolean("syncWin_" + id, false); }
@@ -65,7 +70,7 @@ public class SyncService extends Service {
         final int id = in == null ? -1 : in.getIntExtra("id", -1);
         nm = getSystemService(NotificationManager.class);
         nm.createNotificationChannel(new NotificationChannel("sync", "Syncing audiobook", NotificationManager.IMPORTANCE_LOW));
-        running = true; cancel = false; idle = false; error = ""; itemId = id;
+        running = true; cancel = false; idle = false; error = ""; itemId = id; hereWord = -1; goalTimeOut = -1;
         Whisper.abort(false);
         Store.sp(this).edit().putBoolean("syncWant_" + id, true).apply();
         Notification n = note("Getting ready…", 0, true);
@@ -136,9 +141,12 @@ public class SyncService extends Service {
             int probes = 0;
             SyncPlanner.Req r = null;
             long idleSince = 0;
+            int lastGoal = -2;
             while (!cancel) {
-                r = pl.next();
-                if (r == null) {
+                int g = goalWordReq;
+                if (g != lastGoal) { lastGoal = g; if (g >= 0) { pl.setGoal(g); goalTimeOut = pl.goalTime; Dbg.i("Sync", "goal: when is book word " + g + " spoken?" + (pl.goalTime >= 0 ? " known already: " + (int) pl.goalTime + " s" : "")); } else pl.clearGoal(); }
+                List<SyncPlanner.Req> batch = pl.nextBatch(3);
+                if (batch.isEmpty()) {
                     if (pl.lost) break;
                     if (pl.recenter(Player.pos())) { idleSince = 0; idle = false; Dbg.i("Sync", "playhead moved to " + (int) Player.pos() + " s, mapping around it"); totalSec = pl.windowProgress()[1]; continue; }
                     long nowMs = System.currentTimeMillis();
@@ -156,40 +164,44 @@ public class SyncService extends Service {
                 idleSince = 0;
                 if (lowBattery()) { error = "The battery is low. Plug in and it carries on when you open the book."; break; }
                 long t0 = Dbg.now();
-                float[] pcm = AudioClip.decode(this, it.audio, r.start, r.len);
+                // up to three short pieces go through the speech model together: one call costs the same as one piece
+                float[][] pcm = new float[batch.size()][];
+                for (int i = 0; i < pcm.length; i++) pcm[i] = AudioClip.decode(this, it.audio, batch.get(i).start, batch.get(i).len);
                 long msDec = Dbg.ms(t0);
-                Aligner.Out o = null;
-                long msTr = 0, msAl = 0;
-                int heard = 0;
-                if (pcm.length >= 16000 * 3) {
-                    long t1 = Dbg.now();
-                    String raw = Whisper.transcribeSegs(this, pcm);
-                    msTr = Dbg.ms(t1);
-                    if (cancel) { Dbg.i("Sync", "piece at " + (int) r.start + " s abandoned after " + msTr + " ms (stopped)"); break; }
-                    if (raw == null) throw new Exception("speech model failed");
+                long t1 = Dbg.now();
+                String[] raws = Whisper.transcribeBatch(this, pcm);
+                long msTr = Dbg.ms(t1);
+                if (cancel) { Dbg.i("Sync", "batch abandoned after " + msTr + " ms (stopped)"); break; }
+                if (raws == null) throw new Exception("speech model failed");
+                StringBuilder sum = new StringBuilder();
+                for (int bi2 = 0; bi2 < batch.size(); bi2++) {
+                    SyncPlanner.Req q = batch.get(bi2);
                     ArrayList<String> tw = new ArrayList<>();
                     ArrayList<Double> tt = new ArrayList<>();
-                    for (String line : raw.split("\n")) {
+                    for (String line : raws[bi2].split("\n")) {
                         String[] p = line.split("\t", 3);
                         if (p.length < 3) continue;
-                        double s0, s1;
-                        try { s0 = Double.parseDouble(p[0]); s1 = Double.parseDouble(p[1]); } catch (Exception e) { continue; }
+                        double s0;
+                        try { s0 = Double.parseDouble(p[0]); } catch (Exception e) { continue; }
                         List<String> ws = PageMatcher.words(p[2]);
-                        for (int k = 0; k < ws.size(); k++) { tw.add(ws.get(k)); tt.add(r.start + s0 + (k + 0.5) / ws.size() * Math.max(0.2, s1 - s0)); }
+                        if (ws.isEmpty()) continue;
+                        tw.add(ws.get(0)); tt.add(q.start + s0);
                     }
                     double[] times = new double[tt.size()];
                     for (int k = 0; k < times.length; k++) times[k] = tt.get(k);
-                    heard = times.length;
                     long t2 = Dbg.now();
-                    o = al.align(tw.toArray(new String[0]), times, r.lo, r.hi);
-                    msAl = Dbg.ms(t2);
+                    Aligner.Out o = pcm[bi2].length >= 16000 * 3 ? al.align(tw.toArray(new String[0]), times, q.lo, q.hi) : null;
                     if (o != null) Alignment.append(BookText.alignFile(this, id), o.pos, o.time);
+                    int kept = pl.feed(q, o);
+                    probes++; listened += (long) q.len;
+                    sum.append("\n   ").append(q.why).append(" at ").append((int) q.start).append(" s: heard ").append(times.length).append(" words, ")
+                            .append(o == null ? "no match" : "matched " + o.pos.length + " (votes " + o.votes + ")").append(", kept ").append(kept).append(", window ").append(q.lo).append("..").append(q.hi);
                 }
-                int kept = pl.feed(r, o);
-                probes++; listened += (long) r.len;
+                Dbg.p("Sync", "call with " + batch.size() + " pieces", t0, "decode " + msDec + " ms, speech " + msTr + " ms" + sum);
+                if (goalWordReq >= 0) goalTimeOut = pl.goalTime;
+                hereWord = pl.wordNear(Player.pos());
                 doneSec = Math.max(0, Math.min(totalSec, totalSec - pl.unresolved()));
                 totalSec = pl.windowProgress()[1];
-                Dbg.p("Sync", "probe " + probes + " (" + r.why + ") at " + (int) r.start + "+" + (int) r.len + " s", t0, "decode " + msDec + " ms, listen " + msTr + " ms (" + String.format(Locale.US, "%.1f", r.len * 1000.0 / Math.max(1, msTr)) + "x real time), align " + msAl + " ms, heard " + heard + " words, " + (o == null ? "no match" : "matched " + o.pos.length + ", votes " + o.votes) + ", kept " + kept + ", window " + r.lo + ".." + r.hi);
                 Store.sp(this).edit().putFloat("syncDone_" + id, (float) doneSec).apply();
                 long now = System.currentTimeMillis();
                 if (now - lastNote > 4000) {
@@ -209,7 +221,7 @@ public class SyncService extends Service {
             Dbg.e("Sync", "failed (serious)", t);
         } finally {
             Dbg.i("Sync", (complete ? "finished" : cancel ? "stopped" : error.isEmpty() ? "ended" : "ended with error: " + error) + " at " + (int) doneSec + " of " + (int) totalSec + " s");
-            running = false; idle = false;
+            running = false; idle = false; hereWord = -1;
             Whisper.abort(false);
             if (wl != null && wl.isHeld()) wl.release();
             stopForeground(true);

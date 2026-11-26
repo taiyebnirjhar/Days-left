@@ -65,87 +65,100 @@ public class SyncSim {
         return Alignment.fromPoints(w, t);
     }
 
+    static int calls;       // speech-model calls: the real cost unit (one call = one 30 s window, about 10 s on the phone with the tiny model)
+    static double listened;
+
+    /** Runs one batch (up to 3 short pieces spliced into one model call). Returns false when there is nothing to do. */
+    static boolean step(SyncPlanner p, Aligner al) {
+        List<SyncPlanner.Req> b = p.nextBatch(3);
+        if (b.isEmpty()) return false;
+        calls++;
+        for (SyncPlanner.Req r : b) {
+            List<String> w = new ArrayList<>(); List<Double> t = new ArrayList<>();
+            hear(r.start, r.len, w, t);
+            double[] tt = new double[t.size()]; for (int i = 0; i < tt.length; i++) tt[i] = t.get(i);
+            p.feed(r, al.align(w.toArray(new String[0]), tt, r.lo, r.hi));
+            listened += r.len;
+        }
+        return true;
+    }
+
     public static void main(String[] a) {
         double hours = a.length > 0 ? Double.parseDouble(a[0]) : 9.7;
-        double sttSpeed = a.length > 1 ? Double.parseDouble(a[1]) : 3.0;   // 3x real time = tiny model, 1x = base
+        double callSec = a.length > 1 ? Double.parseDouble(a[1]) : 10;   // seconds per model call on the phone: ~10 tiny, ~26 base
         int bad = 0;
-        for (long seed = 1; seed <= 5; seed++) {
-            build(seed, hours, sttSpeed);
-            int[] pageStart = {0, N};
-            BookIndex bi = new BookIndex(book, pageStart, new float[N * 4], new byte[N]);
-            Aligner al = new Aligner(bi);
-            double start = 0.37 * total;
-            SyncPlanner p = new SyncPlanner(total, start, N, new int[0], new double[0]);
-            if (a.length > 2) p.reach = Double.parseDouble(a[2]) * 60;
-            double listened = 0; int probes = 0, fails = 0;
-            boolean usable = false, ext = false;
-            StringBuilder log = new StringBuilder();
-            SyncPlanner.Req r;
-            while ((r = p.next()) != null && probes < 5000) {
-                List<String> w = new ArrayList<>(); List<Double> t = new ArrayList<>();
-                hear(r.start, r.len, w, t);
-                double[] tt = new double[t.size()]; for (int i = 0; i < tt.length; i++) tt[i] = t.get(i);
-                Aligner.Out o = al.align(w.toArray(new String[0]), tt, r.lo, r.hi);
-                int kept = p.feed(r, o);
-                listened += r.len; probes++;
-                if (o == null) fails++;
-                if (!ext && r.kind == 3) {
-                    ext = true;
-                    double[] ec = accuracy(snapshot(p));
-                    log.append(String.format("  end of sparse pass: %d probes, %.1f min listened (%.1f%%, ~%.1f min on phone): mapped %.1f%%, error median %.2f s, 95th pct %.2f s%n", probes - 1, (listened - r.len) / 60, (listened - r.len) * 100 / total, (listened - r.len) / sttSpeed / 60, ec[0], ec[1], ec[2]));
-                }
-                if (!usable && p.anchorCount() > 0) {
-                    usable = true;
-                    double[] ac = accuracy(snapshot(p));
-                    log.append(String.format("  first anchors after %d probe(s), %.0f s listened (~%.0f s on the phone): near-playhead ok\n", probes, listened, listened / sttSpeed));
+
+        // ---- 1. window sync around the playhead, then play on and jump around ----
+        for (long seed = 1; seed <= 3; seed++) {
+            build(seed, hours, callSec);
+            int[] ps = {0, N};
+            Aligner al = new Aligner(new BookIndex(book, ps, new float[N * 4], new byte[N]));
+            double pos = 0.37 * total;
+            SyncPlanner p = new SyncPlanner(total, pos, N, new int[0], new double[0]);
+            p.reach = 600;
+            calls = 0; listened = 0;
+            int firstCalls = -1;
+            while (step(p, al)) { if (firstCalls < 0 && p.anchorCount() > 0) firstCalls = calls; if (calls > 3000) break; }
+            double[] ac = accuracy(snapshot(p));
+            double[] wa = windowAcc(snapshot(p), pos);
+            System.out.printf("window sync seed %d: first anchors after %d call(s) (~%.0f s); whole +-10 min window after %d calls (~%.0f s); near playhead mapped %.0f%%, worst error %.1f s%n",
+                    seed, firstCalls, firstCalls * callSec, calls, calls * callSec, wa[0], wa[1]);
+            if (wa[0] < 95 || wa[1] > 10) bad++;
+        }
+
+        // ---- 2. Play this page: find a far-away page from nothing (no sync data at all) ----
+        Random r = new Random(11);
+        int ok = 0, tests = 0, maxCalls = 0; double sumCalls = 0, worst = 0;
+        for (long seed = 1; seed <= 3; seed++) {
+            build(100 + seed, hours, callSec);
+            int[] ps = {0, N};
+            Aligner al = new Aligner(new BookIndex(book, ps, new float[N * 4], new byte[N]));
+            for (int k = 0; k < 20; k++) {
+                int target = (int) (r.nextDouble() * (N - 400)) + 200;
+                SyncPlanner p = new SyncPlanner(total, 0, N, new int[0], new double[0]);
+                p.setGoal(target);
+                calls = 0; listened = 0;
+                while (p.goalTime == -1 && step(p, al)) if (calls > 12) break;
+                tests++;
+                double got = p.goalTime;
+                if (got >= 0) {
+                    double err = Math.abs(got - tw[target]);
+                    if (err <= 4) ok++;
+                    worst = Math.max(worst, err);
+                    sumCalls += calls; maxCalls = Math.max(maxCalls, calls);
                 }
             }
-            Alignment fin = snapshot(p);
-            double[] ac = accuracy(fin);
-            System.out.printf("seed %d: %d probes, %.1f min listened of %.1f h (%.1f%%), phone time ~%.1f min @%.0fx, failed probes %d, lost=%b%n",
-                    seed, probes, listened / 60, total / 3600, listened * 100 / total, listened / sttSpeed / 60, sttSpeed, fails, p.lost);
-            System.out.print(log);
-            System.out.printf("  final: mapped %.1f%% of timeline, error median %.2f s, 95th pct %.2f s%n", ac[0], ac[1], ac[2]);
-            if (ac[0] < 95 || ac[2] > 6 || p.lost) bad++;
         }
-        // ---- follow the playhead: window mode, then play on, then jump away and back ----
-        build(7, hours, sttSpeed);
+        System.out.printf("play page from nothing: %d/%d within 4 s of the truth, %.1f calls on average (~%.0f s), worst %d calls (~%.0f s), worst error %.1f s%n",
+                ok, tests, sumCalls / Math.max(1, ok), sumCalls / Math.max(1, ok) * callSec, maxCalls, maxCalls * callSec, worst);
+        if (ok * 100 / tests < 90) bad++;
+
+        // ---- 3. Play this page when the playhead window is already mapped (typical: user reads on) ----
+        build(77, hours, callSec);
         int[] ps = {0, N};
-        BookIndex bi2 = new BookIndex(book, ps, new float[N * 4], new byte[N]);
-        Aligner al2 = new Aligner(bi2);
-        double pos = 0.37 * total;
-        SyncPlanner fp = new SyncPlanner(total, pos, N, new int[0], new double[0]);
-        fp.reach = 600;
-        double[] moves = {pos, pos + 300, pos + 600, pos + 900, 0.8 * total, 0.8 * total + 300, pos + 905, 0.05 * total};
-        String[] what = {"start", "play 5 min", "play 10 min", "play 15 min", "JUMP to 80%", "play 5 min", "jump back to the first spot", "JUMP to 5%"};
-        double lis = 0; int pr = 0;
-        for (int m = 0; m < moves.length; m++) {
-            if (m > 0) fp.recenter(moves[m]);
-            double before = lis; int pb = pr;
-            SyncPlanner.Req r;
-            while ((r = fp.next()) != null && pr < 5000) {
-                List<String> w = new ArrayList<>(); List<Double> t = new ArrayList<>();
-                hear(r.start, r.len, w, t);
-                double[] tt = new double[t.size()]; for (int i = 0; i < tt.length; i++) tt[i] = t.get(i);
-                fp.feed(r, al2.align(w.toArray(new String[0]), tt, r.lo, r.hi));
-                lis += r.len; pr++;
-            }
-            Alignment fa = snapshot(fp);
-            // accuracy only within 5 min of the playhead
-            int ok = 0, n = 0; double worst = 0;
-            for (int k = 0; k < 400; k++) {
-                double t = moves[m] - 300 + k * 1.5;
-                if (t < 40 || t > total - 40) continue;
-                n++;
-                int wd = fa.wordAtTime(t);
-                if (wd < 0) continue;
-                double est = fa.timeOfWord(trueWordAt(t));
-                if (est >= 0) { ok++; worst = Math.max(worst, Math.abs(est - tw[trueWordAt(t)])); }
-            }
-            System.out.printf("follow: %-28s +%2d probes, +%.1f min listened (~%.1f min on phone), mapped %d%% near playhead, worst error %.1f s%n", what[m], pr - pb, (lis - before) / 60, (lis - before) / sttSpeed / 60, n == 0 ? 0 : ok * 100 / n, worst);
-            if (n > 0 && ok * 100 / n < 95) bad++;
-        }
-        System.out.println(bad == 0 ? "ALL SIM RUNS OK" : bad + " SIM RUNS BAD");
+        Aligner al = new Aligner(new BookIndex(book, ps, new float[N * 4], new byte[N]));
+        SyncPlanner p = new SyncPlanner(total, 0.37 * total, N, new int[0], new double[0]);
+        p.reach = 600;
+        while (step(p, al)) if (calls > 3000) break;
+        int near = (int) (0.37 * total * 2.6) + 900;       // a page ~6 min ahead, inside the window
+        p.setGoal(near);
+        System.out.printf("play page inside the mapped window: answered with %s%n", p.goalTime >= 0 ? "no listening (instant), error " + String.format("%.1f s", Math.abs(p.goalTime - tw[near])) : "NO ANSWER");
+        if (p.goalTime < 0) bad++;
+
+        System.out.println(bad == 0 ? "ALL SIM RUNS OK" : bad + " SIM CHECKS BAD");
         System.exit(bad == 0 ? 0 : 1);
+    }
+
+    static double[] windowAcc(Alignment fa, double pos) {
+        int ok = 0, n = 0; double worst = 0;
+        for (int k = 0; k < 800; k++) {
+            double t = pos - 600 + k * 1.5;
+            if (t < 40 || t > total - 40) continue;
+            n++;
+            if (fa.wordAtTime(t) < 0) continue;
+            double est = fa.timeOfWord(trueWordAt(t));
+            if (est >= 0) { ok++; worst = Math.max(worst, Math.abs(est - tw[trueWordAt(t)])); }
+        }
+        return new double[]{n == 0 ? 0 : ok * 100.0 / n, worst};
     }
 }

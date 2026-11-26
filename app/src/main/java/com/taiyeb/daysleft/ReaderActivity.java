@@ -240,6 +240,8 @@ public class ReaderActivity extends Activity {
         if (seek != null) seek.setProgress(cur);
         h.removeCallbacks(saver);
         h.postDelayed(saver, 700);
+        h.removeCallbacks(prefetch);
+        h.postDelayed(prefetch, 2500);
         if (haptic) lastManual = System.currentTimeMillis();
         if (haptic && pv != null) pv.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK);
         boolean last = cur == n - 1 && !item.done;
@@ -620,10 +622,119 @@ public class ReaderActivity extends Activity {
             }
         }
         Dbg.i("Play", "page " + (target + 1) + " has no pin and is not in the sync data" + (syncing() ? " (sync running)" : "") + ", " + (syncing() ? "telling user" : "will search"));
-        if (syncing()) { Toast.makeText(this, "That part isn't synced yet. The sync is at " + syncPct() + "%.", Toast.LENGTH_LONG).show(); return; }
+        // a page the background prefetch already located
+        if (bi != null && SyncService.goalWordReq == bi.pageStart[target] && SyncService.goalTimeOut >= 0) {
+            double ts = SyncService.goalTimeOut;
+            Dbg.i("Play", "page " + (target + 1) + " from prefetch -> " + fmtT(ts));
+            lastManual = System.currentTimeMillis();
+            seekAbs(Math.max(0, ts - 0.3), true);
+            Toast.makeText(this, "Page " + (target + 1) + " · " + fmtT(ts), Toast.LENGTH_SHORT).show();
+            return;
+        }
+        if (syncing()) { openPanel("Find page " + (target + 1) + " in the audio"); runLocate(target); return; }
         prepare("Find page " + (target + 1) + " in the audio",
-                "Page " + (target + 1) + " has no pin yet. I can search the audio for it by listening to short pieces and checking them against the book. It takes about a minute.",
-                "Search the audio", true, () -> runSearch(target));
+                "Page " + (target + 1) + " isn't mapped yet. I listen to a few short pieces of the audio and check them against the book. It usually takes under a minute, and the result is remembered.",
+                "Find it", true, () -> runLocate(target));
+    }
+
+    /** Asks the sync service when the first word of a page is spoken, and waits for the answer. */
+    void runLocate(int target) {
+        final boolean[] cancel = fcancel;
+        final long started = System.currentTimeMillis();
+        setMsg("Looking for page " + (target + 1) + "…", -1);
+        setBtns("Cancel", (Runnable) () -> { SyncService.goalWordReq = -1; closePanel(); });
+        new Thread(() -> {
+            BookIndex b;
+            try { b = BookText.index(this, item.id); } catch (Exception e) { b = null; }
+            final BookIndex bk = b;
+            if (bk == null) { ui(() -> { if (!cancel[0]) fail("Couldn't read the book's text."); }); return; }
+            ui(() -> {
+                if (cancel[0]) return;
+                SyncService.goalTimeOut = -1;
+                SyncService.goalWordReq = bk.pageStart[target];
+                if (!SyncService.running) SyncService.start(this, item.id);
+                Dbg.i("Locate", "page " + (target + 1) + " word " + bk.pageStart[target]);
+                final long[] startedSvc = {System.currentTimeMillis()};
+                h.postDelayed(new Runnable() {
+                    @Override public void run() {
+                        if (cancel[0] || isFinishing()) { return; }
+                        double gt = SyncService.goalTimeOut;
+                        long sec = (System.currentTimeMillis() - started) / 1000;
+                        if (gt >= 0) {
+                            SyncService.goalWordReq = -1;
+                            Dbg.i("Locate", "page " + (target + 1) + " at " + (int) gt + " s after " + sec + " s");
+                            setMsg("Page " + (target + 1) + " is read at about " + fmtT(gt) + ". Checked against the book. Took " + sec + " s.", -1);
+                            setBtns("Play and pin", (Runnable) () -> { pinAt(target, gt); seekAbs(Math.max(0, gt - 0.3), true); closePanel(); },
+                                    "Play only", (Runnable) () -> { seekAbs(Math.max(0, gt - 0.3), true); closePanel(); });
+                            loadSyncData();
+                        } else if (gt == -2) {
+                            SyncService.goalWordReq = -1;
+                            fail("I couldn't confirm page " + (target + 1) + " in the audio. The audio may skip it, be abridged, or differ from this edition.");
+                        } else if (!SyncService.running && System.currentTimeMillis() - startedSvc[0] > 4000) {
+                            SyncService.goalWordReq = -1;
+                            fail("The listening stopped" + (SyncService.error.isEmpty() ? "." : ": " + SyncService.error));
+                        } else {
+                            setMsg("Looking for page " + (target + 1) + "… " + sec + " s\n\nListening to short pieces of the audio and checking them against the book.", -1);
+                            h.postDelayed(this, 700);
+                        }
+                    }
+                }, 700);
+            });
+        }).start();
+    }
+
+    /** Find my page when the spot isn't mapped yet: the sync service listens at the playhead. */
+    void runFindFast() {
+        final boolean[] cancel = fcancel;
+        final double t0 = aT;
+        final long started = System.currentTimeMillis();
+        setMsg("Listening to the audio at " + fmtT(t0) + "…", -1);
+        setBtns("Cancel", (Runnable) this::closePanel);
+        SyncService.hereWord = -1;
+        if (!SyncService.running) SyncService.start(this, item.id);
+        final long[] svc = {System.currentTimeMillis()};
+        h.postDelayed(new Runnable() {
+            @Override public void run() {
+                if (cancel[0] || isFinishing()) return;
+                int w = SyncService.hereWord;
+                long sec = (System.currentTimeMillis() - started) / 1000;
+                if (w >= 0 && bi != null) {
+                    final int pg = bi.pageOf(w);
+                    int[] sn = bi.sentenceAround(w);
+                    StringBuilder sb = new StringBuilder();
+                    for (int k = sn[0]; k <= Math.min(sn[1], sn[0] + 18); k++) sb.append(bi.w[k]).append(' ');
+                    Dbg.i("Find", "listened: " + fmtT(t0) + " -> page " + (pg + 1) + " after " + sec + " s");
+                    setMsg("At " + fmtT(t0) + " the audio is on page " + (pg + 1) + ". Took " + sec + " s.\n\nReading: “" + sb.toString().trim() + (sn[1] > sn[0] + 18 ? "…" : "") + "”", -1);
+                    setBtns("Pin page " + (pg + 1) + " here", (Runnable) () -> { goTo(pg, false); pinAt(pg, t0); closePanel(); },
+                            "Go to page", (Runnable) () -> { goTo(pg, false); closePanel(); });
+                    loadSyncData();
+                } else if (w >= 0) {
+                    h.postDelayed(this, 500);   // the book text is still loading
+                } else if (!SyncService.running && System.currentTimeMillis() - svc[0] > 4000) {
+                    fail("I couldn't match this part with confidence" + (SyncService.error.isEmpty() ? "." : ": " + SyncService.error)
+                            + "\n\nPause on a stretch of someone speaking the book (not music, an intro or silence) and try again.");
+                } else {
+                    setMsg("Listening to the audio at " + fmtT(t0) + "… " + sec + " s", -1);
+                    h.postDelayed(this, 700);
+                }
+            }
+        }, 700);
+    }
+
+    /** After you rest on a page, find where it is read so that Play page is instant. */
+    final Runnable prefetch = this::prefetchNow;
+
+    void prefetchNow() {
+        try {
+            if (isFinishing() || fdlg != null || bi == null || item == null || !mpReady || !fileMode) return;
+            if (!SyncService.wanted(this, item.id) || !Whisper.hasModel(this) || pinFor(cur) != null) return;
+            if (al.size() > 0 && al.timeOfWord(bi.pageStart[cur]) >= 0) return;
+            if (SyncService.goalWordReq == bi.pageStart[cur]) return;
+            Dbg.i("Prefetch", "locating page " + (cur + 1) + " in the background");
+            SyncService.goalTimeOut = -1;
+            SyncService.goalWordReq = bi.pageStart[cur];
+            if (!SyncService.running) SyncService.start(this, item.id);
+        } catch (Throwable e) { Dbg.e("Prefetch", "failed", e); }
     }
 
     void showPins() {
@@ -922,12 +1033,12 @@ public class ReaderActivity extends Activity {
                 return;
             }
         }
-        if (syncing()) { Toast.makeText(this, "That part isn't synced yet. The sync is at " + syncPct() + "%.", Toast.LENGTH_LONG).show(); return; }
         Dbg.i("Find", "no sync data at " + fmtT(aT) + ", listening instead");
+        if (syncing()) { openPanel("Find my page"); runFindFast(); return; }
         findMyPageListening();
     }
 
-    void findMyPageListening() { prepare("Find my page", "This listens to about 20 seconds of the audio at your position and finds the page in the book.", "Find", false, this::runFindMine); }
+    void findMyPageListening() { prepare("Find my page", "This listens to a few seconds of the audio at your position and finds the page in the book.", "Find", false, this::runFindFast); }
 
     /** Where to listen next. Only used to choose where to probe, never as the answer. */
     double guessTime(double[] lo, double[] hi, int target, double dur) {

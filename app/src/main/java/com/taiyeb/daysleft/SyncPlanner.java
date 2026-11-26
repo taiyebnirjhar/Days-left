@@ -15,7 +15,7 @@ import java.util.*;
  *   3. Refine: halve the gaps that are still wider than DENSE_GAP, nearest to the user first.
  */
 final class SyncPlanner {
-    static final double PROBE = 10, LONG_PROBE = 30, DENSE_GAP = 90, MAX_STRIDE = 150, MIN_STRIDE = 20;
+    static final double PROBE = 9, LONG_PROBE = 9, DENSE_GAP = 90, MAX_STRIDE = 150, MIN_STRIDE = 20;
     static final int EXT_FAILS_WIDE = 4, EXT_FAILS_GIVE_UP = 8, SEED_TRIES = 12, GAP_TRIES = 2;
 
     /** What to listen to. Fill in the result with feed(). */
@@ -23,7 +23,7 @@ final class SyncPlanner {
         double start, len;
         int lo, hi;
         boolean wide;
-        int kind;           // 0 seed, 1 forward, 2 backward, 3 gap
+        int kind;           // 0 seed, 1 forward, 2 backward, 3 gap, 4 goal
         String why = "";
         double gapLeftT;    // kind 3: identifies the gap
         double prevT; int prevW; // kind 1/2: the anchor the prediction is measured from
@@ -40,6 +40,11 @@ final class SyncPlanner {
     private final Set<Long> badGaps = new HashSet<>();
     /** Only map this far (seconds) either side of the playhead; infinity = the whole book. */
     double reach = Double.POSITIVE_INFINITY;
+    private final Set<Long> inFlightGaps = new HashSet<>();
+    private final TreeMap<Integer, Double> byWord = new TreeMap<>();   // book word -> time, same anchors
+    /** Goal: find when this book word is spoken (Play this page). goalTime >= 0 once found, -2 if it could not be. */
+    private int goalWord = -1; private int goalRounds;
+    volatile double goalTime = -1;
     /** True if it stopped before the whole book was mapped (lost the place). */
     boolean lost;
 
@@ -47,7 +52,7 @@ final class SyncPlanner {
         this.total = totalSec;
         this.startSec = Math.max(0, Math.min(startSec, totalSec - 1));
         this.words = bookWords;
-        for (int i = 0; i < pos.length; i++) anchors.put(time[i], pos[i]);
+        for (int i = 0; i < pos.length; i++) { anchors.put(time[i], pos[i]); byWord.put(pos[i], time[i]); }
         if (!anchors.isEmpty()) { seeded = true; placeCursors(this.startSec); }
     }
 
@@ -91,6 +96,16 @@ final class SyncPlanner {
 
     int anchorCount() { return anchors.size(); }
 
+    /** Book word being spoken at second t if it is known well (between close anchors, or just next to one), else -1. */
+    int wordNear(double t) {
+        Map.Entry<Double, Integer> a = anchors.floorEntry(t), b = anchors.ceilingEntry(t);
+        if (a != null && b != null && b.getKey() - a.getKey() <= DENSE_GAP)
+            return a.getValue() + (int) ((t - a.getKey()) * (b.getValue() - a.getValue()) / Math.max(1e-6, b.getKey() - a.getKey()));
+        if (a != null && t - a.getKey() <= 12) return a.getValue() + (int) ((t - a.getKey()) * rate());
+        if (b != null && b.getKey() - t <= 12) return Math.max(0, b.getValue() - (int) ((b.getKey() - t) * rate()));
+        return -1;
+    }
+
     /** Words per second, from what is known so far (or the book average). */
     double rate() {
         if (anchors.size() >= 2) {
@@ -125,6 +140,86 @@ final class SyncPlanner {
         return gap();
     }
 
+    /**
+     * Up to max independent pieces to listen to in ONE speech-model call. The model always encodes a full 30 s window,
+     * so three 9 s pieces cost the same as one. Pieces never depend on each other's result.
+     */
+    List<Req> nextBatch(int max) {
+        List<Req> out = new ArrayList<>();
+        if (goalWord >= 0 && goalTime == -1) {
+            out.addAll(goalBatch(max));
+            if (!out.isEmpty()) return out;
+        }
+        if (!seeded) {
+            for (int i = 0; i < max; i++) { Req r = seed(); if (r == null) break; out.add(r); }
+            return out;
+        }
+        if (!fwdDone) { Req f = forward(); if (f != null) out.add(f); }
+        if (!bwdDone && out.size() < max) { Req b = backward(); if (b != null) out.add(b); }
+        while (out.size() < max) { Req g = gap(); if (g == null) break; out.add(g); }
+        return out;
+    }
+
+    /** Ask for the time of a book word. Result in goalTime (-1 working, -2 could not be found). */
+    void setGoal(int word) {
+        if (word < 0 || word >= words) return;
+        goalWord = word; goalRounds = 0; goalTime = -1;
+        if (resolveGoal()) return;
+    }
+
+    void clearGoal() { goalWord = -1; goalTime = -1; }
+
+    /** If the word is already pinned between two close anchors, answer without listening. */
+    private boolean resolveGoal() {
+        Map.Entry<Integer, Double> lo = byWord.floorEntry(goalWord), hi = byWord.ceilingEntry(goalWord);
+        if (lo != null && lo.getKey() == goalWord) { goalTime = lo.getValue(); return true; }
+        if (lo != null && hi != null && hi.getValue() - lo.getValue() <= DENSE_GAP) {
+            goalTime = lo.getValue() + (goalWord - lo.getKey()) * (hi.getValue() - lo.getValue()) / (double) Math.max(1, hi.getKey() - lo.getKey());
+            return true;
+        }
+        return false;
+    }
+
+    private List<Req> goalBatch(int max) {
+        List<Req> out = new ArrayList<>();
+        if (resolveGoal()) return out;
+        if (++goalRounds > 8) { goalTime = -2; return out; }
+        Map.Entry<Integer, Double> lo = byWord.floorEntry(goalWord), hi = byWord.ceilingEntry(goalWord);
+        double est, unc;
+        int wlo, whi;
+        double rate = rate();
+        if (lo != null && hi != null) {
+            double dt = hi.getValue() - lo.getValue();
+            est = lo.getValue() + (goalWord - lo.getKey()) * dt / (double) Math.max(1, hi.getKey() - lo.getKey());
+            unc = Math.max(10, 0.03 * dt); wlo = lo.getKey(); whi = hi.getKey();   // pace drift inside a bracket is a few percent
+        } else if (lo != null || hi != null) {
+            Map.Entry<Integer, Double> a = lo != null ? lo : hi;
+            est = a.getValue() + (goalWord - a.getKey()) / rate;
+            unc = 20 + 0.06 * Math.abs(est - a.getValue());
+            wlo = lo != null ? lo.getKey() - 40 : 0; whi = hi != null ? hi.getKey() + 40 : words;
+            if (lo != null) whi = words; else wlo = 0;
+        } else {
+            est = goalWord / Math.max(0.5, words / total);
+            unc = 0.10 * total; wlo = 0; whi = words;
+        }
+        boolean wide = lo == null || hi == null;
+        double step = Math.max(PROBE + 3, unc * 2 / 3);   // pieces spread over est +- unc
+        for (int i = 0; i < Math.min(max, 3); i++) {
+            double c = est + (i - (Math.min(max, 3) - 1) / 2.0) * step;
+            Req r = new Req();
+            r.kind = 4; r.len = PROBE;
+            r.start = Math.max(0, Math.min(total - PROBE - 1, c - PROBE / 2));
+            r.lo = Math.max(0, wlo - 30); r.hi = Math.min(words, whi + 30);
+            r.wide = wide && goalRounds <= 2;
+            if (r.wide) { r.lo = 0; r.hi = words; }
+            r.why = "goal word " + goalWord + " round " + goalRounds + " near " + (int) est + " s +-" + (int) unc;
+            boolean dup = false;
+            for (Req o : out) if (Math.abs(o.start - r.start) < 2) dup = true;
+            if (!dup) out.add(r);
+        }
+        return out;
+    }
+
     private Req seed() {
         if (seedTry >= SEED_TRIES) { lost = true; return null; }
         int n = seedTry++;
@@ -133,7 +228,7 @@ final class SyncPlanner {
         double s = startSec + (n == 0 ? 0 : off);
         if (s < 0 || s > total - 10) s = Math.max(0, Math.min(total - 10, startSec + Math.abs(off)));
         Req r = new Req();
-        r.kind = 0; r.start = s; r.len = Math.min(n < 2 ? 20 : LONG_PROBE, total - s);
+        r.kind = 0; r.start = s; r.len = Math.min(PROBE, total - s);
         r.lo = 0; r.hi = words; r.wide = true; r.why = "seed #" + (n + 1);
         return r;
     }
@@ -202,7 +297,7 @@ final class SyncPlanner {
         double pt = -1; int pw = 0;
         for (Map.Entry<Double, Integer> e : anchors.entrySet()) {
             double t = e.getKey();
-            if (pt >= 0 && t - pt > DENSE_GAP && !badGaps.contains(Math.round(pt * 10)) && pt < startSec + reach && t > startSec - reach) {
+            if (pt >= 0 && t - pt > DENSE_GAP && !badGaps.contains(Math.round(pt * 10)) && !inFlightGaps.contains(Math.round(pt * 10)) && pt < startSec + reach && t > startSec - reach) {
                 double d = Math.abs((pt + t) / 2 - startSec);
                 if (d < bestD) { bestD = d; lt = pt; rt = t; lw = pw; rw = e.getValue(); }
             }
@@ -211,6 +306,7 @@ final class SyncPlanner {
         if (bestD == Double.MAX_VALUE) return null;
         Req r = new Req();
         r.kind = 3; r.gapLeftT = lt;
+        inFlightGaps.add(Math.round(lt * 10));
         double mid = (lt + rt) / 2;
         r.len = Math.min(PROBE, rt - lt - 4);
         r.start = mid - r.len / 2;
@@ -227,8 +323,14 @@ final class SyncPlanner {
             if (ok) { kept = add(o); seeded = true; placeCursors((o.time[0] + o.time[o.time.length - 1]) / 2); }
             return kept;
         }
+        if (r.kind == 4) {
+            if (ok) kept = add(o);
+            if (goalWord >= 0) resolveGoal();
+            return kept;
+        }
         if (r.kind == 3) {
             long key = Math.round(r.gapLeftT * 10);
+            inFlightGaps.remove(key);
             if (ok) kept = add(o);
             if (kept == 0) {
                 int n = gapTries.merge(key, 1, Integer::sum);
@@ -271,6 +373,7 @@ final class SyncPlanner {
             if (anchors.containsKey(t)) continue;
             if ((lo != null && lo.getValue() >= w) || (hi != null && hi.getValue() <= w)) continue;
             anchors.put(t, w);
+            byWord.put(w, t);
             kept++;
         }
         return kept;
