@@ -72,6 +72,7 @@ public class ReaderActivity extends Activity {
     int hlStyle;   // 0 marker, 1 underline
     long lastManual, alReloaded;
     int seenLiveVer = -1;
+    final MarkerTrack mt = new MarkerTrack();   // which sentence the marker shows (tested in tests/host/MarkerCheck.java)
 
     int goPage;
     boolean jumpToAudio;
@@ -237,6 +238,13 @@ public class ReaderActivity extends Activity {
         }, "text-view").start();
     }
 
+    /** Gets the bigger text ready BEFORE the slider is touched, so moving it responds at once: the book's word positions (once) and the page pictures around the reader. */
+    void warmZoom() {
+        if (!fileMode) return;
+        if (bi == null) { if (!prepTried) prepareText(false); return; }
+        rfPicture(cur); rfPicture(cur + 1);
+    }
+
     int hlColor() { return hlStyle == 1 ? (theme == 3 ? 0xFFFFD54F : 0xFFD9822B) : (theme == 3 ? 0x55FFD54F : 0x70F2B93B); }
 
     final float[] aspects = new float[100000];
@@ -254,7 +262,7 @@ public class ReaderActivity extends Activity {
     }
 
     // one sharp picture per page for the bigger text, cached; the normal page picture is shown until it arrives
-    final LruCache<Integer, Bitmap> rfPics = new LruCache<>(3);
+    final LruCache<Integer, Bitmap> rfPics = new LruCache<>(4);
     final Set<Integer> rfInflight = new HashSet<>();
 
     Bitmap rfPicture(int i) {
@@ -280,6 +288,7 @@ public class ReaderActivity extends Activity {
                     if (p == cur || p < 0 || p >= n) return;
                     cur = p; updateLabel(cur); if (seek != null) seek.setProgress(cur);
                     h.removeCallbacks(saver); h.postDelayed(saver, 700);
+                    rfPicture(p + 1);   // the next page's sharp picture is ready before you get there
                 }
                 @Override public void onUserScroll() { lastManual = System.currentTimeMillis(); if (chrome && settings.getVisibility() != View.VISIBLE) showChrome(false); }
                 @Override public Bitmap pageBitmap(int page) { return rfPicture(page); }
@@ -583,19 +592,11 @@ public class ReaderActivity extends Activity {
         long now = System.currentTimeMillis();
         if (now - lastSave > 5000 && t > 1) { lastSave = now; Learn.setAudio(this, item.id, (int) t, null); }
         if (al.size() > 0 && bi != null) {
-            int hw = al.highlightWordAt(t), fw = al.flipWordAt(t);   // the rules live in Alignment, so the end-to-end test uses the same ones
-            if (hw >= 0) {
-                int[] r = Highlight.sentenceFor(bi, hw);   // null: nothing to read there (a page number or a lone figure)
-                if (r == null) { if (hlFrom >= 0) { hlFrom = hlTo = -1; hlWord = -1; if (pv != null) pv.invalidate(); } }
-                else {
-                    boolean ch = r[0] != hlFrom || hw != hlWord;
-                    hlFrom = r[0]; hlTo = r[1]; hlWord = hw;
-                    if (ch && hlOn && pv != null) pv.invalidate();
-                }
-            } else if (hlFrom >= 0) {
-                hlFrom = hlTo = -1; hlWord = -1;   // better no highlight than a wrong one: the probes around here are too far apart (yet)
-                if (pv != null) pv.invalidate();
-            }
+            int fw = al.flipWordAt(t);   // the rules live in Alignment/MarkerTrack, so the tests use the same ones
+            // MarkerTrack: never loses the marker while playing (dead reckoning through gaps), never flickers or steps back, shows nothing after a seek into unknown audio
+            if (mt.update(al, bi, t, st == 1, now)) { hlFrom = mt.from; hlTo = mt.to; if (hlOn && pv != null) pv.invalidate(); }
+            int hw = mt.word;
+            if (fw < 0 && mt.estimated) fw = mt.word;   // the page follows the marker too
             if (rfActive && rf != null) {
                 rf.setHighlight(hlOn ? hlFrom : -1, hlOn ? hlTo : -1, hlStyle);
                 if (hw >= 0 && followOn && st == 1 && now - lastManual > 5000 && settings.getVisibility() != View.VISIBLE) rf.follow(hw);
@@ -864,11 +865,11 @@ public class ReaderActivity extends Activity {
             setBtns("Hide", (Runnable) this::closePanel, "Stop", (Runnable) () -> { SyncService.stop(this); showSyncState(); });
         } else if (SyncService.fullFor(this, item.id)) {
             setMsg("This audiobook is synced.\n\nPlay page and Find page are instant now, and the sentence being read is highlighted in the book.", -1);
-            setBtns("Close", (Runnable) this::closePanel, "Sync again", (Runnable) () -> { BookText.clearAudioData(this, item.id); al = new Alignment(); hlFrom = hlTo = -1; showSyncState(); });
+            setBtns("Close", (Runnable) this::closePanel, "Sync again", (Runnable) () -> { BookText.clearAudioData(this, item.id); al = new Alignment(); mt.reset(); hlFrom = hlTo = -1; showSyncState(); });
         } else if (SyncService.winReady(this, item.id)) {
             setMsg("Synced around where you were listening.\n\nPlay page, Find page and the sentence highlight work there. If you go somewhere else, Find page and Play page map that place on demand (about a minute), or tap Sync here to map it now.", -1);
             setBtns("Close", (Runnable) this::closePanel, "Sync here", (Runnable) () -> startSync(Whisper.which(this)),
-                    "Start over", (Runnable) () -> { BookText.clearAudioData(this, item.id); al = new Alignment(); hlFrom = hlTo = -1; updateSyncLabel(); showSyncState(); });
+                    "Start over", (Runnable) () -> { BookText.clearAudioData(this, item.id); al = new Alignment(); mt.reset(); hlFrom = hlTo = -1; updateSyncLabel(); showSyncState(); });
         } else {
             boolean part = SyncService.pctFor(this, item.id) > 0;
             if (!SyncService.error.isEmpty() && !part) { /* show the reason once */ }
@@ -1392,7 +1393,11 @@ public class ReaderActivity extends Activity {
         aa.setTextSize(17);
         aa.setTypeface(Typeface.create(Typeface.SERIF, Typeface.BOLD));
         aa.setGravity(Gravity.CENTER);
-        aa.setOnClickListener(v -> settings.setVisibility(settings.getVisibility() == View.VISIBLE ? View.GONE : View.VISIBLE));
+        aa.setOnClickListener(v -> {
+            boolean open = settings.getVisibility() != View.VISIBLE;
+            settings.setVisibility(open ? View.VISIBLE : View.GONE);
+            if (open) warmZoom();
+        });
         lockBtn = new Glyph(3);
         lockBtn.setOnClickListener(v -> setLocked(true));
         lockBtn.setPadding(dp(15), dp(10), dp(15), dp(10));   // the drawn padlock is about as tall as the 'Aa' next to it

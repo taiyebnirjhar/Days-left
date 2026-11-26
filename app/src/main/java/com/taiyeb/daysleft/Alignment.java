@@ -17,6 +17,15 @@ class Alignment {
 
     double typicalWps() { return typ; }
 
+    /** Words per second over everything mapped (a coarse pace, used when the close-probe pace is unknown), or 0. */
+    double averageWps() {
+        if (aw.length < 2) return 0;
+        double dt = at[aw.length - 1] - at[0];
+        if (dt < 30) return 0;
+        double r = (aw[aw.length - 1] - aw[0]) / dt;
+        return r > 0.5 && r < 8 ? r : 0;
+    }
+
     /**
      * Interpolating by word count spreads time evenly over words, but a narrator pauses between sentences, so a boundary
      * lands 1 to 3 s off inside a long gap. With the book's sentence ends known, each end counts as a pause worth
