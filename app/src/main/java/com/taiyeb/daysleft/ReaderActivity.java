@@ -48,6 +48,9 @@ public class ReaderActivity extends Activity {
     FrameLayout playBtn;
     TextView audioBtn;
     boolean chrome = true, finishedToastShown;
+    boolean locked;                 // touch lock (like VLC): the screen ignores touches until the padlock is tapped
+    Glyph lockBtn, unlockBtn;       // padlock in the top bar; the one that appears after a tap while locked
+    final Runnable hideUnlock = () -> { if (unlockBtn != null) unlockBtn.setVisibility(View.GONE); };
     AudioManager am;
 
     // in-app YouTube player + page/time sync
@@ -155,7 +158,38 @@ public class ReaderActivity extends Activity {
         try { synchronized (lock) { if (pr != null) pr.close(); } if (pfd != null) pfd.close(); } catch (Exception ignored) {}
     }
 
+    /** While locked every touch is swallowed, except on the unlock padlock, which appears for 3 s after any touch. */
+    @Override public boolean dispatchTouchEvent(MotionEvent e) {
+        if (!locked) return super.dispatchTouchEvent(e);
+        if (unlockBtn.getVisibility() == View.VISIBLE) {
+            int[] xy = new int[2]; unlockBtn.getLocationOnScreen(xy);
+            int pad = dp(12);
+            if (e.getRawX() >= xy[0] - pad && e.getRawX() <= xy[0] + unlockBtn.getWidth() + pad && e.getRawY() >= xy[1] - pad && e.getRawY() <= xy[1] + unlockBtn.getHeight() + pad) {
+                if (e.getAction() == MotionEvent.ACTION_UP) setLocked(false);
+                return true;
+            }
+        }
+        if (e.getAction() == MotionEvent.ACTION_DOWN) { unlockBtn.setVisibility(View.VISIBLE); h.removeCallbacks(hideUnlock); h.postDelayed(hideUnlock, 3000); }
+        return true;
+    }
+
+    void setLocked(boolean on) {
+        locked = on;
+        h.removeCallbacks(hideUnlock);
+        if (on) {
+            if (settings != null) settings.setVisibility(View.GONE);
+            showChrome(false);
+            unlockBtn.setVisibility(View.VISIBLE);
+            h.postDelayed(hideUnlock, 2500);
+            Toast.makeText(this, "Touch lock on. Tap the screen, then the padlock, to unlock.", Toast.LENGTH_LONG).show();
+        } else {
+            unlockBtn.setVisibility(View.GONE);
+            showChrome(true);
+        }
+    }
+
     @Override public void onBackPressed() {
+        if (locked) { unlockBtn.setVisibility(View.VISIBLE); h.removeCallbacks(hideUnlock); h.postDelayed(hideUnlock, 3000); return; }
         if (settings != null && settings.getVisibility() == View.VISIBLE) { settings.setVisibility(View.GONE); return; }
         super.onBackPressed();
     }
@@ -1209,8 +1243,18 @@ public class ReaderActivity extends Activity {
         aa.setTypeface(Typeface.create(Typeface.SERIF, Typeface.BOLD));
         aa.setGravity(Gravity.CENTER);
         aa.setOnClickListener(v -> settings.setVisibility(settings.getVisibility() == View.VISIBLE ? View.GONE : View.VISIBLE));
+        lockBtn = new Glyph(3);
+        lockBtn.setOnClickListener(v -> setLocked(true));
+        lockBtn.setPadding(dp(11), dp(11), dp(11), dp(11));
+        top.addView(lockBtn, new LinearLayout.LayoutParams(dp(44), dp(44)));
         top.addView(aa, new LinearLayout.LayoutParams(dp(48), dp(40)));
         root.addView(top, new FrameLayout.LayoutParams(-1, -2, Gravity.TOP));
+        unlockBtn = new Glyph(3);
+        unlockBtn.color = 0xFFFFFFFF;
+        unlockBtn.round = true;
+        unlockBtn.setVisibility(View.GONE);
+        root.addView(unlockBtn, new FrameLayout.LayoutParams(dp(64), dp(64), Gravity.CENTER_VERTICAL | Gravity.START));
+        ((FrameLayout.LayoutParams) unlockBtn.getLayoutParams()).leftMargin = dp(20);
 
         // bottom area: done pill, settings panel, controls
         LinearLayout stack = new LinearLayout(this);
@@ -1546,6 +1590,7 @@ public class ReaderActivity extends Activity {
         title.setTextColor(ink);
         aa.setTextColor(ink);
         back.color = ink; back.invalidate();
+        lockBtn.color = ink; lockBtn.invalidate();
         playBtn.setBackground(rr(ink, 30));
         playGlyph.color = paper; playGlyph.invalidate();
         if (audioBtn != null) { audioBtn.setTextColor(ink); audioBtn.setBackground(rr((ink & 0x00FFFFFF) | 0x1F000000, 16)); }
@@ -1646,12 +1691,22 @@ public class ReaderActivity extends Activity {
 
     class Glyph extends View {
         int type, color = 0xFF000000;
+        boolean round;   // draws a dark disc behind the glyph (the unlock padlock must be visible on any page)
         Glyph(int t) { super(ReaderActivity.this); type = t; }
         @Override protected void onDraw(Canvas c) {
             float w = getWidth(), hh = getHeight();
             Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
+            if (round) { p.setColor(0xCC202020); c.drawCircle(w / 2, hh / 2, Math.min(w, hh) / 2, p); }
             p.setColor(color);
-            if (type == 0) {
+            if (type == 3) {
+                float in = round ? w * 0.26f : getPaddingLeft(), l = in, r = w - in, t = hh * (round ? 0.26f : 0.12f), b = hh - (round ? hh * 0.26f : hh * 0.12f);
+                float bw = r - l, bodyTop = t + (b - t) * 0.42f;
+                c.drawRoundRect(l, bodyTop, r, b, bw * 0.16f, bw * 0.16f, p);
+                p.setStyle(Paint.Style.STROKE); p.setStrokeWidth(bw * 0.14f); p.setStrokeCap(Paint.Cap.ROUND);
+                c.drawArc(l + bw * 0.2f, t, r - bw * 0.2f, t + (bodyTop - t) * 2f, 180, 180, false, p);
+                c.drawLine(l + bw * 0.2f, t + (bodyTop - t), l + bw * 0.2f, bodyTop, p);
+                c.drawLine(r - bw * 0.2f, t + (bodyTop - t), r - bw * 0.2f, bodyTop, p);
+            } else if (type == 0) {
                 p.setStyle(Paint.Style.STROKE);
                 p.setStrokeWidth(w * 0.085f);
                 p.setStrokeCap(Paint.Cap.ROUND);
