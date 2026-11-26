@@ -292,6 +292,7 @@ public class ReaderActivity extends Activity {
     /** The number that goes with syncStatus(), or -1 when there is none yet. */
     int statusPct() { return SyncService.statusPct(); }
 
+    String jobText;   // what a hidden Find/Play page search is doing right now (shown in the pill)
     String pendingText;
     Runnable pendingAct;
     long pendingUntil;
@@ -318,8 +319,9 @@ public class ReaderActivity extends Activity {
         boolean mine = SyncService.running && SyncService.itemId == item.id;
         String t = null;
         if (pendingText != null && now >= pendingUntil) { pendingText = null; pendingAct = null; }
-        if (pendingText != null) t = pendingText;
-        else if (fdlg != null && syncPanel) t = null;   // the panel is open and says it already
+        if (fdlg != null) t = null;                      // a dialog is open: it says it already
+        else if (pendingText != null) t = pendingText;
+        else if (jobText != null) t = jobText;
         else if (mine && !SyncService.ready) {
             t = syncStatus();
             if (SyncService.powerSaving && SyncService.dlPct < 0 && SyncService.textPct < 0) t += "\nBattery saver is on, so this is slower";
@@ -327,9 +329,12 @@ public class ReaderActivity extends Activity {
         else if (!SyncService.running && !SyncService.error.isEmpty() && SyncService.wanted(this, item.id) && !SyncService.winReady(this, item.id))
             t = "Sync paused: " + SyncService.error + "\nTap to try again";
         if (t == null) { if (bannerWrap.getVisibility() != View.GONE) bannerWrap.setVisibility(View.GONE); return; }
-        int ink = INK[theme];
-        syncBanner.setTextColor(ink);
-        syncBanner.setBackground(rr((ink & 0x00FFFFFF) | 0x26000000, 20));
+        // solid, high contrast on every theme: the ink colour as the background, the paper colour as the text, with a shadow,
+        // so it stays readable over any page text (the translucent version let the text underneath show through)
+        int ink = INK[theme], paper = PAPER[theme];
+        syncBanner.setTextColor((paper & 0x00FFFFFF) | 0xFF000000);
+        syncBanner.setBackground(rr((ink & 0x00FFFFFF) | 0xFF000000, 22));
+        syncBanner.setElevation(dp(6));
         syncBanner.setGravity(Gravity.CENTER);
         if (!t.contentEquals(syncBanner.getText())) syncBanner.setText(t);
         if (bannerWrap.getVisibility() != View.VISIBLE) bannerWrap.setVisibility(View.VISIBLE);
@@ -787,7 +792,7 @@ public class ReaderActivity extends Activity {
         final boolean[] stop = new boolean[1];      // true only when the user cancels
         final long started = System.currentTimeMillis();
         setMsg("Looking for page " + (target + 1) + "…", -1);
-        setBtns("Hide", (Runnable) this::closePanel, "Cancel", (Runnable) () -> { stop[0] = true; SyncService.goalWordReq = -1; closePanel(); });
+        setBtns("Hide", (Runnable) this::closePanel, "Cancel", (Runnable) () -> { stop[0] = true; jobText = null; SyncService.goalWordReq = -1; closePanel(); updateBanner(); });
         new Thread(() -> {
             BookIndex b;
             try { b = BookText.index(this, item.id); } catch (Exception e) { b = null; }
@@ -795,6 +800,7 @@ public class ReaderActivity extends Activity {
             if (bk == null) { ui(() -> { if (!stop[0]) resultOrPost("Couldn't read the book's text.", null, panel[0]); }); return; }
             ui(() -> {
                 if (stop[0]) return;
+                jobText = "Finding page " + (target + 1) + "…";
                 SyncService.goalTimeOut = -1;
                 SyncService.goalWordReq = bk.pageStart[target];
                 if (!SyncService.running) SyncService.start(this, item.id);
@@ -806,6 +812,7 @@ public class ReaderActivity extends Activity {
                         double gt = SyncService.goalTimeOut;
                         long sec = (System.currentTimeMillis() - started) / 1000;
                         if (gt >= 0) {
+                            jobText = null;
                             SyncService.goalWordReq = -1;
                             Dbg.i("Locate", "page " + (target + 1) + " at " + (int) gt + " s after " + sec + " s" + (panel[0] ? " (dialog hidden)" : ""));
                             final double at = Math.max(0, gt - 0.3);
@@ -816,12 +823,15 @@ public class ReaderActivity extends Activity {
                             } else postResult("Page " + (target + 1) + " is at " + fmtT(gt) + " · tap to play", () -> seekAbs(at, true));
                             loadSyncData();
                         } else if (gt == -2) {
+                            jobText = null;
                             SyncService.goalWordReq = -1;
                             resultOrPost("I couldn't confirm page " + (target + 1) + " in the audio. The audio may skip it, be abridged, or differ from this edition.", null, panel[0]);
                         } else if (!SyncService.running && System.currentTimeMillis() - svc[0] > 4000) {
+                            jobText = null;
                             SyncService.goalWordReq = -1;
                             resultOrPost("The listening stopped" + (SyncService.error.isEmpty() ? "." : ": " + SyncService.error), null, panel[0]);
                         } else {
+                            jobText = "Finding page " + (target + 1) + "… " + sec + " s";
                             if (!panel[0] && fdlg != null) setMsg("Looking for page " + (target + 1) + "… " + sec + " s\n\nListening to short pieces of the audio and checking them against the book. You can hide this: it keeps going in the background.", -1);
                             h.postDelayed(this, 700);
                         }
@@ -839,7 +849,8 @@ public class ReaderActivity extends Activity {
         final double t0 = aT;
         final long started = System.currentTimeMillis();
         setMsg("Listening to the audio at " + fmtT(t0) + "…", -1);
-        setBtns("Hide", (Runnable) this::closePanel, "Cancel", (Runnable) () -> { stop[0] = true; closePanel(); });
+        setBtns("Hide", (Runnable) this::closePanel, "Cancel", (Runnable) () -> { stop[0] = true; jobText = null; closePanel(); updateBanner(); });
+        jobText = "Finding your page…";
         SyncService.hereWord = -1;
         if (!SyncService.running) SyncService.start(this, item.id);
         final long[] svc = {System.currentTimeMillis()};
@@ -849,6 +860,7 @@ public class ReaderActivity extends Activity {
                 int w = SyncService.hereWord;
                 long sec = (System.currentTimeMillis() - started) / 1000;
                 if (w >= 0 && bi != null) {
+                    jobText = null;
                     final int pg = bi.pageOf(w);
                     int[] sn = bi.sentenceAround(w);
                     StringBuilder sb = new StringBuilder();
@@ -863,9 +875,11 @@ public class ReaderActivity extends Activity {
                 } else if (w >= 0) {
                     h.postDelayed(this, 500);   // the book text is still loading
                 } else if (!SyncService.running && System.currentTimeMillis() - svc[0] > 4000) {
+                    jobText = null;
                     resultOrPost("I couldn't match this part with confidence" + (SyncService.error.isEmpty() ? "." : ": " + SyncService.error)
                             + "\n\nPause on a stretch of someone speaking the book (not music, an intro or silence) and try again.", null, panel[0]);
                 } else {
+                    jobText = "Finding your page… " + sec + " s";
                     if (!panel[0] && fdlg != null) setMsg("Listening to the audio at " + fmtT(t0) + "… " + sec + " s\n\nYou can hide this: it keeps going in the background.", -1);
                     h.postDelayed(this, 700);
                 }
