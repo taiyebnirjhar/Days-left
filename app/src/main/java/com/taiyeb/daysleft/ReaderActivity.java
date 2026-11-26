@@ -182,9 +182,9 @@ public class ReaderActivity extends Activity {
     /** Pinch-out hands over to the text view when the printed words are available. False = keep the normal page zoom. */
     boolean tryEnterReflow() {
         if (!fileMode) return false;
-        if (bi != null && disp != null) return true;
+        if (bi != null) return true;   // the word boxes are all it needs: the words are cut out of the PDF's own rendering
         if (rfBuilding) Toast.makeText(this, "Preparing the text view, a few seconds…", Toast.LENGTH_SHORT).show();
-        else if (!prepTried || bi == null || disp == null) prepareText(true);
+        else prepareText(true);
         return false;
     }
 
@@ -226,9 +226,40 @@ public class ReaderActivity extends Activity {
 
     int hlColor() { return hlStyle == 1 ? (theme == 3 ? 0xFFFFD54F : 0xFFD9822B) : (theme == 3 ? 0x55FFD54F : 0x70F2B93B); }
 
+    final float[] aspects = new float[100000];
+
+    /** Page height / width, cached (opening a page asks the renderer, which renders one thing at a time). */
+    float aspectOf(int i) {
+        if (i < 0 || i >= n) return 1.414f;
+        if (i < aspects.length && aspects[i] > 0) return aspects[i];
+        float a = 1.414f;
+        try {
+            synchronized (lock) { PdfRenderer.Page pg = pr.openPage(i); try { a = (float) pg.getHeight() / pg.getWidth(); } finally { pg.close(); } }
+        } catch (Throwable ignored) {}
+        if (i < aspects.length) aspects[i] = a;
+        return a;
+    }
+
+    /** A strip of a page rendered at exactly the size it is shown (sc = pixels per page width), for the zoomed view. */
+    Bitmap renderBand(int page, float sc, int x, int y, int w, int h) {
+        synchronized (lock) {
+            PdfRenderer.Page pg = pr.openPage(page);
+            try {
+                float k = sc / pg.getWidth();
+                android.graphics.Matrix m = new android.graphics.Matrix();
+                m.setScale(k, k);
+                m.postTranslate(-x, -y);
+                Bitmap b = Bitmap.createBitmap(Math.max(1, w), Math.max(1, h), Bitmap.Config.ARGB_8888);
+                b.eraseColor(Color.WHITE);
+                pg.render(b, null, m, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY);
+                return b;
+            } finally { pg.close(); }
+        }
+    }
+
     void enterReflow() {
         if (rf == null) {
-            rf = new ReflowView(this, bi, disp, new ReflowView.Host() {
+            rf = new ReflowView(this, bi, disp == null ? null : disp.tok, new ReflowView.Host() {
                 @Override public void onTap() { if (settings.getVisibility() == View.VISIBLE) settings.setVisibility(View.GONE); else showChrome(!chrome); }
                 @Override public void onPage(int p) {
                     if (p == cur || p < 0 || p >= n) return;
@@ -237,11 +268,13 @@ public class ReaderActivity extends Activity {
                 }
                 @Override public void onUserScroll() { lastManual = System.currentTimeMillis(); if (chrome) showChrome(false); }
                 @Override public void onPinchOut() { exitReflow(); }
+                @Override public Bitmap renderBand(int page, float sc, int x, int y, int w, int h2) { return ReaderActivity.this.renderBand(page, sc, x, y, w, h2); }
+                @Override public float aspect(int page) { return aspectOf(page); }
             });
-            rf.setSize(Store.num(this, "rdRfSize", 20));
+            rf.setZoom(Store.num(this, "rdRfZoom", 170) / 100f);
             root.addView(rf, 1, new FrameLayout.LayoutParams(-1, -1));
         }
-        rf.setColors(INK[theme], PAPER[theme], hlColor());
+        rf.setColors(INK[theme], PAPER[theme], theme);
         rf.setVisibility(View.VISIBLE);
         rfActive = true;
         showChrome(false);
@@ -253,7 +286,7 @@ public class ReaderActivity extends Activity {
 
     void exitReflow() {
         if (!rfActive) return;
-        Store.setNum(this, "rdRfSize", Math.round(rf.size()));
+        Store.setNum(this, "rdRfZoom", Math.round(rf.zoom() * 100));
         rfActive = false;
         int p = rf.pageAtTop();
         rf.setVisibility(View.GONE);
@@ -775,7 +808,8 @@ public class ReaderActivity extends Activity {
                 Dbg.p("Reader", "sync data loaded", tl, "book words " + (b == null ? "none" : b.count()) + ", aligned " + a.size() + (SyncService.running ? ", sync running" : ""));
                 ui(() -> {
                     bi = b; al = a; seenLiveVer = -1; if (dw != null && disp == null) disp = dw; jumpToAudioPage();
-                    if ((b == null || dw == null) && !prepTried) h.postDelayed(() -> prepareText(false), 1500);   // so the text view is ready when you pinch updatePin(); if (pv != null) pv.invalidate();
+                    updatePin(); if (pv != null) pv.invalidate();
+                    if (b == null && !prepTried) h.postDelayed(() -> prepareText(false), 1500);   // so the zoomed view is ready when you pinch
                     // a sync that was interrupted (app closed by the system, low battery) carries on by itself
                     if (b != null && fileMode && !SyncService.running && SyncService.wanted(this, id) && !SyncService.fullFor(this, id) && Whisper.hasModel(this)) {
                         Dbg.i("Sync", "auto-resuming from the reader (was interrupted, not stopped by the user)");
@@ -1621,7 +1655,7 @@ public class ReaderActivity extends Activity {
             hs.setTextSize(15);
             hs.setTag("txt");
             hs.setPadding(0, dp(14), 0, dp(4));
-            hs.setOnClickListener(v -> { hlStyle = 1 - hlStyle; Store.setNum(this, "rdHlStyle", hlStyle); if (rf != null) rf.setColors(INK[theme], PAPER[theme], hlColor()); hs.setText("Highlight style: " + (hlStyle == 0 ? "Marker" : "Underline") + "  ›"); if (pv != null) pv.invalidate(); });
+            hs.setOnClickListener(v -> { hlStyle = 1 - hlStyle; Store.setNum(this, "rdHlStyle", hlStyle); if (rf != null) rf.setHighlight(rf == null ? -1 : (hlOn ? hlFrom : -1), hlOn ? hlTo : -1, hlStyle, hlOn ? hlWord : -1); hs.setText("Highlight style: " + (hlStyle == 0 ? "Marker" : "Underline") + "  ›"); if (pv != null) pv.invalidate(); });
             settings.addView(hs);
             TextView sy = new TextView(this);
             sy.setText("Sync with the book…");
@@ -1685,7 +1719,7 @@ public class ReaderActivity extends Activity {
 
     void skin() {
         int ink = INK[theme], paper = PAPER[theme], desk = DESK[theme];
-        if (rf != null) rf.setColors(ink, paper, hlColor());
+        if (rf != null) rf.setColors(ink, paper, theme);
         chromeBg = (desk & 0x00FFFFFF) | 0xF2000000;
         top.setBackgroundColor(chromeBg);
         bottom.setBackground(box(chromeBg, 24, 24));
@@ -1866,7 +1900,7 @@ public class ReaderActivity extends Activity {
                     invalidate();
                     return true;
                 }
-                @Override public void onScaleEnd(ScaleGestureDetector d) { scaling = false; if (zoom < 1.05f) resetZoom(); }
+                @Override public void onScaleEnd(ScaleGestureDetector d) { scaling = false; if (rfActive && rf != null) rf.endPinch(); if (zoom < 1.05f) resetZoom(); }
             });
             gd = new GestureDetector(ReaderActivity.this, new GestureDetector.SimpleOnGestureListener() {
                 @Override public boolean onDown(MotionEvent e) { flung = false; dragging = false; cancelAnim(); return true; }

@@ -1,16 +1,14 @@
 package com.taiyeb.daysleft;
 
 import android.content.Context;
-import android.graphics.Typeface;
-import android.text.Layout;
-import android.text.SpannableStringBuilder;
-import android.text.Spanned;
-import android.text.style.BackgroundColorSpan;
-import android.text.style.RelativeSizeSpan;
-import android.text.style.StyleSpan;
-import android.text.style.SuperscriptSpan;
-import android.text.style.UnderlineSpan;
-import android.util.TypedValue;
+import android.graphics.Bitmap;
+import android.graphics.Canvas;
+import android.graphics.ColorMatrix;
+import android.graphics.ColorMatrixColorFilter;
+import android.graphics.Paint;
+import android.graphics.Rect;
+import android.graphics.RectF;
+import android.util.LruCache;
 import android.view.GestureDetector;
 import android.view.MotionEvent;
 import android.view.ScaleGestureDetector;
@@ -18,55 +16,71 @@ import android.view.View;
 import android.view.ViewGroup;
 import android.widget.AbsListView;
 import android.widget.BaseAdapter;
-import android.widget.LinearLayout;
 import android.widget.ListView;
-import android.widget.TextView;
-import java.util.LinkedHashMap;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Map;
+import java.util.Set;
+import java.util.TreeSet;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 /**
- * The text view of a book: the same words as the PDF, set to the screen width at any size you pinch to, so zooming in makes the text bigger
- * and it still fits (nothing runs off the side). One row per PDF page, in reading order, with the spoken sentence highlighted and followed.
- * Built from the BookIndex (word boxes tell where lines and paragraphs break) and the printed words saved by BookText.
+ * The zoomed book. Zooming does not change how anything looks: every word is cut out of the PDF's own rendering (same font, weight, colour, italics,
+ * footnote numbers, headings) and only its size and place change, so the text gets bigger and wraps to the next line when it no longer fits
+ * (see WordFlow). One row per PDF page, in reading order. The page is rendered in horizontal bands at exactly the size on screen, so the words are
+ * sharp at any zoom. The spoken sentence and word are drawn over the words.
  */
 class ReflowView extends ListView {
-    static final float MIN_SP = 13, MAX_SP = 46;
+    static final float MIN_Z = 1.0f, MAX_Z = 3.4f;
+    private static final int BAND = 512, OVERLAP = 192;
 
     interface Host {
         void onTap();
         void onPage(int page);
         void onUserScroll();
-        /** The pinch went below the smallest size: go back to the page. */
+        /** The pinch went below the original size: go back to the page. */
         void onPinchOut();
-    }
-
-    private static class PageText {
-        SpannableStringBuilder sb;
-        int[] ws, we;               // char range of every word of the page
+        /** Renders a part of a page at {@code sc} pixels per page width: rectangle (x, y, w, h) in those pixels. Background thread. */
+        Bitmap renderBand(int page, float sc, int x, int y, int w, int h);
+        /** Page height / page width. */
+        float aspect(int page);
     }
 
     private final BookIndex bi;
-    private final BookText.Disp d;
+    private final String[] tok;       // printed words, may be null (then no hyphen joining)
     private final Host host;
     private final ScaleGestureDetector sgd;
     private final GestureDetector gd;
-    private final Map<Integer, PageText> cache = new LinkedHashMap<Integer, PageText>(16, 0.75f, true) {
-        @Override protected boolean removeEldestEntry(Entry<Integer, PageText> e) { return size() > 14; }
-    };
-    private float sizeSp = 20;
-    private int ink = 0xFF222222, paper = 0xFFF4ECD8, hlColor = 0x70F2B93B;
+    private float zoom = 1.6f;
+    private boolean pinching;
+    private float bookTw = 0.8f;      // width of the body text as a fraction of the page: the zoom is relative to "the text fills the line"
+    private int theme;
     private int hlFrom = -1, hlTo = -1, hlStyle, hlWord = -1;
     private int lastPage = -1;
+    private final Paint bmpP = new Paint(Paint.FILTER_BITMAP_FLAG), bandP = new Paint(Paint.ANTI_ALIAS_FLAG), lblP = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final BaseAdapter adapter;
+    private final LruCache<Integer, WordFlow.Flow> flows = new LruCache<>(10);
+    private final LruCache<Long, Bitmap> bands = new LruCache<Long, Bitmap>(96 * 1024) {
+        @Override protected int sizeOf(Long k, Bitmap b) { return b.getByteCount() / 1024; }
+    };
+    private final Map<Integer, TreeSet<Integer>> scalesOf = new HashMap<>();   // page -> source scales that have bands
+    private final Set<Long> pending = new HashSet<>();
+    private final ExecutorService exec = Executors.newSingleThreadExecutor();
+    private final float density;
 
-    ReflowView(Context c, BookIndex bi, BookText.Disp d, Host host) {
+    ReflowView(Context c, BookIndex bi, String[] tok, Host host) {
         super(c);
-        this.bi = bi; this.d = d; this.host = host;
+        this.bi = bi; this.tok = tok; this.host = host;
+        density = getResources().getDisplayMetrics().density;
         setDivider(null);
         setVerticalScrollBarEnabled(false);
         setOverScrollMode(OVER_SCROLL_NEVER);
         setSelector(android.R.color.transparent);
         setCacheColorHint(0);
+        lblP.setTextAlign(Paint.Align.CENTER);
+        lblP.setTextSize(11 * density);
+        bookTw = measureBookWidth();
         adapter = new BaseAdapter() {
             @Override public int getCount() { return ReflowView.this.bi.pages; }
             @Override public Object getItem(int i) { return null; }
@@ -74,43 +88,16 @@ class ReflowView extends ListView {
             @Override public boolean areAllItemsEnabled() { return false; }
             @Override public boolean isEnabled(int i) { return false; }
             @Override public View getView(int p, View v, ViewGroup parent) {
-                LinearLayout row; TextView lbl, body;
-                if (v == null) {
-                    row = new LinearLayout(getContext());
-                    row.setOrientation(LinearLayout.VERTICAL);
-                    lbl = new TextView(getContext()); lbl.setGravity(android.view.Gravity.CENTER); lbl.setTypeface(Typeface.SERIF);
-                    body = new TextView(getContext()); body.setTypeface(Typeface.SERIF); body.setHyphenationFrequency(android.text.Layout.HYPHENATION_FREQUENCY_NORMAL);
-                    body.setJustificationMode(0);
-                    row.addView(lbl, new LinearLayout.LayoutParams(-1, -2));
-                    row.addView(body, new LinearLayout.LayoutParams(-1, -2));
-                    v = row;
-                }
-                row = (LinearLayout) v;
-                lbl = (TextView) row.getChildAt(0); body = (TextView) row.getChildAt(1);
-                int pad = dp(20);
-                row.setPadding(pad, dp(6), pad, dp(10));
-                lbl.setTextSize(TypedValue.COMPLEX_UNIT_SP, Math.max(11, sizeSp * 0.55f));
-                lbl.setTextColor((ink & 0x00FFFFFF) | 0x88000000);
-                lbl.setText("— " + (p + 1) + " —");
-                lbl.setPadding(0, dp(14), 0, dp(6));
-                body.setTextSize(TypedValue.COMPLEX_UNIT_SP, sizeSp);
-                body.setLineSpacing(0, 1.38f);
-                body.setTextColor(ink);
-                PageText pt = page(p);
-                marks(pt.sb, pt, p);
-                body.setText(pt.sb, TextView.BufferType.SPANNABLE);
-                return v;
+                PageRow r = v instanceof PageRow ? (PageRow) v : new PageRow(getContext());
+                r.bind(p);
+                return r;
             }
         };
         setAdapter(adapter);
         sgd = new ScaleGestureDetector(c, new ScaleGestureDetector.SimpleOnScaleGestureListener() {
-            private float acc = 1;
-            @Override public boolean onScaleBegin(ScaleGestureDetector d) { acc = 1; return true; }
-            @Override public boolean onScale(ScaleGestureDetector d) {
-                acc *= d.getScaleFactor();
-                if (acc > 1.02f || acc < 0.98f) { if (scaleBy(acc)) host.onPinchOut(); acc = 1; }
-                return true;
-            }
+            @Override public boolean onScaleBegin(ScaleGestureDetector d) { pinching = true; return true; }
+            @Override public boolean onScale(ScaleGestureDetector d) { if (scaleBy(d.getScaleFactor())) host.onPinchOut(); return true; }
+            @Override public void onScaleEnd(ScaleGestureDetector d) { endPinch(); }
         });
         gd = new GestureDetector(c, new GestureDetector.SimpleOnGestureListener() {
             @Override public boolean onSingleTapConfirmed(MotionEvent e) { host.onTap(); return true; }
@@ -124,8 +111,25 @@ class ReflowView extends ListView {
         });
     }
 
-    private int dp(float v) { return (int) (v * getResources().getDisplayMetrics().density + 0.5f); }
+    private int dp(float v) { return (int) (v * density + 0.5f); }
 
+    /** The body text width of the book (median over a sample of pages), so the zoom means the same on every page. */
+    private float measureBookWidth() {
+        java.util.ArrayList<Float> w = new java.util.ArrayList<>();
+        int step = Math.max(1, bi.pages / 24);
+        float asp = host.aspect(0);
+        for (int p = 0; p < bi.pages; p += step) {
+            int a = bi.pageStart[p], b = bi.pageStart[p + 1];
+            if (b - a < 60) continue;
+            float[] e = WordFlow.extent(bi.box, a, b, asp);
+            w.add(e[1] - e[0]);
+        }
+        if (w.isEmpty()) return 0.8f;
+        java.util.Collections.sort(w);
+        return Math.max(0.3f, Math.min(1f, w.get(w.size() / 2)));
+    }
+
+    // ---------- zoom ----------
     @Override public boolean onTouchEvent(MotionEvent e) {
         sgd.onTouchEvent(e);
         gd.onTouchEvent(e);
@@ -133,160 +137,133 @@ class ReflowView extends ListView {
         return super.onTouchEvent(e);
     }
 
-    /** Called by whoever owns the pinch (also the page view hands its running gesture over). True = smaller than the smallest size: leave. */
+    float zoom() { return zoom; }
+
+    /** A pinch step (also fed by the page view's running gesture). True = smaller than the original size: leave. */
     boolean scaleBy(float f) {
-        float ns = sizeSp * f;
-        if (ns < MIN_SP) return f < 1;
-        setSize(Math.min(MAX_SP, ns));
+        pinching = true;
+        float nz = zoom * f;
+        if (nz < MIN_Z) { if (f < 1) return true; nz = MIN_Z; }
+        setZoom(Math.min(MAX_Z, nz));
         return false;
     }
 
-    float size() { return sizeSp; }
+    void endPinch() {
+        pinching = false;
+        invalidateRows();   // now the bands are fetched at the exact size
+    }
 
-    void setSize(float sp) {
-        if (Math.abs(sp - sizeSp) < 0.15f) return;
-        sizeSp = sp;
+    void setZoom(float z) {
+        if (Math.abs(z - zoom) < 0.004f) return;
+        float ratio = z / zoom;
+        zoom = z;
+        flows.evictAll();
         int pos = getFirstVisiblePosition();
         View c0 = getChildAt(0);
         int top = c0 == null ? 0 : c0.getTop();
         adapter.notifyDataSetChanged();
-        setSelectionFromTop(pos, top);
+        setSelectionFromTop(pos, (int) (top * ratio));
     }
 
-    void setColors(int ink, int paper, int hl) {
-        this.ink = ink; this.paper = paper; this.hlColor = hl;
+    void setColors(int ink, int paper, int theme) {
+        this.theme = theme;
+        // the reader's own colour filter: white -> paper, black -> ink
+        float[] pr = {android.graphics.Color.red(paper), android.graphics.Color.green(paper), android.graphics.Color.blue(paper)};
+        float[] ik = {android.graphics.Color.red(ink), android.graphics.Color.green(ink), android.graphics.Color.blue(ink)};
+        bmpP.setColorFilter(new ColorMatrixColorFilter(new ColorMatrix(new float[]{
+                (pr[0] - ik[0]) / 255f, 0, 0, 0, ik[0],
+                0, (pr[1] - ik[1]) / 255f, 0, 0, ik[1],
+                0, 0, (pr[2] - ik[2]) / 255f, 0, ik[2],
+                0, 0, 0, 1, 0})));
+        lblP.setColor((ink & 0x00FFFFFF) | 0x66000000);
         setBackgroundColor(paper);
-        adapter.notifyDataSetChanged();
+        invalidateRows();
     }
+
+    private void invalidateRows() { for (int i = 0; i < getChildCount(); i++) getChildAt(i).invalidate(); }
 
     int pageAtTop() {
         int p = pointToPosition(getWidth() / 2, getHeight() / 3);
         return p == INVALID_POSITION ? Math.max(0, getFirstVisiblePosition()) : p;
     }
 
-    void showPage(int p) { setSelectionFromTop(Math.max(0, Math.min(bi.pages - 1, p)), dp(64)); }
+    void showPage(int p) { setSelectionFromTop(Math.max(0, Math.min(bi.pages - 1, p)), 0); }
 
-    // ---------- text of a page ----------
-    /**
-     * One page as running text. What the PDF tells us: where every printed line sits (the word boxes), the font size and bold/italic of every
-     * word. So: headings (bigger or bold short lines) stand alone, footnote numbers (much smaller than the text) stay raised and glued to their
-     * word and never start a new line or paragraph, italics stay italic, lines of one paragraph run together, a word broken by a hyphen at the
-     * end of a line is joined.
-     */
-    private PageText page(int p) {
-        PageText pt = cache.get(p);
-        if (pt != null) return pt;
-        pt = new PageText();
+    // ---------- layout of a page ----------
+    private float lineWidth() { int w = getWidth() > 0 ? getWidth() : getResources().getDisplayMetrics().widthPixels; return w - 2 * dp(12); }
+
+    private WordFlow.Flow flow(int p) {
+        WordFlow.Flow f = flows.get(p);
+        if (f != null) return f;
         int a = bi.pageStart[p], b = bi.pageStart[p + 1];
-        int n = Math.max(0, b - a);
-        pt.ws = new int[n]; pt.we = new int[n];
-        // the size most words have = the body text of this page
-        java.util.HashMap<Integer, Integer> cnt = new java.util.HashMap<>();
-        int dom = 0, best = 0;
-        for (int j = a; j < b; j++) if (!d.tok[j].isEmpty()) { int h = d.half[j]; int c = cnt.merge(h, 1, Integer::sum); if (c > best) { best = c; dom = h; } }
-        if (dom <= 0) dom = 20;
-        float minX = 1, maxX = 0;
-        for (int j = a; j < b; j++) if (!d.tok[j].isEmpty() && d.half[j] >= dom * 0.9f) { minX = Math.min(minX, bi.box[4 * j]); maxX = Math.max(maxX, bi.box[4 * j + 2]); }
-        StringBuilder sb = new StringBuilder();
-        java.util.ArrayList<int[]> spans = new java.util.ArrayList<>();   // {kind, from, to, sizeHalf}: 0 bold, 1 italic, 2 superscript, 3 heading size
-        float prevY0 = -1, prevY1 = 0, prevH = 0.01f, prevX1 = 0;
-        boolean prevEnd = true, prevHead = false; String prevTok = "";
-        for (int j = a; j < b; j++) {
-            String t = d.tok[j];
-            int k = j - a;
-            if (t.isEmpty()) {   // the second piece of one printed token shares its range
-                pt.ws[k] = k > 0 ? pt.ws[k - 1] : sb.length(); pt.we[k] = k > 0 ? pt.we[k - 1] : sb.length();
-                continue;
-            }
-            int half = d.half[j], bits = d.bits[j];
-            boolean sup = half > 0 && half <= dom * 0.78f && sb.length() > 0 && t.length() <= 12;
-            boolean head = half >= dom * 1.18f || ((bits & 1) != 0 && half >= dom * 0.95f && lineIsShort(j, a, b, dom, maxX));
-            float x0 = bi.box[4 * j], y0 = bi.box[4 * j + 1], y1 = bi.box[4 * j + 3];
-            float h = Math.max(0.004f, y1 - y0);
-            boolean newLine = !sup && prevY0 >= 0 && y0 > prevY0 + 0.5f * prevH;
-            if (sup) {
-                // a footnote number: raised, glued to the word before it
-            } else if (newLine) {
-                boolean shortLine = prevX1 < maxX - 0.12f;
-                boolean veryShort = prevX1 < maxX - 0.3f;
-                boolean para = head != prevHead || head || veryShort || (shortLine && prevEnd) || (prevEnd && (x0 > minX + 0.02f || y0 - prevY1 > 0.45f * h));
-                if (para) sb.append("\n\n");
-                else if (prevTok.endsWith("-") && !prevTok.endsWith("--") && Character.isLowerCase(t.charAt(0))) { /* a word broken at the line end: join */ }
-                else sb.append(' ');
-            } else if (sb.length() > 0) sb.append(' ');
-            pt.ws[k] = sb.length(); sb.append(t); pt.we[k] = sb.length();
-            if (sup) spans.add(new int[]{2, pt.ws[k], pt.we[k], half});
-            else {
-                if ((bits & 1) != 0) spans.add(new int[]{0, pt.ws[k], pt.we[k], half});
-                if ((bits & 2) != 0) spans.add(new int[]{1, pt.ws[k], pt.we[k], half});
-                if (head && half > dom) spans.add(new int[]{3, pt.ws[k], pt.we[k], half * 100 / dom});
-                prevY0 = (prevY0 < 0 || newLine) ? y0 : prevY0; prevY1 = y1; prevH = h; prevX1 = bi.box[4 * j + 2];
-                prevEnd = (bi.flag[j] & 1) != 0; prevTok = t; prevHead = head;
-            }
-        }
-        pt.sb = new SpannableStringBuilder(sb);
-        for (int[] sp : spans) {
-            Object o = sp[0] == 0 ? new StyleSpan(Typeface.BOLD) : sp[0] == 1 ? new StyleSpan(Typeface.ITALIC) : null;
-            if (o != null) pt.sb.setSpan(o, sp[1], sp[2], Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
-            else if (sp[0] == 2) { pt.sb.setSpan(new SuperscriptSpan(), sp[1], sp[2], Spanned.SPAN_EXCLUSIVE_EXCLUSIVE); pt.sb.setSpan(new RelativeSizeSpan(0.7f), sp[1], sp[2], Spanned.SPAN_EXCLUSIVE_EXCLUSIVE); }
-            else pt.sb.setSpan(new RelativeSizeSpan(Math.min(1.6f, sp[3] / 100f)), sp[1], sp[2], Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
-        }
-        cache.put(p, pt);
-        return pt;
+        float lw = lineWidth();
+        f = WordFlow.layout(bi.box, tok, bi.flag, a, b, host.aspect(p), lw, lw / bookTw * zoom, dp(12));
+        flows.put(p, f);
+        return f;
     }
 
-    /** True if the printed line holding word j ends well before the right edge (so a bold line is a heading, not a bold phrase inside text). */
-    private boolean lineIsShort(int j, int a, int b, int dom, float maxX) {
-        float y = bi.box[4 * j + 1];
-        float right = 0;
-        for (int q = j; q < b && Math.abs(bi.box[4 * q + 1] - y) < 0.004f; q++) right = Math.max(right, bi.box[4 * q + 2]);
-        for (int q = j - 1; q >= a && Math.abs(bi.box[4 * q + 1] - y) < 0.004f; q--) right = Math.max(right, bi.box[4 * q + 2]);
-        return right < maxX - 0.1f;
+    /** The scale bands are rendered at: the exact one, or while pinching a coarse step (so a pinch does not render a new set every frame). */
+    private int srcScale(float sc) {
+        if (!pinching) return Math.max(64, Math.round(sc));
+        double step = Math.log(1.1);
+        return (int) Math.round(Math.exp(Math.round(Math.log(sc) / step) * step));
+    }
+
+    private static long key(int page, int sc, int band) { return ((long) page << 40) | ((long) sc << 16) | band; }
+
+    private int bandX0(WordFlow.Flow f, int sc) { return Math.max(0, Math.round((f.wholePage ? 0 : f.minX - 0.01f) * sc)); }
+
+    /** The bitmap holding band {@code band} of the page at scale sc, or null (and a request is queued). */
+    private Bitmap band(WordFlow.Flow f, int page, int sc, int band) {
+        long k = key(page, sc, band);
+        Bitmap bm = bands.get(k);
+        if (bm != null) return bm;
+        synchronized (pending) { if (!pending.add(k)) return null; }
+        final float asp = host.aspect(page);
+        final int x0 = bandX0(f, sc);
+        final int x1 = Math.min(sc, Math.round((f.wholePage ? 1 : f.maxX + 0.01f) * sc));
+        final int pageH = Math.max(1, Math.round(asp * sc));
+        final int y0 = f.wholePage ? 0 : band * BAND;
+        final int h = f.wholePage ? pageH : Math.min(pageH - y0, BAND + OVERLAP);
+        if (h <= 0 || x1 <= x0) { synchronized (pending) { pending.remove(k); } return null; }
+        exec.submit(() -> {
+            try {
+                Bitmap nb = host.renderBand(page, sc, x0, y0, x1 - x0, h);
+                if (nb != null) {
+                    post(() -> {
+                        bands.put(k, nb);
+                        TreeSet<Integer> ts = scalesOf.get(page);
+                        if (ts == null) { ts = new TreeSet<>(); scalesOf.put(page, ts); }
+                        ts.add(sc);
+                        synchronized (pending) { pending.remove(k); }
+                        invalidateRows();
+                    });
+                    return;
+                }
+            } catch (Throwable ignored) {}
+            synchronized (pending) { pending.remove(k); }
+        });
+        return null;
+    }
+
+    /** Any band that already covers this source row, from another scale: used while the exact one is being rendered (blurry for a moment, never blank). */
+    private Bitmap fallback(WordFlow.Flow f, int page, int wantSc, float srcTopUnits, int[] out) {
+        TreeSet<Integer> ts = scalesOf.get(page);
+        if (ts == null) return null;
+        Bitmap best = null; int bestD = Integer.MAX_VALUE;
+        for (int s2 : ts) {
+            int band2 = f.wholePage ? 0 : Math.max(0, (int) (srcTopUnits * s2) / BAND);
+            Bitmap b2 = bands.get(key(page, s2, band2));
+            if (b2 != null && Math.abs(s2 - wantSc) < bestD) { best = b2; bestD = Math.abs(s2 - wantSc); out[0] = s2; out[1] = band2; }
+        }
+        return best;
     }
 
     // ---------- the spoken sentence and word ----------
-    /** The sentence being read (band) and the word being read inside it (stronger band). word < 0: sentence only. */
     void setHighlight(int from, int to, int style, int word) {
         if (from == hlFrom && to == hlTo && style == hlStyle && word == hlWord) return;
-        int of = hlFrom, ot = hlTo, ow = hlWord;
         hlFrom = from; hlTo = to; hlStyle = style; hlWord = word;
-        refreshRange(of, ot);
-        if (ow >= 0 && (ow < of || ow > ot)) refreshRange(ow, ow);
-        refreshRange(from, to);
-    }
-
-    private void refreshRange(int from, int to) {
-        if (from < 0) return;
-        int p0 = bi.pageOf(from), p1 = bi.pageOf(Math.max(from, to));
-        int first = getFirstVisiblePosition();
-        for (int p = p0; p <= p1; p++) {
-            View v = getChildAt(p - first);
-            if (v == null || p < first || p > getLastVisiblePosition()) continue;
-            TextView body = (TextView) ((LinearLayout) v).getChildAt(1);
-            CharSequence cs = body.getText();
-            if (cs instanceof android.text.Spannable) { marks((android.text.Spannable) cs, page(p), p); body.invalidate(); }   // spans only: no new layout, so this is cheap enough to run several times a second
-        }
-    }
-
-    /** Puts the sentence band and the word marker on a page text (removing the old ones). */
-    private void marks(android.text.Spannable t, PageText pt, int p) {
-        for (BackgroundColorSpan x : t.getSpans(0, t.length(), BackgroundColorSpan.class)) t.removeSpan(x);
-        for (UnderlineSpan x : t.getSpans(0, t.length(), UnderlineSpan.class)) t.removeSpan(x);
-        if (hlFrom < 0) return;
-        int a = bi.pageStart[p], b = bi.pageStart[p + 1];
-        int lo = Math.max(hlFrom, a), hi = Math.min(hlTo, b - 1);
-        if (lo > hi || hi - a >= pt.we.length) return;
-        int s = pt.ws[lo - a], e = pt.we[hi - a];
-        if (e <= s || e > t.length()) return;
-        // sentence: a tinted band (underline style: lighter band plus the underline, visible on any theme)
-        int tint = hlStyle == 1 ? ((hlColor & 0x00FFFFFF) | 0x40000000) : hlColor;
-        t.setSpan(new BackgroundColorSpan(tint), s, e, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
-        if (hlStyle == 1) t.setSpan(new UnderlineSpan(), s, e, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
-        // the word being spoken, stronger
-        if (hlWord >= lo && hlWord <= hi) {
-            int ws = pt.ws[hlWord - a], we = pt.we[hlWord - a];
-            if (we > ws && we <= t.length()) t.setSpan(new BackgroundColorSpan((hlColor & 0x00FFFFFF) | 0xB0000000), ws, we, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
-        }
+        invalidateRows();
     }
 
     /** Keeps the word being read on screen (not at the very top or bottom). */
@@ -296,15 +273,92 @@ class ReflowView extends ListView {
         int first = getFirstVisiblePosition(), last = getLastVisiblePosition();
         if (p < first || p > last) { showPage(p); return; }
         View row = getChildAt(p - first);
-        if (row == null) return;
-        TextView body = (TextView) ((LinearLayout) row).getChildAt(1);
-        Layout lay = body.getLayout();
-        PageText pt = page(p);
-        int k = word - bi.pageStart[p];
-        if (lay == null || k < 0 || k >= pt.ws.length) return;
-        int line = lay.getLineForOffset(Math.min(pt.ws[k], Math.max(0, body.getText().length() - 1)));
-        int y = row.getTop() + body.getTop() + lay.getLineTop(line);
+        if (!(row instanceof PageRow)) return;
+        float y = ((PageRow) row).yOfWord(word);
+        if (y < 0) return;
         int h = getHeight();
-        if (y < h * 0.15f || y > h * 0.62f) smoothScrollBy((int) (y - h * 0.3f), 400);
+        float yy = row.getTop() + y;
+        if (yy < h * 0.15f || yy > h * 0.62f) smoothScrollBy((int) (yy - h * 0.3f), 400);
+    }
+
+    // ---------- one page ----------
+    private class PageRow extends View {
+        int page = -1;
+        WordFlow.Flow f;
+        final int topPad = dp(22);
+        final RectF dst = new RectF();
+        final Rect srcR = new Rect();
+
+        PageRow(Context c) { super(c); }
+
+        void bind(int p) { page = p; f = flow(p); requestLayout(); invalidate(); }
+
+        @Override protected void onMeasure(int wms, int hms) {
+            int w = MeasureSpec.getSize(wms);
+            setMeasuredDimension(w, f == null ? topPad : (int) Math.ceil(f.height) + topPad + dp(8));
+        }
+
+        /** y of a word's line inside this row (for scrolling), or -1. */
+        float yOfWord(int word) {
+            if (f == null) return -1;
+            int k = word - f.a;
+            if (k < 0 || k >= f.itemOfWord.length) return -1;
+            return topPad + f.y[f.itemOfWord[k]];
+        }
+
+        @Override protected void onDraw(Canvas c) {
+            if (f == null) return;
+            c.drawText("— " + (page + 1) + " —", getWidth() / 2f, topPad * 0.72f, lblP);
+            Rect clip = c.getClipBounds();
+            int sc = f.wholePage ? Math.max(64, Math.round(f.scale)) : srcScale(f.scale);
+            int[] fb = new int[2];
+            for (int i = 0; i < f.n; i++) {
+                float dy = topPad + f.y[i];
+                if (dy + f.h[i] < clip.top - 2 || dy > clip.bottom + 2) continue;
+                float topU = Math.max(0, f.sy0[i]);
+                int band = f.wholePage ? 0 : (int) (topU * sc) / BAND;
+                Bitmap bm = band(f, page, sc, band);
+                int useSc = sc, useBand = band;
+                if (bm == null) { bm = fallback(f, page, sc, topU, fb); if (bm != null) { useSc = fb[0]; useBand = fb[1]; } }
+                if (bm == null) continue;
+                if (f.wholePage) { dst.set(f.x[i], dy, f.x[i] + f.w[i], dy + f.h[i]); c.drawBitmap(bm, null, dst, bmpP); continue; }
+                int bx0 = bandX0(f, useSc), by0 = useBand * BAND;
+                float k = f.w[i] / Math.max(1f, (f.sx1[i] - f.sx0[i]) * useSc);      // destination pixels per source pixel (1 at the exact scale)
+                int l = Math.round(f.sx0[i] * useSc) - bx0 - 1, r = Math.round(f.sx1[i] * useSc) - bx0 + 1;
+                int t = Math.round(f.sy0[i] * useSc) - by0, b = Math.round(f.sy1[i] * useSc) - by0;
+                srcR.set(Math.max(0, l), Math.max(0, t), Math.min(bm.getWidth(), r), Math.min(bm.getHeight(), b));
+                if (srcR.width() <= 0 || srcR.height() <= 0) continue;
+                // the destination follows the source clipping so nothing stretches
+                dst.set(f.x[i] + (srcR.left - (l + 1)) * k, dy + (srcR.top - t) * k, f.x[i] + (srcR.right - (l + 1)) * k, dy + (srcR.bottom - t) * k);
+                c.drawBitmap(bm, srcR, dst, bmpP);
+            }
+            drawHighlight(c);
+        }
+
+        private void drawHighlight(Canvas c) {
+            if (hlFrom < 0 || f.wholePage) return;
+            int a = f.a, b = a + f.itemOfWord.length;
+            int lo = Math.max(hlFrom, a), hi = Math.min(hlTo, b - 1);
+            if (lo > hi) return;
+            boolean dark = theme == 3;
+            int itemLo = f.itemOfWord[lo - a], itemHi = f.itemOfWord[hi - a];
+            bandP.setColor(hlStyle == 1 ? (dark ? 0xFFFFD54F : 0xFFD9822B) : (dark ? 0x55FFD54F : 0x70F2B93B));
+            float pad = dp(1.5f);
+            int i = itemLo;
+            while (i <= itemHi) {   // the sentence: one band per printed line (neighbouring words are merged)
+                float yTop = topPad + f.y[i] + 0.2f * f.h[i], yBot = topPad + f.y[i] + 0.96f * f.h[i];
+                float x0 = f.x[i], x1 = f.x[i] + f.w[i];
+                int j = i + 1;
+                while (j <= itemHi && Math.abs(f.y[j] - f.y[i]) < 0.35f * f.h[i]) { x1 = Math.max(x1, f.x[j] + f.w[j]); yTop = Math.min(yTop, topPad + f.y[j] + 0.2f * f.h[j]); j++; }
+                if (hlStyle == 1) c.drawRoundRect(x0 - pad, yBot - dp(2.2f), x1 + pad, yBot, dp(1.1f), dp(1.1f), bandP);
+                else c.drawRoundRect(x0 - pad, yTop - pad, x1 + pad, yBot + pad, dp(3), dp(3), bandP);
+                i = j;
+            }
+            if (hlWord >= lo && hlWord <= hi) {   // the word being spoken: a filled box in both styles
+                int w = f.itemOfWord[hlWord - a];
+                bandP.setColor(((dark ? 0xFFFFD54F : 0xFFD9822B) & 0x00FFFFFF) | 0xB0000000);
+                c.drawRoundRect(f.x[w] - pad, topPad + f.y[w] + 0.2f * f.h[w] - pad, f.x[w] + f.w[w] + pad, topPad + f.y[w] + 0.96f * f.h[w] + pad, dp(3), dp(3), bandP);
+            }
+        }
     }
 }
