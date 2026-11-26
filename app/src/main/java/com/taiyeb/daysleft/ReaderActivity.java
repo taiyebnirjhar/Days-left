@@ -48,6 +48,10 @@ public class ReaderActivity extends Activity {
     FrameLayout playBtn;
     TextView audioBtn;
     boolean chrome = true, finishedToastShown;
+    // text view (reflow): pinch out and the text is set to the screen width at a bigger size instead of overflowing the page
+    ReflowView rf;
+    boolean rfActive, rfBuilding;
+    String[] disp;                  // printed words of the book, null until saved (books read before v3.39 are rebuilt on the first pinch)
     boolean locked;                 // touch lock (like VLC): the screen ignores touches until the padlock is tapped
     Glyph lockBtn, unlockBtn;       // padlock in the top bar; the one that appears after a tap while locked
     final Runnable hideUnlock = () -> { if (unlockBtn != null) unlockBtn.setVisibility(View.GONE); };
@@ -173,6 +177,67 @@ public class ReaderActivity extends Activity {
         return true;
     }
 
+    // ====================== text view ======================
+    /** Pinch-out hands over to the text view when the printed words are available. False = keep the normal page zoom. */
+    boolean tryEnterReflow() {
+        if (bi == null || !fileMode) return false;
+        if (disp == null) {
+            if (!rfBuilding) {
+                rfBuilding = true;
+                Toast.makeText(this, "Preparing the text view (about 15 s). Pinch again when it says ready.", Toast.LENGTH_LONG).show();
+                final int id = item.id;
+                new Thread(() -> {
+                    try {
+                        BookIndex nb = BookText.extract(this, item, pc -> {}, new boolean[1]);
+                        String[] dw = BookText.display(this, id, nb.count());
+                        if (dw != null && bi != null && nb.count() == bi.count()) { disp = dw; ui(() -> Toast.makeText(this, "Text view ready: pinch out to zoom the text.", Toast.LENGTH_LONG).show()); }
+                        else ui(() -> Toast.makeText(this, "Could not prepare the text view for this PDF.", Toast.LENGTH_LONG).show());
+                    } catch (Exception e) { Dbg.e("Reader", "text view prepare failed", e); ui(() -> Toast.makeText(this, "Could not prepare the text view for this PDF.", Toast.LENGTH_LONG).show()); }
+                    finally { rfBuilding = false; }
+                }, "text-view").start();
+            }
+            return false;
+        }
+        return true;
+    }
+
+    int hlColor() { return hlStyle == 1 ? (theme == 3 ? 0xFFFFD54F : 0xFFD9822B) : (theme == 3 ? 0x55FFD54F : 0x70F2B93B); }
+
+    void enterReflow() {
+        if (rf == null) {
+            rf = new ReflowView(this, bi, disp, new ReflowView.Host() {
+                @Override public void onTap() { if (settings.getVisibility() == View.VISIBLE) settings.setVisibility(View.GONE); else showChrome(!chrome); }
+                @Override public void onPage(int p) {
+                    if (p == cur || p < 0 || p >= n) return;
+                    cur = p; updateLabel(cur); if (seek != null) seek.setProgress(cur);
+                    h.removeCallbacks(saver); h.postDelayed(saver, 700);
+                }
+                @Override public void onUserScroll() { lastManual = System.currentTimeMillis(); if (chrome) showChrome(false); }
+                @Override public void onPinchOut() { exitReflow(); }
+            });
+            rf.setSize(Store.num(this, "rdRfSize", 20));
+            root.addView(rf, 1, new FrameLayout.LayoutParams(-1, -1));
+        }
+        rf.setColors(INK[theme], PAPER[theme], hlColor());
+        rf.setVisibility(View.VISIBLE);
+        rfActive = true;
+        showChrome(false);
+        int p = hlFrom >= 0 ? bi.pageOf(hlFrom) : cur;
+        rf.showPage(p);
+        rf.setHighlight(hlOn ? hlFrom : -1, hlOn ? hlTo : -1, hlStyle);
+        if (hlFrom >= 0 && hlOn) rf.post(() -> rf.follow(hlFrom));
+    }
+
+    void exitReflow() {
+        if (!rfActive) return;
+        Store.setNum(this, "rdRfSize", Math.round(rf.size()));
+        rfActive = false;
+        int p = rf.pageAtTop();
+        rf.setVisibility(View.GONE);
+        if (pv != null) pv.noReflow = true;
+        goTo(p, false);
+    }
+
     void setLocked(boolean on) {
         locked = on;
         h.removeCallbacks(hideUnlock);
@@ -189,6 +254,7 @@ public class ReaderActivity extends Activity {
     }
 
     @Override public void onBackPressed() {
+        if (rfActive && !locked) { exitReflow(); return; }
         if (locked) { unlockBtn.setVisibility(View.VISIBLE); h.removeCallbacks(hideUnlock); h.postDelayed(hideUnlock, 3000); return; }
         if (settings != null && settings.getVisibility() == View.VISIBLE) { settings.setVisibility(View.GONE); return; }
         super.onBackPressed();
@@ -286,6 +352,7 @@ public class ReaderActivity extends Activity {
         for (int k = -1; k <= 2; k++) ensure(cur + k);
         ensure(cur);
         if (pv != null) { pv.resetZoom(); pv.invalidate(); }
+        if (rfActive && rf != null && rf.pageAtTop() != cur) rf.showPage(cur);
         updateLabel(cur);
         if (seek != null) seek.setProgress(cur);
         h.removeCallbacks(saver);
@@ -454,7 +521,10 @@ public class ReaderActivity extends Activity {
                 hlFrom = hlTo = -1;   // better no highlight than a wrong one: the probes around here are too far apart (yet)
                 if (pv != null) pv.invalidate();
             }
-            if (fw >= 0 && followOn && st == 1 && now - lastManual > 5000 && pv != null && !pv.dragging && pv.zoom <= 1.01f && settings.getVisibility() != View.VISIBLE) {
+            if (rfActive && rf != null) {
+                rf.setHighlight(hlOn ? hlFrom : -1, hlOn ? hlTo : -1, hlStyle);
+                if (hw >= 0 && followOn && st == 1 && now - lastManual > 5000 && settings.getVisibility() != View.VISIBLE) rf.follow(hw);
+            } else if (fw >= 0 && followOn && st == 1 && now - lastManual > 5000 && pv != null && !pv.dragging && pv.zoom <= 1.01f && settings.getVisibility() != View.VISIBLE) {
                 int pg = bi.pageOf(fw);
                 if (pg != cur) goTo(pg, false);
             }
@@ -668,9 +738,10 @@ public class ReaderActivity extends Activity {
                 BookIndex b = BookText.ready(this, id) ? BookText.index(this, id) : null;
                 long tl = Dbg.now();
                 Alignment a = Alignment.load(BookText.alignFile(this, id)).withBook(b);
+                final String[] dw = b == null ? null : BookText.display(this, id, b.count());
                 Dbg.p("Reader", "sync data loaded", tl, "book words " + (b == null ? "none" : b.count()) + ", aligned " + a.size() + (SyncService.running ? ", sync running" : ""));
                 ui(() -> {
-                    bi = b; al = a; jumpToAudioPage(); updatePin(); if (pv != null) pv.invalidate();
+                    bi = b; al = a; if (dw != null && disp == null) disp = dw; jumpToAudioPage(); updatePin(); if (pv != null) pv.invalidate();
                     // a sync that was interrupted (app closed by the system, low battery) carries on by itself
                     if (b != null && fileMode && !SyncService.running && SyncService.wanted(this, id) && !SyncService.fullFor(this, id) && Whisper.hasModel(this)) {
                         Dbg.i("Sync", "auto-resuming from the reader (was interrupted, not stopped by the user)");
@@ -1516,7 +1587,7 @@ public class ReaderActivity extends Activity {
             hs.setTextSize(15);
             hs.setTag("txt");
             hs.setPadding(0, dp(14), 0, dp(4));
-            hs.setOnClickListener(v -> { hlStyle = 1 - hlStyle; Store.setNum(this, "rdHlStyle", hlStyle); hs.setText("Highlight style: " + (hlStyle == 0 ? "Marker" : "Underline") + "  ›"); if (pv != null) pv.invalidate(); });
+            hs.setOnClickListener(v -> { hlStyle = 1 - hlStyle; Store.setNum(this, "rdHlStyle", hlStyle); if (rf != null) rf.setColors(INK[theme], PAPER[theme], hlColor()); hs.setText("Highlight style: " + (hlStyle == 0 ? "Marker" : "Underline") + "  ›"); if (pv != null) pv.invalidate(); });
             settings.addView(hs);
             TextView sy = new TextView(this);
             sy.setText("Sync with the book…");
@@ -1580,6 +1651,7 @@ public class ReaderActivity extends Activity {
 
     void skin() {
         int ink = INK[theme], paper = PAPER[theme], desk = DESK[theme];
+        if (rf != null) rf.setColors(ink, paper, hlColor());
         chromeBg = (desk & 0x00FFFFFF) | 0xF2000000;
         top.setBackgroundColor(chromeBg);
         bottom.setBackground(box(chromeBg, 24, 24));
@@ -1733,7 +1805,7 @@ public class ReaderActivity extends Activity {
     class PageView extends View {
         int th;
         float zoom = 1, px, py, dragX;
-        boolean scaling, dragging, flung;
+        boolean scaling, dragging, flung, noReflow;
         ValueAnimator anim;
         final Paint paperP = new Paint(Paint.ANTI_ALIAS_FLAG), bmpP = new Paint(Paint.FILTER_BITMAP_FLAG), shP = new Paint(Paint.ANTI_ALIAS_FLAG),
                 grainP = new Paint(), edgeP = new Paint(), dimP = new Paint(), gutP = new Paint();
@@ -1748,8 +1820,11 @@ public class ReaderActivity extends Activity {
             for (int i = 0; i < 128 * 128 / 5; i++) g.setPixel(r.nextInt(128), r.nextInt(128), Color.argb(8 + r.nextInt(22), 70, 50, 20));
             grainP.setShader(new BitmapShader(g, Shader.TileMode.REPEAT, Shader.TileMode.REPEAT));
             sgd = new ScaleGestureDetector(ReaderActivity.this, new ScaleGestureDetector.SimpleOnScaleGestureListener() {
-                @Override public boolean onScaleBegin(ScaleGestureDetector d) { scaling = true; cancelAnim(); dragX = 0; return true; }
+                @Override public boolean onScaleBegin(ScaleGestureDetector d) { scaling = true; noReflow = false; cancelAnim(); dragX = 0; return true; }
                 @Override public boolean onScale(ScaleGestureDetector d) {
+                    if (rfActive) { if (rf.scaleBy(d.getScaleFactor())) exitReflow(); return true; }   // the running pinch carries on in the text view
+                    if (noReflow) return true;
+                    if (zoom * d.getScaleFactor() > 1.25f && tryEnterReflow()) { enterReflow(); return true; }
                     float nz = Math.max(1f, Math.min(5f, zoom * d.getScaleFactor()));
                     px *= nz / zoom; py *= nz / zoom;
                     zoom = nz;
@@ -1770,6 +1845,7 @@ public class ReaderActivity extends Activity {
                 }
                 @Override public boolean onDoubleTap(MotionEvent e) {
                     if (zoom > 1.05f) resetZoom();
+                    else if (tryEnterReflow()) { enterReflow(); return true; }   // double-tap: the text, bigger, fitted to the screen
                     else {
                         zoom = 2.4f;
                         px = (e.getX() - getWidth() / 2f) * (1 - zoom);

@@ -32,6 +32,7 @@ class BookText {
         final ArrayList<String> words = new ArrayList<>();
         final ArrayList<float[]> boxes = new ArrayList<>();
         final ArrayList<Byte> flags = new ArrayList<>();
+        final ArrayList<String> disp = new ArrayList<>();   // the word as printed (case, punctuation); "" for the 2nd+ piece of one printed token
         float pw = 612, ph = 792;
 
         BoxStripper() throws IOException { super(); }
@@ -61,6 +62,7 @@ class BookText {
                     words.add(ws.get(k));
                     boxes.add(bx);
                     flags.add((byte) (end && k == ws.size() - 1 ? 1 : 0));
+                    disp.add(k == 0 ? tok : "");
                 }
             }
         }
@@ -114,9 +116,32 @@ class BookText {
         for (int j = 0; j < m; j++) { float[] b = st.boxes.get(j); System.arraycopy(b, 0, box, j * 4, 4); fl[j] = st.flags.get(j); }
         BookIndex bi = new BookIndex(w, ps, box, fl);
         boolean scanned = looksScanned(bi);
-        if (!scanned) bi.save(file(c, it.id));
+        if (!scanned) {
+            bi.save(file(c, it.id));
+            try { saveDisplay(c, it.id, st.disp); } catch (Exception e) { Dbg.e("Book", "could not save the display text", e); }
+        }
         Dbg.p("Book", "text read", tx, bi.pages + " pages, " + m + " words" + (scanned ? ", LOOKS SCANNED (too little text)" : ", saved"));
         return bi;
+    }
+
+    static File dispFile(Context c, int itemId) { return new File(c.getFilesDir(), "tx_" + itemId + ".txt"); }
+
+    private static void saveDisplay(Context c, int itemId, List<String> disp) throws IOException {
+        File f = new File(dispFile(c, itemId).getPath() + ".tmp");
+        try (Writer w = new BufferedWriter(new OutputStreamWriter(new FileOutputStream(f), "UTF-8"), 1 << 16)) {
+            for (String t : disp) { w.write(t); w.write('\n'); }
+        }
+        if (!f.renameTo(dispFile(c, itemId))) throw new IOException("rename failed");
+    }
+
+    /** The printed words, one per index word, for the text view. Null if not saved yet (books read before v3.39) or out of step with the index. */
+    static String[] display(Context c, int itemId, int words) {
+        File f = dispFile(c, itemId);
+        if (!f.exists()) return null;
+        try {
+            List<String> l = java.nio.file.Files.readAllLines(f.toPath(), java.nio.charset.StandardCharsets.UTF_8);
+            return l.size() == words ? l.toArray(new String[0]) : null;
+        } catch (Exception e) { return null; }
     }
 
     /** True when the PDF has too little text to search (a scan). */
@@ -169,6 +194,7 @@ class BookText {
     /** Forget everything derived from the PDF (a new PDF was attached). */
     static synchronized void forget(Context c, int itemId) {
         file(c, itemId).delete();
+        dispFile(c, itemId).delete();
         clearAudioData(c, itemId);
         if (cachedId == itemId) { cached = null; cachedMatcher = null; cachedId = -1; }
     }
