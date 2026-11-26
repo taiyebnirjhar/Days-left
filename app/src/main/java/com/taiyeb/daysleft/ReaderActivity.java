@@ -287,21 +287,10 @@ public class ReaderActivity extends Activity {
     };
 
     /** One place for the sync wording and number: the pill and the panel must always say the same. */
-    String syncStatus() {
-        if (SyncService.dlPct >= 0) return "Downloading the speech model… " + SyncService.dlPct + "%";
-        if (SyncService.textPct >= 0) return "Reading the book… " + SyncService.textPct + "%";
-        if (SyncService.anchorCount == 0) return "Finding your place in the audio…";
-        int sec = SyncService.etaSeconds();
-        return "Syncing around you… " + syncPct() + "%" + (sec > 0 ? " · about " + (sec >= 90 ? (sec + 30) / 60 + " min" : sec + " s") : "");
-    }
+    String syncStatus() { return SyncService.statusText(); }
 
     /** The number that goes with syncStatus(), or -1 when there is none yet. */
-    int statusPct() {
-        if (SyncService.dlPct >= 0) return SyncService.dlPct;
-        if (SyncService.textPct >= 0) return SyncService.textPct;
-        if (SyncService.anchorCount == 0) return -1;
-        return syncPct();
-    }
+    int statusPct() { return SyncService.statusPct(); }
 
     String pendingText;
     Runnable pendingAct;
@@ -331,7 +320,7 @@ public class ReaderActivity extends Activity {
         if (pendingText != null && now >= pendingUntil) { pendingText = null; pendingAct = null; }
         if (pendingText != null) t = pendingText;
         else if (fdlg != null && syncPanel) t = null;   // the panel is open and says it already
-        else if (mine && !SyncService.idle) {
+        else if (mine && !SyncService.ready) {
             t = syncStatus();
             if (SyncService.powerSaving && SyncService.dlPct < 0 && SyncService.textPct < 0) t += "\nBattery saver is on, so this is slower";
         } else if (now < readyFlashUntil) t = "Ready ✓  highlight" + (followOn ? " and page turns" : "") + " are on";
@@ -433,7 +422,7 @@ public class ReaderActivity extends Activity {
             }
         }
         if (SyncService.running && SyncService.itemId == item.id && now - alReloaded > 10000) loadSyncData();
-        if (waitingReady && SyncService.running && SyncService.idle && SyncService.itemId == item.id) {
+        if (waitingReady && SyncService.running && SyncService.ready && SyncService.itemId == item.id) {
             waitingReady = false;
             loadSyncData();
             readyFlashUntil = now + 4500;
@@ -620,7 +609,7 @@ public class ReaderActivity extends Activity {
 
     void updateSyncLabel() {
         if (syncIcon == null) return;
-        boolean run = syncing(), full = SyncService.fullFor(this, item.id) || (run ? SyncService.idle : SyncService.winReady(this, item.id));
+        boolean run = syncing(), full = SyncService.fullFor(this, item.id) || (run ? SyncService.ready : SyncService.winReady(this, item.id));
         int pct = run || SyncService.pctFor(this, item.id) > 0 ? syncPct() : 0;
         String label = full ? "Synced" : run ? pct + "%" : pct > 0 ? "Resume " + pct + "%" : "Sync";
         if (!label.contentEquals(syncIcon.label.getText())) syncIcon.label.setText(label);
@@ -678,7 +667,7 @@ public class ReaderActivity extends Activity {
         if (stopping()) {
             setMsg("Stopping… your progress is saved.", -1);
             setBtns("Close", (Runnable) this::closePanel);
-        } else if (syncing() && SyncService.idle) {
+        } else if (syncing() && SyncService.ready) {
             setMsg("Synced around where you are listening.\n\nPlay page, Find page and the sentence highlight work here. It follows you as you play, and maps the new place within a minute or so if you jump somewhere else.", -1);
             setBtns("Close", (Runnable) this::closePanel, "Stop", (Runnable) () -> { SyncService.stop(this); showSyncState(); });
         } else if (syncing()) {
@@ -892,7 +881,7 @@ public class ReaderActivity extends Activity {
         try {
             if (isFinishing() || fdlg != null || bi == null || item == null || !mpReady || !fileMode) return;
             if (!SyncService.wanted(this, item.id) || !Whisper.hasModel(this) || pinFor(cur) != null) return;
-            if (SyncService.running && !SyncService.idle) return;   // still mapping around the playhead: don't compete with it
+            if (SyncService.running && !SyncService.ready) return;   // still mapping around the playhead: don't compete with it
             if (al.size() > 0 && al.timeOfWord(bi.pageStart[cur]) >= 0) return;
             if (SyncService.goalWordReq == bi.pageStart[cur]) return;
             Dbg.i("Prefetch", "locating page " + (cur + 1) + " in the background");

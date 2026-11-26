@@ -25,6 +25,11 @@ public class SyncService extends Service {
     static volatile boolean cancel;
     /** Everything around the playhead is mapped; the service is only waiting for the user to move. */
     static volatile boolean idle;
+    /**
+     * The zone around the playhead is mapped well enough for a sentence highlight. Re-checked continuously (hysteresis: on at 90%,
+     * off below 60%), so it turns off by itself after a jump and the user is told the truth.
+     */
+    static volatile boolean ready;
     /** Speech model download progress (0..100) while the service is downloading, else -1. */
     static volatile int dlPct = -1;
     /** The phone is in battery saver, which slows the processor (and so the sync). */
@@ -73,11 +78,32 @@ public class SyncService extends Service {
         return (int) Math.ceil((totalSec - doneSec) / (got / el) / 60.0);
     }
 
-    /** Seconds left in the current stage, from the speed so far; -1 while unknown. */
+    /** Seconds left in the current stage, from the speed since the stage began; -1 when unknown or absurd. */
     static int etaSeconds() {
+        if (ready) return -1;
         double got = doneSec - startedFrom, el = (System.currentTimeMillis() - startedMs) / 1000.0;
-        if (got < 5 || el < 6) return -1;
-        return (int) Math.ceil(Math.max(0, totalSec - doneSec) / (got / el));
+        if (got < 8 || el < 8) return -1;
+        double sec = Math.max(0, totalSec - doneSec) / (got / el);
+        return sec > 900 ? -1 : (int) Math.ceil(sec);
+    }
+
+    /** What the sync is doing, in words. The notification, the pill and the panel all use this, so they never disagree. */
+    static String statusText() {
+        if (dlPct >= 0) return "Downloading the speech model… " + dlPct + "%";
+        if (textPct >= 0) return "Reading the book… " + textPct + "%";
+        if (ready) return "Ready · follows you as you listen";
+        if (anchorCount == 0) return "Finding your place in the audio…";
+        int sec = etaSeconds();
+        return "Syncing around you… " + statusPct() + "%" + (sec > 0 ? " · about " + (sec >= 90 ? (sec + 30) / 60 + " min" : sec + " s") : "");
+    }
+
+    /** The number that goes with statusText(), or -1 when there is none (yet). */
+    static int statusPct() {
+        if (dlPct >= 0) return dlPct;
+        if (textPct >= 0) return textPct;
+        if (ready) return 100;
+        if (anchorCount == 0) return -1;
+        return totalSec > 0 ? (int) Math.max(0, Math.min(99, doneSec * 100 / totalSec)) : 0;
     }
 
     @Override public IBinder onBind(Intent i) { return null; }
@@ -88,7 +114,7 @@ public class SyncService extends Service {
         final int id = in == null ? -1 : in.getIntExtra("id", -1);
         nm = getSystemService(NotificationManager.class);
         nm.createNotificationChannel(new NotificationChannel("sync", "Syncing audiobook", NotificationManager.IMPORTANCE_LOW));
-        running = true; cancel = false; idle = false; try { powerSaving = getSystemService(PowerManager.class).isPowerSaveMode(); } catch (Exception ignored) {} error = ""; itemId = id; hereWord = -1; goalTimeOut = -1;
+        running = true; cancel = false; idle = false; ready = false; try { powerSaving = getSystemService(PowerManager.class).isPowerSaveMode(); } catch (Exception ignored) {} error = ""; itemId = id; hereWord = -1; goalTimeOut = -1;
         Whisper.abort(false);
         Store.sp(this).edit().putBoolean("syncWant_" + id, true).apply();
         Notification n = note("Getting ready…", 0, true);
@@ -103,6 +129,17 @@ public class SyncService extends Service {
             work(id);
         }, "sync").start();
         return START_REDELIVER_INTENT;   // if the system kills the app, it restarts and carries on
+    }
+
+    /** Re-check "ready" against the zone around the playhead; the speed estimate starts over whenever it changes. */
+    private void updateReady(SyncPlanner pl, int id) {
+        double[] zp = pl.zoneProgress();
+        boolean now = anchorCount > 0 && zp[0] >= (ready ? 0.6 : 0.9) * zp[1];
+        if (now == ready) return;
+        ready = now;
+        startedFrom = zp[0]; startedMs = System.currentTimeMillis();
+        Dbg.i("Sync", now ? "ready here (" + (int) zp[0] + " of " + (int) zp[1] + " s of the zone around " + (int) pl.focus + " s)" : "no longer ready: the zone around " + (int) pl.focus + " s is only " + (int) (zp[0] * 100 / zp[1]) + "% mapped");
+        Store.sp(this).edit().putBoolean("syncWin_" + id, now).putInt("syncPct_" + id, now ? 100 : (int) (zp[0] * 100 / zp[1])).apply();
     }
 
     private boolean lowBattery() {
@@ -218,6 +255,7 @@ public class SyncService extends Service {
                         totalSec = pl.zoneProgress()[1]; doneSec = pl.zoneProgress()[0]; anchorCount = pl.anchorCount();
                     }
                 }
+                updateReady(pl, id);
                 List<SyncPlanner.Req> batch = pl.nextBatch(3);
                 if (batch.isEmpty()) {
                     if (pl.lost) break;
@@ -226,7 +264,7 @@ public class SyncService extends Service {
                         idle = true;   // the small ring is done: usable now, the wider ring is filled in quietly
                         Store.sp(this).edit().putBoolean("syncWin_" + id, true).putInt("syncPct_" + id, 100).apply();
                         Dbg.i("Sync", "ready around " + (int) Player.pos() + " s after " + probes + " probes; widening to +-" + (int) STAGES[stage] + " s");
-                        nm.notify(7100, note("Ready. Widening the mapped area…", 100, false));
+                        nm.notify(7100, note(statusText(), statusPct(), statusPct() < 0));
                         continue;
                     }
                     widening = false;
@@ -237,7 +275,7 @@ public class SyncService extends Service {
                             idle = true; doneSec = totalSec;
                             Store.sp(this).edit().putBoolean("syncWin_" + id, true).putInt("syncPct_" + id, 100).apply();
                             Dbg.i("Sync", "mapped around " + (int) Player.pos() + " s after listening to " + listened + " s in " + probes + " probes");
-                            nm.notify(7100, note("Ready. It follows you as you listen", 100, false));
+                            nm.notify(7100, note(statusText(), statusPct(), statusPct() < 0));
                         }
                     }
                     if (!Player.isPlaying() && nowMs - idleSince > 10000) break;
@@ -289,12 +327,12 @@ public class SyncService extends Service {
                 totalSec = zp[1];
                 doneSec = Math.max(0, Math.min(zp[1], zp[0]));
                 anchorCount = pl.anchorCount();
+                updateReady(pl, id);
                 Store.sp(this).edit().putFloat("syncDone_" + id, (float) doneSec).putInt("syncPct_" + id, idle ? 100 : (int) Math.min(100, doneSec * 100 / Math.max(1, totalSec))).apply();
                 long now = System.currentTimeMillis();
                 if (now - lastNote > 4000) {
                     lastNote = now;
-                    int pct = (int) (doneSec * 100 / totalSec), eta = etaMinutes();
-                    nm.notify(7100, note(pct + "%" + (eta >= 0 ? " · about " + (eta >= 60 ? (eta / 60) + " h " + (eta % 60) + " min" : eta + " min") + " left" : ""), pct, false));
+                    nm.notify(7100, note(statusText(), statusPct(), statusPct() < 0));
                 }
             }
             Dbg.i("Sync", "listened to " + listened + " s of " + (int) pl.total + " s in " + probes + " probes");
@@ -308,7 +346,7 @@ public class SyncService extends Service {
             Dbg.e("Sync", "failed (serious)", t);
         } finally {
             Dbg.i("Sync", (complete ? "finished" : cancel ? "stopped" : error.isEmpty() ? "ended" : "ended with error: " + error) + " at " + (int) doneSec + " of " + (int) totalSec + " s");
-            running = false; idle = false; hereWord = -1; textPct = -1; dlPct = -1; anchorCount = 0;
+            running = false; idle = false; ready = false; hereWord = -1; textPct = -1; dlPct = -1; anchorCount = 0;
             Whisper.abort(false);
             if (wl != null && wl.isHeld()) wl.release();
             stopForeground(true);
