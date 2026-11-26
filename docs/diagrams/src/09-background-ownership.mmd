@@ -1,0 +1,20 @@
+flowchart TB
+    subgraph FG["Reader screen (can vanish any time)"]
+        direction TB
+        D1["dialogs"]
+        D2["status pill"]
+        D3["highlight + page turns"]
+        D1 ~~~ D2 ~~~ D3
+    end
+    subgraph BG["SyncService (foreground, survives)"]
+        direction TB
+        B1["download the model"]
+        B2["read the book's text"]
+        B3["open + decode audio"]
+        B4["recognise + match"]
+        B5["Find page, Play page"]
+        B6["follow the playhead"]
+        B1 ~~~ B2 ~~~ B3 ~~~ B4 ~~~ B5 ~~~ B6
+    end
+    FG -- "asks: goal word,<br/>where am I?" --> BG
+    BG -- "publishes: progress, ready,<br/>answers, anchors file" --> FG

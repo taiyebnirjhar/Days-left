@@ -1,0 +1,11 @@
+flowchart TB
+    P["Press play"] --> Q{"book synced?"}
+    Q -- "no, first time" --> A["Ask: sync now?<br/>benefits, be patient,<br/>keep reading meanwhile"]
+    Q -- yes --> R["Listen"]
+    A -- "Sync and play" --> W["service maps the zone<br/>around the playhead"]
+    A -- "Just play" --> R
+    A -- "Don't ask" --> R
+    W --> R
+    R --> H["sentence highlight<br/>+ page turns"]
+    R --> F["Find page: instant"]
+    R --> G["Play page: instant nearby,<br/>about 20 s far away"]

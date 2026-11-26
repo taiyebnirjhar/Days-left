@@ -1,0 +1,10 @@
+flowchart TB
+    S["SEED<br/>3 probes at once, spread out<br/>(intro music? silence?)"] --> Z["FILL THE ZONE<br/>ahead of you first,<br/>then behind"]
+    Z --> R{"zone 90% mapped?"}
+    R -- no --> Z
+    R -- yes --> READY["READY<br/>highlight + page turns on"]
+    READY --> WID["WIDEN quietly<br/>150 s, then 10 min<br/>coarse probes"]
+    WID --> FOL["FOLLOW the playhead<br/>keep the zone filled"]
+    FOL --> J{"jumped somewhere<br/>unmapped?"}
+    J -- no --> FOL
+    J -- yes --> S

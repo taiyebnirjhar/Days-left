@@ -1,0 +1,8 @@
+ time: 10.2  11.9  13.0  14.6  ...  35.9
+ word: 2310  2316  2322  2327  ...  2406
+              ▲
+ "which word is spoken at 12.4 s?"
+   between anchor 2 and anchor 3
+   interpolate: word 2319
+
+ microseconds per question

@@ -1,0 +1,9 @@
+ time ────────────────────────────────►
+
+      40 s        playhead     150 s
+     behind          ▼         ahead
+ ·· ·  ▮  ▮  ▮  ▮▮▮▮▮  ▮  ▮  ▮  ▮  · ··
+ coarse ◄─ dense: a probe ~20 s ─► coarse
+
+ ▮ = a 9-second probe, placed in the text
+ the zone slides with you as you listen

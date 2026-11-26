@@ -1,0 +1,17 @@
+sequenceDiagram
+    participant U as You
+    participant R as Reader
+    participant S as SyncService
+    participant P as Planner
+    U->>R: tap Play page 174
+    R->>S: goal = first word of page 174
+    S->>P: setGoal(word)
+    loop until bracketed within 25 s
+        P-->>S: 3 probes around the best guess
+        S->>S: decode, recognise, match
+        S->>P: anchors
+        P->>P: tighter bracket, better guess
+    end
+    P-->>S: time of the word
+    S-->>R: the answer
+    R-->>U: playback starts there<br/>(or a tappable pill if hidden)

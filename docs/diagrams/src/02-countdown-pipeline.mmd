@@ -1,0 +1,9 @@
+flowchart TB
+    UI["MainActivity<br/>create, edit, templates"] --> S["Store<br/>countdowns + settings"]
+    S --> K["Calc<br/>pure java.time, no Android"]
+    K --> N["CountdownService<br/>foreground service"]
+    B["BootReceiver<br/>after reboot or update"] --> N
+    N --> N1["status-bar icon"]
+    N --> N2["pinned notification"]
+    N --> N3["overlay text"]
+    N --> N4["finish alert"]

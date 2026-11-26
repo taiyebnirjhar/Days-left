@@ -1,0 +1,9 @@
+flowchart TB
+    A["heard: we hold these truths to be self evident"] --> B["bigrams: we·hold, hold·these,<br/>these·truths, truths·to ..."]
+    B --> C["look each up in the book index<br/>skip pairs seen more than 25 times"]
+    C --> D["each hit votes for a diagonal:<br/>book position minus heard position"]
+    D --> E["strongest diagonal wins<br/>(neighbouring bins merged)"]
+    E --> F["keep hits within 14 words of it"]
+    F --> G["longest increasing run<br/>in book position"]
+    G --> H["Theil-Sen line: time vs position<br/>drop words more than 1.5 s off it"]
+    H --> I["anchors:<br/>word index + seconds"]

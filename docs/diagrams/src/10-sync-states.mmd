@@ -1,0 +1,13 @@
+stateDiagram-v2
+    [*] --> Preparing
+    Preparing: Downloading the model,<br/>reading the book
+    Preparing --> Finding: ready to listen
+    Finding: Finding your place
+    Finding --> Mapping: first anchors
+    Mapping: Filling the zone<br/>progress = % of zone ready
+    Mapping --> Ready: zone 90% or more
+    Ready: Ready, follows you
+    Ready --> Mapping: zone below 60%<br/>(jumped, seeked)
+    Ready --> Idle: not playing for 10 s
+    Idle --> Mapping: you press play
+    Idle --> [*]

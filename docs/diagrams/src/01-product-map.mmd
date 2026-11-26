@@ -1,0 +1,19 @@
+flowchart TB
+    subgraph DL["Days Left: the clock"]
+        direction TB
+        C1["Countdowns<br/>days + hours left"]
+        C2["Status bar<br/>always visible"]
+        C3["Templates<br/>exam, trip, life clock"]
+        C1 ~~~ C2 ~~~ C3
+    end
+    subgraph LB["Library: the work"]
+        direction TB
+        L1["Plans + Inbox<br/>deadlines and a queue"]
+        L2["Reader<br/>eye-friendly PDF"]
+        L3["Audiobook<br/>in sync with the page"]
+        L4["Daily nudge<br/>one Up next"]
+        L1 ~~~ L2 ~~~ L3 ~~~ L4
+    end
+    DL --> Q{{"how much is left?"}}
+    LB --> Q
+    Q --> A["finish things"]

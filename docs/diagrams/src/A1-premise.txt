@@ -1,0 +1,8 @@
+ what you have            what you want
+┌─────────────────────┐  ┌──────────────────┐
+│ a deadline          │  │ to finish        │
+│ a book (PDF)        │─►│ to understand    │
+│ its audiobook       │  │ without          │
+│ a few spare minutes │  │ babysitting      │
+└─────────────────────┘  └──────────────────┘
+        the app is the arrow

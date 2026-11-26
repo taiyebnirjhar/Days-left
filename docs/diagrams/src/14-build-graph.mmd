@@ -1,0 +1,6 @@
+flowchart TB
+    J["Java, about 7,600 lines"] --> APK
+    N["cpp/jni.cpp"] --> W["vendored whisper.cpp<br/>CPU only"]
+    W --> SO["libdayswhisper.so<br/>arm64-v8a"]
+    SO --> APK["app-debug.apk<br/>about 12 MB"]
+    P["PDFBox for Android<br/>the only dependency"] --> APK

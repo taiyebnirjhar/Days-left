@@ -1,0 +1,11 @@
+ ONE SPEECH CALL  (a 30 s window)
+
+┌────────┬──┬────────┬──┬────────┐
+│ clip A │  │ clip B │  │ clip C │
+└────────┴──┴────────┴──┴────────┘
+     │          │          │
+     ▼          ▼          ▼
+ words+time words+time words+time
+
+ a second of silence between clips;
+ word timestamps tell them apart

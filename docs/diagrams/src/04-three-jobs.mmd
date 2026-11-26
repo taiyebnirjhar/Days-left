@@ -1,0 +1,5 @@
+flowchart TB
+    A["1. HEAR<br/>decode a few seconds of audio.<br/>The recogniser returns words + times."]
+    B["2. PLACE<br/>match the words to the book text.<br/>Result: an anchor, time and word position."]
+    C["3. KNOW<br/>many anchors, then interpolate:<br/>the time of any word,<br/>the word at any time."]
+    A --> B --> C

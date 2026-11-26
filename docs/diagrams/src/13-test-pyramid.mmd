@@ -1,0 +1,7 @@
+flowchart BT
+    H["HOST CHECKS<br/>37 plain-Java assertions:<br/>Calc, matcher, aligner, versions"]
+    S["SIMULATION<br/>9.7 h fake book, noisy recogniser,<br/>pace drift, chapter pauses, intro"]
+    W["WHISPER HARNESS<br/>the real model on a laptop:<br/>timings, crash hunting"]
+    D["ON A REAL PHONE<br/>logs, screenshots, the Debug log"]
+    H --> S --> D
+    W --> D

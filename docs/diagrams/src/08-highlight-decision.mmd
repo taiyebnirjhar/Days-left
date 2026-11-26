@@ -1,0 +1,11 @@
+flowchart TB
+    T["every tick while playing"] --> W{"word known<br/>at this time?"}
+    W -- no --> N["show nothing"]
+    W -- yes --> G{"probes around here<br/>25 s apart or less?"}
+    G -- no --> N
+    G -- yes --> P{"pause in<br/>this gap?"}
+    P -- yes --> N
+    P -- no --> H["highlight the sentence"]
+    H --> F{"gap 60 s or less,<br/>and turn pages is on?"}
+    F -- yes --> T2["turn the page"]
+    F -- no --> D["stay"]

@@ -1,0 +1,11 @@
+flowchart TB
+    DEV["push to main<br/>(touches app/)"] --> CI["GitHub Actions"]
+    CI --> D1["decrypt the signing key<br/>passphrase = one short secret"]
+    D1 --> B["build the APK"]
+    B --> V{"APK certificate equals<br/>the key's certificate?"}
+    V -- no --> X["fail: publish nothing"]
+    V -- yes --> REL["create release<br/>attach the APK"]
+    REL --> APP["in the app:<br/>Check for update"]
+    APP --> D2["read the latest redirect<br/>(no rate limit)"]
+    D2 --> D3["download the APK"]
+    D3 --> I["PackageInstaller<br/>one confirm tap"]
