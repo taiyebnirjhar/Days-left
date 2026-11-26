@@ -25,6 +25,8 @@ public class SyncService extends Service {
     static volatile boolean cancel;
     /** Everything around the playhead is mapped; the service is only waiting for the user to move. */
     static volatile boolean idle;
+    /** Speech model download progress (0..100) while the service is downloading, else -1. */
+    static volatile int dlPct = -1;
     /** The reader asks: when is this book word spoken? (-1 none). The answer appears in goalTimeOut (-1 working, -2 not found). */
     static volatile int goalWordReq = -1;
     static volatile double goalTimeOut = -1;
@@ -122,7 +124,42 @@ public class SyncService extends Service {
         try {
             Item it = Learn.item(this, id);
             if (it == null || it.audio.isEmpty()) throw new Exception("no audio file");
-            if (!Whisper.hasModel(this)) throw new Exception("speech model missing");
+            if (!Whisper.hasModel(this)) {
+                // downloaded here, in the service, so it carries on when the dialog is closed or the screen is off
+                dlPct = 0;
+                Dbg.i("Sync", "downloading the speech model in the background");
+                final boolean[] stop = {false};
+                final long[] lastN = {0};
+                try {
+                    Whisper.download(this, pc -> {
+                        dlPct = pc; stop[0] = cancel;
+                        long now = System.currentTimeMillis();
+                        if (now - lastN[0] > 1000) { lastN[0] = now; nm.notify(7100, note("Downloading the speech model… " + pc + "%", pc, false)); }
+                    }, stop);
+                } catch (Exception e) {
+                    if (cancel) { Dbg.i("Sync", "model download cancelled"); return; }
+                    throw e;
+                } finally { dlPct = -1; }
+                if (!Whisper.hasModel(this)) throw new Exception("speech model missing");
+            }
+            if (!BookText.ready(this, id)) {
+                // the book's text is read here too, so it does not depend on the dialog being open
+                Dbg.i("Sync", "reading the book's text in the background");
+                final boolean[] stop = {false};
+                final long[] lastN = {0};
+                BookIndex got;
+                try {
+                    got = BookText.extract(this, it, pc -> {
+                        stop[0] = cancel; dlPct = -1;
+                        long now = System.currentTimeMillis();
+                        if (now - lastN[0] > 1000) { lastN[0] = now; nm.notify(7100, note("Reading the book's text… " + pc + "%", pc, false)); }
+                    }, stop);
+                } catch (Exception e) {
+                    if (cancel) return;
+                    throw e;
+                }
+                if (BookText.looksScanned(got)) { BookText.forget(this, id); throw new Exception("This PDF is made of page pictures (a scan), so there is no text to match against."); }
+            }
             BookIndex bi = BookText.index(this, id);
             Aligner al = new Aligner(bi);
             MediaMetadataRetriever mr = new MediaMetadataRetriever();

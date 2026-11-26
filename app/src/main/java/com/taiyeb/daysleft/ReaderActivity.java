@@ -542,6 +542,9 @@ public class ReaderActivity extends Activity {
         if (stopping()) {
             setMsg("Stopping… your progress is saved.", -1);
             setBtns("Close", (Runnable) this::closePanel);
+        } else if (syncing() && SyncService.dlPct >= 0) {
+            setMsg("Downloading the speech model… " + SyncService.dlPct + "%\n\nIt keeps going in the background. When it is done the sync starts by itself.", SyncService.dlPct);
+            setBtns("Hide", (Runnable) this::closePanel, "Cancel", (Runnable) () -> { SyncService.stop(this); showSyncState(); });
         } else if (syncing() && SyncService.idle) {
             setMsg("Synced around where you are listening.\n\nPlay page, Find page and the sentence highlight work here. It follows you as you play, and maps the new place within a minute or two if you jump somewhere else.", -1);
             setBtns("Close", (Runnable) this::closePanel, "Stop", (Runnable) () -> { SyncService.stop(this); showSyncState(); });
@@ -931,16 +934,25 @@ public class ReaderActivity extends Activity {
     void ensureModel(Runnable next) {
         if (Whisper.hasModel(this)) { next.run(); return; }
         final boolean[] cancel = fcancel;
-        setMsg("Downloading the speech model… 0%", 0);
-        setBtns("Cancel", (Runnable) this::closePanel);
-        new Thread(() -> {
-            try {
-                Whisper.download(this, pc -> ui(() -> { if (!cancel[0]) setMsg("Downloading the speech model… " + pc + "%", pc); }), cancel);
-                ui(() -> { if (!cancel[0]) next.run(); });
-            } catch (Exception e) {
-                ui(() -> { if (!cancel[0]) fail("The download didn't finish. Check your internet and try again."); });
+        final long t0 = System.currentTimeMillis();
+        // the download runs in the background service: closing this panel or leaving the book does not stop it
+        SyncService.dlPct = 0;
+        if (!SyncService.running) SyncService.start(this, item.id);
+        setMsg("Downloading the speech model… 0%\n\nIt keeps going in the background. You can close this and use your phone.", 0);
+        setBtns("Hide", (Runnable) this::closePanel, "Cancel download", (Runnable) () -> { SyncService.stop(this); closePanel(); });
+        h.postDelayed(new Runnable() {
+            @Override public void run() {
+                if (cancel[0] || isFinishing()) return;
+                if (Whisper.hasModel(ReaderActivity.this)) { next.run(); return; }
+                int pc = SyncService.dlPct;
+                if (!SyncService.running && System.currentTimeMillis() - t0 > 4000) {
+                    fail("The download didn't finish. Check your internet and try again." + (SyncService.error.isEmpty() ? "" : "\n\n" + SyncService.error));
+                    return;
+                }
+                if (pc >= 0) setMsg("Downloading the speech model… " + pc + "%\n\nIt keeps going in the background. You can close this and use your phone.", pc);
+                h.postDelayed(this, 500);
             }
-        }).start();
+        }, 500);
     }
 
     void ensureText(Runnable next) {
