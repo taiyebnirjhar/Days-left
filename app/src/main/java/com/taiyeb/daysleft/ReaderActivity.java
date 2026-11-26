@@ -475,17 +475,20 @@ public class ReaderActivity extends Activity {
 
     boolean stopping() { return SyncService.running && SyncService.itemId == item.id && SyncService.cancel; }
 
-    int syncPct() { double tot = syncing() ? SyncService.totalSec : 0; return tot > 0 ? (int) (SyncService.doneSec * 100 / tot) : (int) Math.round(aDur > 0 ? SyncService.doneFor(this, item.id) * 100 / aDur : 0); }
+    int syncPct() {
+        if (syncing()) { double tot = SyncService.totalSec; return tot > 0 ? (int) Math.min(100, SyncService.doneSec * 100 / tot) : 0; }
+        return SyncService.pctFor(this, item.id);
+    }
 
     String etaText() {
         int e = SyncService.etaMinutes();
-        return e < 0 ? "" : " · about " + (e >= 60 ? (e / 60) + " h " + (e % 60) + " min" : e + " min") + " left";
+        return e <= 0 ? "" : " · about " + (e >= 60 ? (e / 60) + " h " + (e % 60) + " min" : e + " min") + " left";
     }
 
     void updateSyncLabel() {
         if (syncIcon == null) return;
         boolean run = syncing(), full = SyncService.fullFor(this, item.id) || (run ? SyncService.idle : SyncService.winReady(this, item.id));
-        int pct = run || SyncService.doneFor(this, item.id) > 0 ? syncPct() : 0;
+        int pct = run || SyncService.pctFor(this, item.id) > 0 ? syncPct() : 0;
         String label = full ? "Synced" : run ? pct + "%" : pct > 0 ? "Resume " + pct + "%" : "Sync";
         if (!label.contentEquals(syncIcon.label.getText())) syncIcon.label.setText(label);
         if (syncIcon.pct != (full ? 100 : pct) || syncIcon.done != full || syncIcon.badge != (!full && !run && pct == 0)) {
@@ -554,8 +557,12 @@ public class ReaderActivity extends Activity {
         } else if (SyncService.fullFor(this, item.id)) {
             setMsg("This audiobook is synced.\n\nPlay page and Find page are instant now, and the sentence being read is highlighted in the book.", -1);
             setBtns("Close", (Runnable) this::closePanel, "Sync again", (Runnable) () -> { BookText.clearAudioData(this, item.id); al = new Alignment(); hlFrom = hlTo = -1; showSyncState(); });
+        } else if (SyncService.winReady(this, item.id)) {
+            setMsg("Synced around where you were listening.\n\nPlay page, Find page and the sentence highlight work there. If you go somewhere else, Find page and Play page map that place on demand (about a minute), or tap Sync here to map it now.", -1);
+            setBtns("Close", (Runnable) this::closePanel, "Sync here", (Runnable) () -> startSync(Whisper.which(this)),
+                    "Start over", (Runnable) () -> { BookText.clearAudioData(this, item.id); al = new Alignment(); hlFrom = hlTo = -1; updateSyncLabel(); showSyncState(); });
         } else {
-            boolean part = SyncService.doneFor(this, item.id) > 0;
+            boolean part = SyncService.pctFor(this, item.id) > 0;
             if (!SyncService.error.isEmpty() && !part) { /* show the reason once */ }
             setMsg((part ? "Paused at " + syncPct() + "%. It continues from there.\n\n" : "")
                     + "This listens to a few short samples around where you are in the audiobook and links them to the book. Then Play page and Find page are instant there, and the sentence being read is highlighted. It follows you as you play or jump.\n\n"

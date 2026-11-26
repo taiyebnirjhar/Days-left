@@ -163,7 +163,7 @@ class BookText {
     static void clearAudioData(Context c, int itemId) {
         clearSamples(c, itemId);
         alignFile(c, itemId).delete();
-        Store.sp(c).edit().remove("syncDone_" + itemId).remove("syncFull_" + itemId).apply();
+        Store.sp(c).edit().remove("syncDone_" + itemId).remove("syncFull_" + itemId).remove("syncPct_" + itemId).remove("syncWin_" + itemId).apply();
     }
 
     /** Forget everything derived from the PDF (a new PDF was attached). */

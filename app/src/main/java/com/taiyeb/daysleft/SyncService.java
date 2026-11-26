@@ -34,6 +34,9 @@ public class SyncService extends Service {
     static volatile int hereWord = -1;
     static final double WINDOW = 600;   // seconds mapped either side of the playhead
 
+    /** Saved progress of the window sync, 0..100. */
+    static int pctFor(Context c, int id) { return Store.sp(c).getInt("syncPct_" + id, 0); }
+
     static boolean winReady(Context c, int id) { return Store.sp(c).getBoolean("syncWin_" + id, false); }
 
     static final double CHUNK = 30;
@@ -174,7 +177,7 @@ public class SyncService extends Service {
             int stage = 0;
             boolean widening = false;
             pl.reach = STAGES[0];
-            Store.sp(this).edit().putBoolean("syncWin_" + id, false).apply();
+            idle = winReady(this, id);   // was ready last time: stays "Synced" unless new work turns up
             totalSec = pl.windowProgress()[1];   // the progress bar is about the window around the playhead
             doneSec = pl.windowProgress()[0]; startedFrom = doneSec; startedMs = System.currentTimeMillis();
             Dbg.i("Sync", "start item " + id + ", model " + (Whisper.which(this) == 0 ? "accurate" : "faster") + ", audio " + (int) totalSec + " s, from " + (int) here + " s, known anchors " + pl.anchorCount() + ", book words " + bi.count());
@@ -192,7 +195,7 @@ public class SyncService extends Service {
                     if (stage < STAGES.length - 1) {
                         stage++; pl.reach = STAGES[stage]; widening = true;
                         idle = true;   // the small ring is done: usable now, the wider ring is filled in quietly
-                        Store.sp(this).edit().putBoolean("syncWin_" + id, true).apply();
+                        Store.sp(this).edit().putBoolean("syncWin_" + id, true).putInt("syncPct_" + id, 100).apply();
                         Dbg.i("Sync", "ready around " + (int) Player.pos() + " s after " + probes + " probes; widening to +-" + (int) STAGES[stage] + " s");
                         nm.notify(7100, note("Ready. Widening the mapped area…", 100, false));
                         continue;
@@ -202,7 +205,7 @@ public class SyncService extends Service {
                     long nowMs = System.currentTimeMillis();
                     if (idleSince == 0) {
                         idleSince = nowMs; idle = true; doneSec = totalSec;
-                        Store.sp(this).edit().putBoolean("syncWin_" + id, true).apply();
+                        Store.sp(this).edit().putBoolean("syncWin_" + id, true).putInt("syncPct_" + id, 100).apply();
                         Dbg.i("Sync", "mapped around " + (int) Player.pos() + " s after listening to " + listened + " s in " + probes + " probes");
                         nm.notify(7100, note("Ready. It follows you as you listen", 100, false));
                     }
@@ -210,7 +213,7 @@ public class SyncService extends Service {
                     Thread.sleep(2000);
                     continue;
                 }
-                if (idle && !widening) { idle = false; Store.sp(this).edit().putBoolean("syncWin_" + id, false).apply(); }
+                if (!widening && (idle || winReady(this, id))) { idle = false; Store.sp(this).edit().putBoolean("syncWin_" + id, false).apply(); }
                 idleSince = 0;
                 if (lowBattery()) { error = "The battery is low. Plug in and it carries on when you open the book."; break; }
                 long t0 = Dbg.now();
@@ -252,7 +255,7 @@ public class SyncService extends Service {
                 hereWord = pl.wordNear(Player.pos());
                 doneSec = Math.max(0, Math.min(totalSec, totalSec - pl.unresolved()));
                 totalSec = pl.windowProgress()[1];
-                Store.sp(this).edit().putFloat("syncDone_" + id, (float) doneSec).apply();
+                Store.sp(this).edit().putFloat("syncDone_" + id, (float) doneSec).putInt("syncPct_" + id, idle ? 100 : (int) Math.min(100, doneSec * 100 / Math.max(1, totalSec))).apply();
                 long now = System.currentTimeMillis();
                 if (now - lastNote > 4000) {
                     lastNote = now;
@@ -262,7 +265,7 @@ public class SyncService extends Service {
             }
             Dbg.i("Sync", "listened to " + listened + " s of " + (int) pl.total + " s in " + probes + " probes");
             if (!cancel && pl.lost && error.isEmpty()) error = "Lost the place in the audio. Pin a page, then start the sync again.";
-            if (!cancel && error.isEmpty()) Store.sp(this).edit().putBoolean("syncWin_" + id, true).apply();   // wanted stays on: it resumes next time the book opens
+            if (!cancel && error.isEmpty()) Store.sp(this).edit().putBoolean("syncWin_" + id, true).putInt("syncPct_" + id, 100).apply();   // wanted stays on: it resumes next time the book opens
         } catch (Exception e) {
             error = String.valueOf(e.getMessage());
             Dbg.e("Sync", "failed", e);
