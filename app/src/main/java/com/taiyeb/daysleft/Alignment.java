@@ -162,7 +162,6 @@ class Alignment {
         if (i < 0) return Double.MAX_VALUE;
         if (i + 1 >= at.length) return t - at[i] < 6 ? 0 : Double.MAX_VALUE;
         if (pauseBetween(i)) return Double.MAX_VALUE;   // somewhere in here is a pause: where the narrator is cannot be told by interpolating
-        if (at[i + 1] - at[i] > SKIP_GAP && skippedTextBetween(i)) return Double.MAX_VALUE;   // unread text (an abridged passage) hides in here: a probe must look inside
         return at[i + 1] - at[i];
     }
 
@@ -192,8 +191,6 @@ class Alignment {
         return j;
     }
 
-    /** A gap with skipped text wider than this (s) is not trusted at all. */
-    static final double SKIP_GAP = 10;
 
     /** Book word being spoken at second t, or -1 if unknown. */
     int wordAtTime(double t) {
