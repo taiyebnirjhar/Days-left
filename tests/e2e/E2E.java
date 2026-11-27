@@ -416,8 +416,8 @@ public class E2E {
             if (!(spoken[e] && kind[e].equals("sentence"))) { k--; continue; }
             double t = st[e] + r.nextDouble() * (en[e] - st[e]);
             int tp = pageOfWord(elStartW[e]);
-            int j = fin.wordAtTime(t);
-            if (j >= 0 && fin.gapAt(t) > Alignment.FLIP_GAP) { listen++; continue; }   // the app does not trust probes this far apart (it listens right there instead)
+            int j = fin.flipWordAt(t);
+            if (j < 0 && fin.wordAtTime(t) >= 0) { listen++; continue; }   // the app does not trust probes this far apart (it listens right there instead)
             if (j < 0) { nomap++; if (verbose || nomap <= 25) System.out.printf("      unmapped at %.1f s (anchors cover %.1f..%.1f s, %d anchors; nearest before %.1f after %.1f)%n", t, fin.firstTime(), fin.times()[fin.size() - 1], fin.size(), nearest(fin, t, -1), nearest(fin, t, 1)); continue; }
 
             int pp = pageOfWord(j);
