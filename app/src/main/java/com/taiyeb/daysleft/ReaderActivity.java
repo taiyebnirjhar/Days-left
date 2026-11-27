@@ -145,7 +145,7 @@ public class ReaderActivity extends Activity {
             if (BookText.alignFile(this, item.id).lastModified() > alReloaded) loadSyncData();
             double t = Player.pos();
             if (!SyncService.running && SyncService.wanted(this, item.id) && Whisper.hasModel(this)
-                    && (!SyncService.winReady(this, item.id) || al.wordAtTime(t) < 0)) {
+                    && (!SyncService.winReady(this, item.id) || al.wordAtTime(t) < 0 || al.gapAt(t) > Alignment.HL_GAP)) {
                 Dbg.i("Sync", "back in the book at " + (int) t + " s: not mapped here, waking the sync");
                 SyncService.start(this, item.id);
             }
@@ -494,12 +494,11 @@ public class ReaderActivity extends Activity {
     };
 
     /** One place for the sync wording and number: the pill and the panel must always say the same. */
-    String syncStatus() { return SyncService.statusText(); }
 
     /** The number that goes with syncStatus(), or -1 when there is none yet. */
-    int statusPct() { return SyncService.statusPct(); }
 
     String jobText;   // what a hidden Find/Play page search is doing right now (shown in the pill)
+    Runnable jobCancel;   // a tap on the pill while it shows that job cancels it
     String pendingText;
     Runnable pendingAct;
     long pendingUntil;
@@ -519,7 +518,10 @@ public class ReaderActivity extends Activity {
         else postResult(text, act);
     }
 
-    /** The status line above the player. Calm wording, honest numbers. */
+    /**
+     * The status line above the player, only when there is something to say: what the first run is preparing, that it is finding the place, a hidden
+     * Find/Play-page job, an answer to tap, or why the sync stopped. The steady progress lives on the nav icon, not here.
+     */
     void updateBanner() {
         if (bannerWrap == null || item == null || !fileMode) return;
         long now = System.currentTimeMillis();
@@ -528,12 +530,10 @@ public class ReaderActivity extends Activity {
         if (pendingText != null && now >= pendingUntil) { pendingText = null; pendingAct = null; }
         if (fdlg != null) t = null;                      // a dialog is open: it says it already
         else if (pendingText != null) t = pendingText;
+        else if (mine && !SyncService.cancel && (SyncService.dlPct >= 0 || SyncService.textPct >= 0 || !SyncService.modelOk || !SyncService.textOk)) t = SyncService.statusText();
         else if (jobText != null) t = jobText;
-        else if (mine && !SyncService.ready) {
-            t = syncStatus();
-            if (SyncService.powerSaving && SyncService.dlPct < 0 && SyncService.textPct < 0) t += "\nBattery saver is on, so this is slower";
-        } else if (now < readyFlashUntil) t = "Ready ✓  highlight" + (followOn ? " and page turns" : "") + " are on";
-        else if (!SyncService.running && !SyncService.error.isEmpty() && SyncService.wanted(this, item.id) && !SyncService.winReady(this, item.id))
+        else if (mine && !SyncService.cancel && !SyncService.ready && SyncService.anchorCount == 0) t = SyncService.statusText();
+        else if (!SyncService.running && !SyncService.error.isEmpty() && SyncService.itemId == item.id && SyncService.wanted(this, item.id) && !SyncService.fullFor(this, item.id))
             t = "Sync paused: " + SyncService.error + "\nTap to try again";
         if (t == null) { if (bannerWrap.getVisibility() != View.GONE) bannerWrap.setVisibility(View.GONE); return; }
         // solid, high contrast on every theme: the ink colour as the background, the paper colour as the text, with a shadow,
@@ -554,37 +554,14 @@ public class ReaderActivity extends Activity {
         if (playGlyph.type != t) { playGlyph.type = t; playGlyph.invalidate(); }
     }
 
-    boolean askedSyncThisSession, waitingReady, autoHidePanel;
     LinearLayout bannerWrap;
     TextView syncBanner;
-    long readyFlashUntil;
 
-    /** Ask once per visit, and never again if the user said so, for a book that has no sync yet. */
-    boolean shouldAskSync() {
-        return item != null && fileMode && Store.flag(this, "syncAsk", true) && !askedSyncThisSession && !SyncService.running
-                && !SyncService.wanted(this, item.id) && !SyncService.winReady(this, item.id)
-                && !Store.sp(this).getBoolean("syncNever_" + item.id, false);
-    }
-
-    /** The first time the user presses Play on an unsynced book: explain what syncing gives, and be honest about the wait. */
-    void askSync() {
-        askedSyncThisSession = true;
-        openPanel("Sync this book with the audio?");
-        setMsg("Want to sync this audiobook with the book first?\n\n"
-                + "What you get:\n"
-                + "•  the sentence being read is highlighted\n"
-                + "•  pages turn by themselves as you listen" + (followOn ? "" : " (turn on “Turn pages with the audio” in the settings)") + "\n"
-                + "•  Play page and Find page become instant\n\n"
-                + "It works quietly in the background and takes a few minutes the first time, so please be patient. "
-                + "You can keep listening or reading meanwhile, and you'll be told when it's ready.", -1);
-        setBtns("Sync and play", (Runnable) () -> {
-                    autoHidePanel = true;
-                    openPanel("Sync with the book");
-                    startSync(Whisper.which(this));
-                    Player.toggle(this);
-                },
-                "Just play", (Runnable) () -> { closePanel(); Player.toggle(this); },
-                "Don't ask", (Runnable) () -> { Store.sp(this).edit().putBoolean("syncNever_" + item.id, true).apply(); closePanel(); Player.toggle(this); });
+    /** Pressing Play on a book that was never synced starts the sync by itself (no question), unless the user turned that off or paused a sync on purpose. */
+    boolean shouldAutoSync() {
+        return item != null && fileMode && Store.flag(this, "syncAsk", true) && !SyncService.running
+                && !SyncService.fullFor(this, item.id) && SyncService.pctFor(this, item.id) == 0 && !SyncService.wanted(this, item.id)
+                && !Store.sp(this).getBoolean("syncPaused_" + item.id, false);
     }
 
     void togglePlay() {
@@ -593,7 +570,7 @@ public class ReaderActivity extends Activity {
             if (!mpReady) { Toast.makeText(this, "Loading the audio…", Toast.LENGTH_SHORT).show(); return; }
             if (!Player.isPlaying() && Build.VERSION.SDK_INT >= 33 && checkSelfPermission("android.permission.POST_NOTIFICATIONS") != android.content.pm.PackageManager.PERMISSION_GRANTED)
                 requestPermissions(new String[]{"android.permission.POST_NOTIFICATIONS"}, 92);
-            if (!Player.isPlaying() && shouldAskSync()) { askSync(); return; }
+            if (!Player.isPlaying() && shouldAutoSync()) startSyncNow(false);
             Player.toggle(this);
             return;
         }
@@ -639,17 +616,9 @@ public class ReaderActivity extends Activity {
             }
         }
         if (SyncService.running && SyncService.itemId == item.id && SyncService.liveItem != item.id && now - alReloaded > 10000) loadSyncData();   // live hand-over replaces this poll
-        if (waitingReady && SyncService.running && SyncService.ready && SyncService.itemId == item.id) {
-            waitingReady = false;
-            loadSyncData();
-            readyFlashUntil = now + 4500;
-            if (playBtn != null) playBtn.performHapticFeedback(HapticFeedbackConstants.CONFIRM);
-            updateBanner();
-            Toast.makeText(this, "Ready! The sentence being read is highlighted" + (followOn ? " and pages turn by themselves." : "."), Toast.LENGTH_LONG).show();
-        }
         // listening on: when the mapped area is running out ahead of the playhead, wake the service so it maps the next part
         if (st == 1 && !SyncService.running && now - lastFollowStart > 60000 && bi != null && al.size() > 0
-                && SyncService.wanted(this, item.id) && Whisper.hasModel(this) && al.wordAtTime(t + 120) < 0) {
+                && SyncService.wanted(this, item.id) && Whisper.hasModel(this) && (al.wordAtTime(t + 120) < 0 || al.gapAt(t) > Alignment.HL_GAP) && now - lastFollowStart > 120000) {
             lastFollowStart = now;
             Dbg.i("Sync", "playing at " + (int) t + " s, nothing mapped 2 min ahead: mapping the next part");
             SyncService.start(this, item.id);
@@ -809,36 +778,6 @@ public class ReaderActivity extends Activity {
         updateSyncLabel();
     }
 
-    // ====================== sync with the book ======================
-    boolean syncing() { return SyncService.running && SyncService.itemId == item.id && !SyncService.cancel; }
-
-    boolean stopping() { return SyncService.running && SyncService.itemId == item.id && SyncService.cancel; }
-
-    int syncPct() {
-        if (syncing()) { double tot = SyncService.totalSec; return tot > 0 ? (int) Math.min(100, SyncService.doneSec * 100 / tot) : 0; }
-        return SyncService.pctFor(this, item.id);
-    }
-
-    String etaText() {
-        int sec = SyncService.etaSeconds();
-        return sec <= 0 ? "" : " · about " + (sec >= 90 ? (sec + 30) / 60 + " min" : sec + " s") + " left";
-    }
-
-    void updateSyncLabel() {
-        if (syncIcon == null) return;
-        boolean run = syncing(), full = SyncService.fullFor(this, item.id) || (run ? SyncService.ready : SyncService.winReady(this, item.id));
-        int pct = run || SyncService.pctFor(this, item.id) > 0 ? syncPct() : 0;
-        String label = full ? "Synced" : run ? pct + "%" : pct > 0 ? "Resume " + pct + "%" : "Sync";
-        if (!label.contentEquals(syncIcon.label.getText())) syncIcon.label.setText(label);
-        if (syncIcon.pct != (full ? 100 : pct) || syncIcon.done != full || syncIcon.badge != (!full && !run && pct == 0)) {
-            syncIcon.pct = full ? 100 : pct;
-            syncIcon.done = full;
-            syncIcon.badge = !full && !run && pct == 0;   // a dot that says "this is worth doing"
-            syncIcon.invalidate();
-        }
-    }
-
-    /** (Re)load the book index and the audio map from disk, off the main thread. */
     void loadSyncData() {
         alReloaded = System.currentTimeMillis();
         final int id = item.id;
@@ -855,7 +794,7 @@ public class ReaderActivity extends Activity {
                     // an index from an older version is discarded when opened: read the book again quietly (a book with audio needs it for the marker)
                     if (b == null && item.audio != null && !item.audio.isEmpty()) h.postDelayed(this::readBookQuietly, 800);
                     // a sync that was interrupted (app closed by the system, low battery) carries on by itself
-                    if (b != null && fileMode && !SyncService.running && SyncService.wanted(this, id) && !SyncService.fullFor(this, id) && Whisper.hasModel(this)) {
+                    if (b != null && fileMode && !SyncService.running && SyncService.wanted(this, id) && !SyncService.fullFor(this, id)) {
                         Dbg.i("Sync", "auto-resuming from the reader (was interrupted, not stopped by the user)");
                         SyncService.start(this, id);
                         Toast.makeText(this, "Continuing the sync in the background", Toast.LENGTH_SHORT).show();
@@ -865,51 +804,98 @@ public class ReaderActivity extends Activity {
         }).start();
     }
 
-    final Runnable syncPoll = new Runnable() {
-        @Override public void run() {
-            if (fdlg == null || !syncPanel) return;
-            showSyncState();
-            h.postDelayed(this, 1000);
-        }
-    };
-    boolean syncPanel;
+    // ====================== sync with the book ======================
+    // One control, no questions: the Sync icon. Tap = start, tap again = pause, tap = resume; hold = start over. The ring shows ONE number, how much of the
+    // whole audiobook is linked to the book, and it never goes down. The speech model is always the fast one.
+    boolean syncing() { return SyncService.running && SyncService.itemId == item.id && !SyncService.cancel; }
 
-    void showSync() {
-        if (!mpReady) { Toast.makeText(this, "The audio is still loading", Toast.LENGTH_SHORT).show(); return; }
-        openPanel("Sync with the book");
-        syncPanel = true;
-        fdlg.setOnDismissListener(d -> syncPanel = false);
-        showSyncState();
-        h.postDelayed(syncPoll, 1000);
+    boolean stopping() { return SyncService.running && SyncService.itemId == item.id && SyncService.cancel; }
+
+    boolean sawSyncRunning, toldSynced;
+
+    void onSyncTap() {
+        if (item == null || !fileMode) return;
+        if (SyncService.running && SyncService.itemId != item.id) { Toast.makeText(this, "Another book is syncing. Pause it there first.", Toast.LENGTH_SHORT).show(); return; }
+        if (stopping()) return;
+        if (syncing()) {   // pause
+            Store.sp(this).edit().putBoolean("syncPaused_" + item.id, true).apply();
+            SyncService.stop(this);
+            Toast.makeText(this, "Paused at " + SyncService.pct() + "%. Tap again to continue.", Toast.LENGTH_SHORT).show();
+            updateSyncLabel();
+            return;
+        }
+        if (SyncService.fullFor(this, item.id)) { Toast.makeText(this, "This book is synced. Hold the icon to sync it again.", Toast.LENGTH_SHORT).show(); return; }
+        startSyncNow(true);
     }
 
-    void showSyncState() {
-        if (fmsg == null) return;
-        if (stopping()) {
-            setMsg("Stopping… your progress is saved.", -1);
-            setBtns("Close", (Runnable) this::closePanel);
-        } else if (syncing() && SyncService.ready) {
-            setMsg("Synced around where you are listening.\n\nPlay page, Find page and the sentence highlight work here. It follows you as you play, and maps the new place within a minute or so if you jump somewhere else.", -1);
-            setBtns("Close", (Runnable) this::closePanel, "Stop", (Runnable) () -> { SyncService.stop(this); showSyncState(); });
-        } else if (syncing()) {
-            setMsg(syncStatus() + (SyncService.powerSaving ? "\n\nBattery saver is on, so this is slower than usual." : "")
-                    + "\n\nPlease be patient. You can keep listening or reading meanwhile, leave this screen, or turn the screen off: it keeps going in the background and shows a notification. Stopping is safe: it continues from where it stopped.", statusPct());
-            setBtns("Hide", (Runnable) this::closePanel, "Stop", (Runnable) () -> { SyncService.stop(this); showSyncState(); });
-        } else if (SyncService.fullFor(this, item.id)) {
-            setMsg("This audiobook is synced.\n\nPlay page and Find page are instant now, and the sentence being read is highlighted in the book.", -1);
-            setBtns("Close", (Runnable) this::closePanel, "Sync again", (Runnable) () -> { BookText.clearAudioData(this, item.id); al = new Alignment(); mt.reset(); hlFrom = hlTo = -1; showSyncState(); });
-        } else if (SyncService.winReady(this, item.id)) {
-            setMsg("Synced around where you were listening.\n\nPlay page, Find page and the sentence highlight work there. If you go somewhere else, Find page and Play page map that place on demand (about a minute), or tap Sync here to map it now.", -1);
-            setBtns("Close", (Runnable) this::closePanel, "Sync here", (Runnable) () -> startSync(Whisper.which(this)),
-                    "Start over", (Runnable) () -> { BookText.clearAudioData(this, item.id); al = new Alignment(); mt.reset(); hlFrom = hlTo = -1; updateSyncLabel(); showSyncState(); });
-        } else {
-            boolean part = SyncService.pctFor(this, item.id) > 0;
-            if (!SyncService.error.isEmpty() && !part) { /* show the reason once */ }
-            setMsg((part ? "Paused at " + syncPct() + "%. It continues from there.\n\n" : "")
-                    + "This listens to a few short samples around where you are in the audiobook and links them to the book. Then Play page and Find page are instant there, and the sentence being read is highlighted. It follows you as you play or jump.\n\n"
-                    + "Rough guess: Faster about 2 minutes, Accurate about 5 minutes. It runs in the background."
-                    + (SyncService.error.isEmpty() ? "" : "\n\nLast stop: " + SyncService.error), -1);
-            setBtns("Accurate", (Runnable) () -> startSync(0), "Faster", (Runnable) () -> startSync(1), "Cancel", (Runnable) this::closePanel);
+    /** Starts (or continues) the sync in the background service; it downloads the model and reads the book first when that is needed. */
+    void startSyncNow(boolean tell) {
+        if (item == null || !fileMode) return;
+        if (SyncService.running) return;
+        Store.sp(this).edit().putBoolean("syncPaused_" + item.id, false).apply();
+        if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission("android.permission.POST_NOTIFICATIONS") != android.content.pm.PackageManager.PERMISSION_GRANTED)
+            requestPermissions(new String[]{"android.permission.POST_NOTIFICATIONS"}, 91);
+        SyncService.error = "";
+        SyncService.start(this, item.id);
+        if (tell && !Store.flag(this, "toldBg_" + item.id, false)) {
+            Store.setFlag(this, "toldBg_" + item.id, true);
+            Toast.makeText(this, "Syncing in the background. Keep reading or listening: the ring shows how far it is.", Toast.LENGTH_LONG).show();
+        }
+        h.postDelayed(this::askBackground, 1800);
+        updateSyncLabel(); updateBanner();
+    }
+
+    /** Hold the icon: forget what is linked and start again (the one place that asks, because it throws work away). */
+    void confirmStartOver() {
+        if (item == null || !fileMode) return;
+        if (SyncService.running && SyncService.itemId != item.id) { Toast.makeText(this, "Another book is syncing. Pause it there first.", Toast.LENGTH_SHORT).show(); return; }
+        openDialog("Start the sync over?");
+        setMsg("This forgets what was linked for this book and links it again, starting from where you are. Your pins stay.", -1);
+        setBtns("Start over", (Runnable) () -> { closePanel(); resetSync(); }, "Cancel", (Runnable) this::closePanel);
+    }
+
+    void resetSync() {
+        final long t0 = System.currentTimeMillis();
+        if (SyncService.running && SyncService.itemId == item.id) SyncService.stop(this);
+        h.postDelayed(new Runnable() {
+            @Override public void run() {
+                if (isFinishing()) return;
+                if (SyncService.running && System.currentTimeMillis() - t0 < 6000) { h.postDelayed(this, 300); return; }   // let the running pass end first
+                BookText.clearAudioData(ReaderActivity.this, item.id);
+                al = new Alignment(); mt.reset(); hlFrom = hlTo = -1; sawSyncRunning = false; toldSynced = false;
+                if (sp != null) sp.pictureReady();
+                if (pv != null) pv.invalidate();
+                startSyncNow(false);
+                Toast.makeText(ReaderActivity.this, "Syncing again from the start", Toast.LENGTH_SHORT).show();
+            }
+        }, 300);
+    }
+
+    /** The icon: ring and label tell the whole story with the one number. */
+    void updateSyncLabel() {
+        if (syncIcon == null || item == null) return;
+        boolean run = syncing(), stop = stopping();
+        boolean full = SyncService.fullFor(this, item.id);
+        if (run) sawSyncRunning = true;
+        int pct = full ? 100 : (run || stop) ? SyncService.pct() : SyncService.pctFor(this, item.id);
+        if (!full && !run && !stop && pct >= 100 && al.size() > 0 && aDur > 0) {
+            // a book synced by an older version saved "100%" for 'around where you were': show how much of the WHOLE book that really is, and keep it
+            pct = Math.min(99, 15 + (int) Math.round(85 * al.coverageOf(aDur, SyncPlanner.DENSE_GAP)));
+            Store.sp(this).edit().putInt("syncPct_" + item.id, pct).apply();
+        }
+        String label = full ? "Synced" : stop ? "Pausing" : run ? (pct == 0 ? "Starting" : pct + "%") : pct > 0 ? "Resume " + pct + "%" : "Sync";
+        if (!label.contentEquals(syncIcon.label.getText())) syncIcon.label.setText(label);
+        boolean badge = !full && !run && !stop && pct == 0;   // a dot that says "this is worth doing"
+        if (syncIcon.pct != pct || syncIcon.done != full || syncIcon.badge != badge) {
+            syncIcon.pct = pct;
+            syncIcon.done = full;
+            syncIcon.badge = badge;
+            syncIcon.invalidate();
+        }
+        if (full && sawSyncRunning && !toldSynced) {   // the moment the whole book becomes linked: one tap on the shoulder, once
+            toldSynced = true;
+            performHaptic();
+            Toast.makeText(this, "Synced: the marker, Play page and Find page work everywhere in this book.", Toast.LENGTH_LONG).show();
         }
     }
 
@@ -922,32 +908,6 @@ public class ReaderActivity extends Activity {
                 startActivity(new Intent(android.provider.Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:" + getPackageName())));
             }
         } catch (Exception ignored) {}
-    }
-
-    void startSync(int model) {
-        Dbg.i("Sync", "start tapped, model " + (model == 0 ? "accurate" : "faster") + ", item " + item.id);
-        Whisper.setWhich(this, model);
-        waitingReady = true;
-        syncPanel = false;
-        h.removeCallbacks(syncPoll);
-        ensureModel(() -> ensureText(() -> {
-            if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission("android.permission.POST_NOTIFICATIONS") != android.content.pm.PackageManager.PERMISSION_GRANTED)
-                requestPermissions(new String[]{"android.permission.POST_NOTIFICATIONS"}, 91);
-            SyncService.start(this, item.id);
-            h.postDelayed(this::askBackground, 1800);
-            syncPanel = true;
-            h.postDelayed(() -> { showSyncState(); h.postDelayed(syncPoll, 1000); }, 700);
-            if (autoHidePanel) {
-                autoHidePanel = false;
-                final boolean[] mine = fcancel;
-                h.postDelayed(() -> {
-                    if (fcancel == mine && !mine[0] && SyncService.running) {
-                        closePanel();
-                        Toast.makeText(this, "Syncing in the background. Keep listening or reading, I'll tell you when it's ready.", Toast.LENGTH_LONG).show();
-                    }
-                }, 9000);
-            }
-        }));
     }
 
     void pinHere() {
@@ -993,10 +953,7 @@ public class ReaderActivity extends Activity {
             Toast.makeText(this, "Page " + (target + 1) + " · " + fmtT(ts), Toast.LENGTH_SHORT).show();
             return;
         }
-        if (syncing()) { openPanel("Find page " + (target + 1) + " in the audio"); runLocate(target); return; }
-        prepare("Find page " + (target + 1) + " in the audio",
-                "Page " + (target + 1) + " isn't mapped yet. I listen to a few short pieces of the audio and check them against the book. It usually takes under a minute, and the result is remembered.",
-                "Find it", true, () -> runLocate(target));
+        whenReady(() -> runLocate(target));   // no dialog: a pill says it is looking, the answer is a pill you tap
     }
 
     /**
@@ -1004,11 +961,10 @@ public class ReaderActivity extends Activity {
      * background (the answer then arrives as a tappable pill); only Cancel stops it.
      */
     void runLocate(int target) {
-        final boolean[] panel = fcancel;            // true once the dialog is hidden
+        final boolean[] panel = {true};             // there is no dialog any more: always the pill
         final boolean[] stop = new boolean[1];      // true only when the user cancels
         final long started = System.currentTimeMillis();
-        setMsg("Looking for page " + (target + 1) + "…", -1);
-        setBtns("Hide", (Runnable) this::closePanel, "Cancel", (Runnable) () -> { stop[0] = true; jobText = null; SyncService.goalWordReq = -1; closePanel(); updateBanner(); });
+        jobCancel = () -> { stop[0] = true; jobText = null; jobCancel = null; SyncService.goalWordReq = -1; updateBanner(); };
         new Thread(() -> {
             BookIndex b;
             try { b = BookText.index(this, item.id); } catch (Exception e) { b = null; }
@@ -1060,12 +1016,11 @@ public class ReaderActivity extends Activity {
 
     /** Find my page when the spot isn't mapped yet: the sync service listens at the playhead. Hide keeps it going. */
     void runFindFast() {
-        final boolean[] panel = fcancel;
+        final boolean[] panel = {true};
         final boolean[] stop = new boolean[1];
         final double t0 = aT;
         final long started = System.currentTimeMillis();
-        setMsg("Listening to the audio at " + fmtT(t0) + "…", -1);
-        setBtns("Hide", (Runnable) this::closePanel, "Cancel", (Runnable) () -> { stop[0] = true; jobText = null; closePanel(); updateBanner(); });
+        jobCancel = () -> { stop[0] = true; jobText = null; jobCancel = null; updateBanner(); };
         jobText = "Finding your page…";
         SyncService.hereWord = -1;
         if (!SyncService.running) SyncService.start(this, item.id);
@@ -1222,9 +1177,20 @@ public class ReaderActivity extends Activity {
     void closePanel() {
         fcancel[0] = true;
         if (fdlg != null) { try { fdlg.dismiss(); } catch (Exception ignored) {} fdlg = null; }
+        fmsg = null; fbtns = null; fbar = null;
     }
 
+    /**
+     * Find page / Play page / Find my page are background jobs now, not dialogs: this keeps the old call sites working but shows nothing; the job
+     * speaks through the pill above the player (jobText) and its answer is a tappable pill (postResult).
+     */
     void openPanel(String title) {
+        closePanel();
+        fcancel = new boolean[]{true};
+    }
+
+    /** The one modal left: a question that has to be asked (it throws work away). */
+    void openDialog(String title) {
         closePanel();
         fcancel = new boolean[]{false};
         final boolean[] mine = fcancel;
@@ -1273,6 +1239,7 @@ public class ReaderActivity extends Activity {
     }
 
     void setBtns(Object... pairs) {
+        if (fbtns == null) return;
         fbtns.removeAllViews();
         int ink = INK[theme], paper = PAPER[theme];
         for (int i = 0; i + 1 < pairs.length; i += 2) {
@@ -1297,74 +1264,31 @@ public class ReaderActivity extends Activity {
         setBtns("Close", (Runnable) this::closePanel);
     }
 
-    /** Makes sure the speech model and the book text are ready, then runs `go`. */
-    void prepare(String title, String intro, String startLabel, boolean confirm, Runnable go) {
-        if (!mpReady) { Toast.makeText(this, "The audio is still loading", Toast.LENGTH_SHORT).show(); return; }
-        if (Player.isPlaying()) Player.pause(this);
-        openPanel(title);
-        Runnable start = () -> ensureModel(() -> ensureText(go));
-        if (confirm || !Whisper.hasModel(this) || !BookText.ready(this, item.id)) {
-            String extra = "";
-            if (!Whisper.hasModel(this)) extra += "\n\nFirst time: it downloads a small offline speech model (" + Whisper.SIZES[Whisper.which(this)] + ", needs internet once) and reads the book's text. Both stay on your phone.";
-            else if (!BookText.ready(this, item.id)) extra += "\n\nFirst time: it reads the book's text once (a minute or so).";
-            setMsg(intro + extra, -1);
-            setBtns(startLabel, (Runnable) start, "Cancel", (Runnable) this::closePanel);
-        } else start.run();
-    }
-
-    /** Failure text in the dialog if it is open, else as a pill. */
-    void failOrPost(String msg) {
-        if (fdlg != null) fail(msg); else postResult(msg, null);
-    }
-
-    void ensureModel(Runnable next) {
-        if (Whisper.hasModel(this)) { next.run(); return; }
-        final boolean[] stop = new boolean[1];
+    /**
+     * Runs {@code go} once the speech model and the book text are on the phone. If they are not, the background service fetches them (and starts
+     * linking the book, which is what the user wants anyway); the pill says what is happening. A tap on the pill cancels.
+     */
+    void whenReady(Runnable go) {
+        if (item == null) return;
+        if (Whisper.hasModel(this) && BookText.ready(this, item.id)) { go.run(); return; }
+        jobText = "Getting ready…";
+        jobCancel = () -> { jobText = null; jobCancel = null; updateBanner(); };
+        updateBanner();
+        startSyncNow(false);
         final long t0 = System.currentTimeMillis();
-        // the download runs in the background service: hiding this panel or leaving the book does not stop it, only Cancel does
-        SyncService.dlPct = 0;
-        if (!SyncService.running) SyncService.start(this, item.id);
-        setMsg("Downloading the speech model… 0%\n\nIt keeps going in the background. You can hide this and use your phone.", 0);
-        setBtns("Hide", (Runnable) this::closePanel, "Cancel download", (Runnable) () -> { stop[0] = true; SyncService.stop(this); closePanel(); });
         h.postDelayed(new Runnable() {
             @Override public void run() {
-                if (stop[0] || isFinishing()) return;
-                if (Whisper.hasModel(ReaderActivity.this)) { next.run(); return; }
-                int pc = SyncService.dlPct;
+                if (isFinishing() || jobText == null) return;   // left, or cancelled by a tap on the pill
+                if (Whisper.hasModel(ReaderActivity.this) && BookText.ready(ReaderActivity.this, item.id)) { jobText = null; jobCancel = null; go.run(); return; }
                 if (!SyncService.running && System.currentTimeMillis() - t0 > 4000) {
-                    failOrPost("The download didn't finish. Check your internet and try again." + (SyncService.error.isEmpty() ? "" : "\n\n" + SyncService.error));
+                    jobText = null; jobCancel = null;
+                    postResult(SyncService.error.isEmpty() ? "Couldn't get ready. Try again." : SyncService.error, null);
                     return;
                 }
-                if (pc >= 0 && fdlg != null) setMsg("Downloading the speech model… " + pc + "%\n\nIt keeps going in the background. You can hide this and use your phone.", pc);
-                h.postDelayed(this, 500);
+                h.postDelayed(this, 600);
             }
-        }, 500);
+        }, 600);
     }
-
-    void ensureText(Runnable next) {
-        if (BookText.ready(this, item.id)) { next.run(); return; }
-        final boolean[] stop = new boolean[1];
-        final long t0 = System.currentTimeMillis();
-        // the service reads the book's text: it carries on when this panel is hidden or the screen is off
-        SyncService.textPct = 0;
-        if (!SyncService.running) SyncService.start(this, item.id);
-        setMsg("Reading the book… 0%\n\nIt keeps going in the background. You can hide this.", 0);
-        setBtns("Hide", (Runnable) this::closePanel, "Cancel", (Runnable) () -> { stop[0] = true; SyncService.stop(this); closePanel(); });
-        h.postDelayed(new Runnable() {
-            @Override public void run() {
-                if (stop[0] || isFinishing()) return;
-                if (BookText.ready(ReaderActivity.this, item.id)) { loadSyncData(); next.run(); return; }
-                int pc = SyncService.textPct;
-                if (!SyncService.running && System.currentTimeMillis() - t0 > 4000) {
-                    failOrPost(SyncService.error.isEmpty() ? "Couldn't read the text of this PDF." : SyncService.error);
-                    return;
-                }
-                if (pc >= 0 && fdlg != null) setMsg("Reading the book… " + pc + "%\n\nIt keeps going in the background. You can hide this.", pc);
-                h.postDelayed(this, 500);
-            }
-        }, 500);
-    }
-
 
     void findMyPage() {
         if (mpReady && bi != null && al.size() > 0) {
@@ -1373,22 +1297,16 @@ public class ReaderActivity extends Activity {
                 final int pg = bi.pageOf(j);
                 final double t0 = aT;
                 Dbg.i("Find", "instant from sync: " + fmtT(t0) + " -> page " + (pg + 1));
-                openPanel("Find my page");
-                int[] sn = bi.sentenceAround(j);
-                StringBuilder sb = new StringBuilder();
-                for (int k = sn[0]; k <= Math.min(sn[1], sn[0] + 18); k++) sb.append(bi.w[k]).append(' ');
-                setMsg("At " + fmtT(t0) + " the audio is on page " + (pg + 1) + ".\n\nReading: “" + sb.toString().trim() + (sn[1] > sn[0] + 18 ? "…" : "") + "”", -1);
-                setBtns("Go to page " + (pg + 1), (Runnable) () -> { goTo(pg, false); closePanel(); },
-                        "Pin it here", (Runnable) () -> { goTo(pg, false); pinAt(pg, t0); closePanel(); });
+                goTo(pg, true);
+                postResult("The audio is on page " + (pg + 1) + " · " + fmtT(t0), null);
                 return;
             }
         }
         Dbg.i("Find", "no sync data at " + fmtT(aT) + ", listening instead");
-        if (syncing()) { openPanel("Find my page"); runFindFast(); return; }
         findMyPageListening();
     }
 
-    void findMyPageListening() { prepare("Find my page", "This listens to a few seconds of the audio at your position and finds the page in the book.", "Find", false, this::runFindFast); }
+    void findMyPageListening() { whenReady(this::runFindFast); }
 
     void pinAt(int page, double t) {
         Dbg.i("Pin", "page " + (page + 1) + " = " + fmtT(Math.floor(t)));
@@ -1481,8 +1399,10 @@ public class ReaderActivity extends Activity {
             if (pendingText != null && System.currentTimeMillis() < pendingUntil) {
                 Runnable act = pendingAct; pendingText = null; pendingAct = null; updateBanner();
                 if (act != null) act.run();
-            } else if (!SyncService.running && !SyncService.error.isEmpty()) { SyncService.error = ""; SyncService.start(this, item.id); }
-            else showSync();
+            } else if (jobText != null && jobCancel != null) {
+                Runnable c = jobCancel; c.run();
+                Toast.makeText(this, "Cancelled", Toast.LENGTH_SHORT).show();
+            } else if (!SyncService.running && !SyncService.error.isEmpty()) startSyncNow(false);
         });
         bannerWrap.addView(syncBanner);
         bannerWrap.setVisibility(View.GONE);
@@ -1564,7 +1484,8 @@ public class ReaderActivity extends Activity {
             pinIcon = navItem(0, "Pins", this::showPins);
             navItem(1, "Play page", this::playPageAudio);
             navItem(2, "Find page", this::findMyPage);
-            syncIcon = navItem(4, "Sync", this::showSync);
+            syncIcon = navItem(4, "Sync", this::onSyncTap);
+            syncIcon.holder.setOnLongClickListener(v -> { confirmStartOver(); return true; });
             controlsCol.addView(navBar, new LinearLayout.LayoutParams(-1, -2));
             bottom.addView(controlsCol, new LinearLayout.LayoutParams(-1, -2));
         } else {
@@ -1719,7 +1640,7 @@ public class ReaderActivity extends Activity {
         if (ui) {
             settings.addView(switchRow("Highlight the spoken sentence", hlOn, on -> { hlOn = on; Store.setFlag(this, "rdHl", on); if (pv != null) pv.invalidate(); }), lpm(-1, -2, 0, 12, 0, 0));
             settings.addView(switchRow("Turn pages with the audio", followOn, on -> { followOn = on; Store.setFlag(this, "rdFollow", on); }), lpm(-1, -2, 0, 12, 0, 0));
-            settings.addView(switchRow("Offer to sync when I press Play", Store.flag(this, "syncAsk", true), on -> Store.setFlag(this, "syncAsk", on)), lpm(-1, -2, 0, 12, 0, 0));
+            settings.addView(switchRow("Sync when I press Play", Store.flag(this, "syncAsk", true), on -> Store.setFlag(this, "syncAsk", on)), lpm(-1, -2, 0, 12, 0, 0));
             TextView hs = new TextView(this);
             hs.setText("Highlight style: " + (hlStyle == 0 ? "Marker" : "Underline") + "  ›");
             hs.setTextSize(15);
@@ -1727,13 +1648,6 @@ public class ReaderActivity extends Activity {
             hs.setPadding(0, dp(14), 0, dp(4));
             hs.setOnClickListener(v -> { hlStyle = 1 - hlStyle; Store.setNum(this, "rdHlStyle", hlStyle); hs.setText("Highlight style: " + (hlStyle == 0 ? "Marker" : "Underline") + "  ›"); if (pv != null) pv.invalidate(); });
             settings.addView(hs);
-            TextView sy = new TextView(this);
-            sy.setText("Sync with the book…");
-            sy.setTextSize(15);
-            sy.setTag("txt");
-            sy.setPadding(0, dp(14), 0, dp(4));
-            sy.setOnClickListener(v -> { settings.setVisibility(View.GONE); showSync(); });
-            settings.addView(sy);
         }
     }
 

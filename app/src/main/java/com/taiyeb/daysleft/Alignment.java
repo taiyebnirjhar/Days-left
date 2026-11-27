@@ -17,6 +17,14 @@ class Alignment {
 
     double typicalWps() { return typ; }
 
+    /** The share (0..1) of an audio of {@code totalSec} that this alignment covers with probes at most `gap` seconds apart (the old syncs' saved number meant something else). */
+    double coverageOf(double totalSec, double gap) {
+        if (totalSec <= 0 || aw.length < 2) return 0;
+        double c = 0;
+        for (int i = 0; i + 1 < at.length; i++) if (at[i + 1] - at[i] <= gap) c += at[i + 1] - at[i];
+        return Math.max(0, Math.min(1, c / totalSec));
+    }
+
     /** Words per second over everything mapped (a coarse pace, used when the close-probe pace is unknown), or 0. */
     double averageWps() {
         if (aw.length < 2) return 0;

@@ -47,8 +47,30 @@ public class SyncService extends Service {
     /** Book word at the playhead once it is known (for Find page), else -1. */
     static volatile int hereWord = -1;
     static final double WINDOW = 600;   // seconds mapped either side of the playhead
+    /** 0..1 of the WHOLE audio that is linked to the book (SyncPlanner.coverage). */
+    static volatile double coverage;
+    /** The planner has nothing left to do anywhere: the whole book is linked. */
+    static volatile boolean complete;
+    /** The speech model / the book text are on the phone (the two things the first run has to prepare). */
+    static volatile boolean modelOk, textOk;
+    private static volatile int shown;     // the number on screen: never goes down
+    private static volatile double cov0;   // coverage when mapping began (for the time left)
+    private static volatile long mapStartMs;
 
-    /** Saved progress of the window sync, 0..100. */
+    /**
+     * THE progress number, 0..100, the same on the nav icon, the pill and the notification. Three phases that always weigh the same, so it does not jump
+     * when a later run has less to prepare: the speech model (6, once per phone), the book text (9, once per book), then linking the whole audiobook (85).
+     * It never goes down: a stretch of the book that is linked stays linked, the playhead moving does not matter.
+     */
+    static int pct() {
+        double p = 6 * (modelOk ? 1 : Math.max(0, dlPct) / 100.0) + 9 * (textOk ? 1 : modelOk ? Math.max(0, textPct) / 100.0 : 0);
+        if (modelOk && textOk) p += 85 * (complete ? 1 : coverage);
+        int v = (int) Math.round(Math.min(complete ? 100 : 99, p));
+        if (v > shown) shown = v;
+        return shown;
+    }
+
+    /** Saved progress of this book, 0..100 (what the icon shows when the service is not running). */
     static int pctFor(Context c, int id) { return Store.sp(c).getInt("syncPct_" + id, 0); }
 
     static boolean winReady(Context c, int id) { return Store.sp(c).getBoolean("syncWin_" + id, false); }
@@ -66,7 +88,7 @@ public class SyncService extends Service {
         Dbg.i("Sync", "stop requested (item " + itemId + ", at " + (int) doneSec + " s)");
         cancel = true;
         Whisper.abort(true);   // stop the piece being listened to right now, not after it
-        if (itemId >= 0) Store.sp(c).edit().putBoolean("syncWant_" + itemId, false).apply();   // the user asked to stop: don't auto-resume
+        if (itemId >= 0) Store.sp(c).edit().putBoolean("syncWant_" + itemId, false).putBoolean("syncPaused_" + itemId, true).apply();   // the user asked to stop (icon or notification): don't auto-resume, don't auto-start on Play
     }
 
     static boolean wanted(Context c, int id) { return Store.sp(c).getBoolean("syncWant_" + id, false); }
@@ -74,40 +96,28 @@ public class SyncService extends Service {
     static double doneFor(Context c, int id) { return Store.sp(c).getFloat("syncDone_" + id, 0f); }
     static boolean fullFor(Context c, int id) { return Store.sp(c).getBoolean("syncFull_" + id, false); }
 
-    /** Minutes left, from the speed so far; -1 while unknown. */
-    static int etaMinutes() {
-        double got = doneSec - startedFrom, el = (System.currentTimeMillis() - startedMs) / 1000.0;
-        if (got < 60 || el < 20) return -1;
-        return (int) Math.ceil((totalSec - doneSec) / (got / el) / 60.0);
+    /** " · about 6 min left" from how fast the book has been linking since mapping began; "" while that is not known well enough to say. */
+    static String etaText() {
+        double c = coverage;
+        long el = System.currentTimeMillis() - mapStartMs;
+        if (mapStartMs == 0 || complete || el < 40000 || c - cov0 < 0.03) return "";
+        double sec = (1 - c) / ((c - cov0) / (el / 1000.0));
+        if (sec > 3 * 3600) return "";
+        return sec < 60 ? " · under a minute left" : " · about " + (int) Math.ceil(sec / 60.0) + " min left";
     }
 
-    /** Seconds left in the current stage, from the speed since the stage began; -1 when unknown or absurd. */
-    static int etaSeconds() {
-        if (ready) return -1;
-        double got = doneSec - startedFrom, el = (System.currentTimeMillis() - startedMs) / 1000.0;
-        if (got < 8 || el < 8) return -1;
-        double sec = Math.max(0, totalSec - doneSec) / (got / el);
-        return sec > 900 ? -1 : (int) Math.ceil(sec);
-    }
-
-    /** What the sync is doing, in words. The notification, the pill and the panel all use this, so they never disagree. */
+    /** What the sync is doing, in words. The notification, the pill and the icon all use this and pct(), so they never disagree. */
     static String statusText() {
-        if (dlPct >= 0) return "Downloading the speech model… " + dlPct + "%";
-        if (textPct >= 0) return "Reading the book… " + textPct + "%";
-        if (ready) return "Ready · follows you as you listen";
-        if (anchorCount == 0 || statusPct() < 3) return "Finding your place in the audio…";   // nothing mapped around you yet: do not show a percentage
-        int sec = etaSeconds();
-        return "Syncing around you… " + statusPct() + "%" + (sec > 0 ? " · about " + (sec >= 90 ? (sec + 30) / 60 + " min" : sec + " s") : "");
+        if (dlPct >= 0) return "Downloading the speech model, once · " + dlPct + "%";
+        if (textPct >= 0) return "Reading the book · " + textPct + "%";
+        if (!modelOk || !textOk) return "Getting ready…";
+        if (complete) return "Synced";
+        if (anchorCount == 0) return "Finding your place in the audio…";
+        return "Linking the audiobook to the book · " + pct() + "%" + etaText();
     }
 
-    /** The number that goes with statusText(), or -1 when there is none (yet). */
-    static int statusPct() {
-        if (dlPct >= 0) return dlPct;
-        if (textPct >= 0) return textPct;
-        if (ready) return 100;
-        if (anchorCount == 0) return -1;
-        return totalSec > 0 ? (int) Math.max(0, Math.min(99, doneSec * 100 / totalSec)) : 0;
-    }
+    /** The number that goes with statusText(). */
+    static int statusPct() { return pct(); }
 
     @Override public IBinder onBind(Intent i) { return null; }
 
@@ -131,6 +141,7 @@ public class SyncService extends Service {
         if (stopping) { stop(this); if (!running) { stopForeground(true); stopSelf(); } return START_NOT_STICKY; }
         if (running) return START_REDELIVER_INTENT;
         final int id = in == null ? -1 : in.getIntExtra("id", -1);
+        shown = pctFor(this, id); coverage = 0; complete = false; mapStartMs = 0;   // continue from the saved number
         running = true; cancel = false; idle = false; ready = false; try { powerSaving = getSystemService(PowerManager.class).isPowerSaveMode(); } catch (Exception ignored) {} error = ""; itemId = id; hereWord = -1; goalTimeOut = -1;
         Whisper.abort(false);
         Store.sp(this).edit().putBoolean("syncWant_" + id, true).apply();
@@ -180,10 +191,11 @@ public class SyncService extends Service {
     }
 
     private void work(int id) {
-        boolean complete = false;
+        boolean doneNote = false;   // tell the user at the end that the whole book is linked
         try {
             Item it = Learn.item(this, id);
             if (it == null || it.audio.isEmpty()) throw new Exception("no audio file");
+            modelOk = Whisper.hasModel(this); textOk = BookText.ready(this, id);
             AudioClip.warm(this, it.audio);   // opening a 10 h file takes ~10 s: do it now, while the model/book text are prepared
             if (!Whisper.hasModel(this)) {
                 // downloaded here, in the service, so it carries on when the dialog is closed or the screen is off
@@ -199,9 +211,11 @@ public class SyncService extends Service {
                     }, stop);
                 } catch (Exception e) {
                     if (cancel) { Dbg.i("Sync", "model download cancelled"); return; }
-                    throw e;
+                    Dbg.e("Sync", "model download failed", e);
+                    throw new Exception("Couldn't download the speech model (about 30 MB, once). Check the internet, then tap Sync.");
                 } finally { dlPct = -1; }
-                if (!Whisper.hasModel(this)) throw new Exception("speech model missing");
+                if (!Whisper.hasModel(this)) throw new Exception("Couldn't download the speech model. Check the internet, then tap Sync.");
+                modelOk = true;
             }
             if (!BookText.ready(this, id)) {
                 // the book's text is read here too, so it does not depend on the dialog being open
@@ -220,6 +234,7 @@ public class SyncService extends Service {
                     throw e;
                 } finally { textPct = -1; }
                 if (BookText.looksScanned(got)) { BookText.forget(this, id); throw new Exception("This PDF is made of page pictures (a scan), so there is no text to match against."); }
+                textOk = true;
             }
             BookIndex bi = BookText.index(this, id);
             Aligner al = new Aligner(bi);
@@ -256,7 +271,7 @@ public class SyncService extends Service {
                     liveItem = id; liveVer++;
                 }
                 @Override public void readyChanged(boolean r, double zd, double zt) {
-                    Store.sp(SyncService.this).edit().putBoolean("syncWin_" + id, r).putInt("syncPct_" + id, r ? 100 : (int) (zd * 100 / Math.max(1, zt))).apply();
+                    Store.sp(SyncService.this).edit().putBoolean("syncWin_" + id, r).apply();   // 'marker works around the playhead'; the progress number is pct()
                 }
                 @Override public void log(String m) { Dbg.i("Sync", m); }
                 @Override public void batch(int n, long msDec, long msTr, String detail) {
@@ -264,6 +279,9 @@ public class SyncService extends Service {
                 }
             }, System.currentTimeMillis());
             Dbg.i("Sync", "start item " + id + ", model " + (Whisper.which(this) == 0 ? "accurate" : "faster") + ", audio " + (int) pl.total + " s, from " + (int) here + " s, known anchors " + pl.anchorCount() + ", book words " + bi.count());
+            cov0 = pl.coverage(); mapStartMs = System.currentTimeMillis();
+            boolean boosted = true;   // thread priority: high until the marker works here, normal afterwards (the speech threads inherit it)
+            boolean savedFull = false;
             long lastNote = 0, idleSince = 0;
             while (!cancel) {
                 int rc;
@@ -275,6 +293,8 @@ public class SyncService extends Service {
                 }
                 // what the screen reads
                 doneSec = core.doneSec; totalSec = core.totalSec; anchorCount = core.anchorCount; ready = core.ready;
+                coverage = core.coverage; complete = core.complete;
+                if (boosted && ready) { boosted = false; try { android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_DEFAULT); } catch (Exception ignored) {} }
                 startedFrom = core.startedFrom; startedMs = core.startedMs;
                 if (Player.ready) hereWord = core.hereWord;
                 if (goalWordReq >= 0) goalTimeOut = core.goalTime;
@@ -287,22 +307,27 @@ public class SyncService extends Service {
                             idle = true;
                             Dbg.i("Sync", "mapped around " + (int) Player.pos() + " s after listening to " + (long) core.listened + " s in " + core.probes + " probes");
                         }
-                        nm.notify(7100, note(statusText(), statusPct(), statusPct() < 0));
+                        nm.notify(7100, note(statusText(), statusPct(), false));
+                    }
+                    if (complete && !savedFull) {
+                        savedFull = true; doneNote = true;
+                        Store.sp(this).edit().putBoolean("syncFull_" + id, true).putInt("syncPct_" + id, 100).apply();
+                        Dbg.i("Sync", "the whole book is linked (" + core.probes + " probes, " + (long) core.listened + " s listened)");
                     }
                     if (!Player.isPlaying() && nowMs - idleSince > 10000) break;
                     Thread.sleep(2000);
                     continue;
                 }
                 idleSince = 0;
-                Store.sp(this).edit().putFloat("syncDone_" + id, (float) doneSec).putInt("syncPct_" + id, ready ? 100 : (int) Math.min(100, doneSec * 100 / Math.max(1, totalSec))).apply();
                 if (nowMs - lastNote > 4000) {
                     lastNote = nowMs;
-                    nm.notify(7100, note(statusText(), statusPct(), statusPct() < 0));
+                    Store.sp(this).edit().putInt("syncPct_" + id, pct()).apply();   // the saved number only grows too
+                    nm.notify(7100, note(statusText(), statusPct(), false));
                 }
             }
             Dbg.i("Sync", "listened to " + (long) core.listened + " s of " + (int) pl.total + " s in " + core.probes + " probes (" + (long) (core.listened * 100 / Math.max(1, pl.total)) + "%)");
             if (!cancel && pl.lost && error.isEmpty()) error = "Lost the place in the audio. Pin a page, then start the sync again.";
-            if (!cancel && error.isEmpty()) Store.sp(this).edit().putBoolean("syncWin_" + id, true).putInt("syncPct_" + id, 100).apply();   // wanted stays on: it resumes next time the book opens
+            Store.sp(this).edit().putInt("syncPct_" + id, pct()).apply();
         } catch (Exception e) {
             error = String.valueOf(e.getMessage());
             Dbg.e("Sync", "failed", e);
@@ -315,7 +340,7 @@ public class SyncService extends Service {
             Whisper.abort(false);
             if (wl != null && wl.isHeld()) wl.release();
             stopForeground(true);
-            if (complete) finishNote("Audiobook synced", "Instant page lookup and highlighting are ready.");
+            if (doneNote) finishNote("Audiobook synced", "Page lookup and the sentence marker work everywhere in the book.");
             else if (!error.isEmpty()) finishNote("Sync stopped", error);
             stopSelf();
         }

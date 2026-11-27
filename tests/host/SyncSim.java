@@ -133,6 +133,36 @@ public class SyncSim {
             if (wide[0] < 95) bad++;
         }
 
+        // ---- 1b2. the progress number: the share of the WHOLE book that is linked. It must only grow (also across playhead jumps and the staged widening
+        // 150 s -> 600 s -> whole book), reach 100% when the planner has nothing left to do, and the whole book must be done in a sensible number of calls ----
+        {
+            build(71, hours, callSec);
+            int[] ps5 = {0, N};
+            Aligner al5 = new Aligner(new BookIndex(book, ps5, new float[N * 4], new byte[N]));
+            double playhead = 0.4 * total;
+            SyncPlanner p = new SyncPlanner(total, playhead, N, new int[0], new double[0]);
+            p.dense = true;
+            double[] stages = {150, 600, Double.POSITIVE_INFINITY};
+            int stage = 0; p.reach = stages[0];
+            double last = 0, worstDrop = 0; int callsDone = 0, jumps = 0; boolean idle = false; java.util.Random jr = new java.util.Random(7);
+            long cs0 = calls;
+            for (int i = 0; i < 4000 && !idle; i++) {
+                if (i % 40 == 39) { playhead = jr.nextDouble() * (total - 100); jumps++; }   // the user jumps somewhere else
+                playhead += 3;
+                p.recenter(playhead);
+                boolean work = step(p, al5);
+                if (!work) { if (stage < stages.length - 1) { stage++; p.widen(stages[stage]); p.dense = true; } else idle = true; }
+                else callsDone++;
+                double c = p.coverage();
+                worstDrop = Math.max(worstDrop, last - c);
+                last = c;
+            }
+            System.out.printf("whole book (%.1f h) with %d playhead jumps: linked in %d speech calls (~%.0f min on the phone at ~9 s a call), progress ended at %.1f%%, largest drop %.4f%%%n",
+                    hours, jumps, callsDone, callsDone * 9 / 60.0, last * 100, worstDrop * 100);
+            if (worstDrop > 1e-9) { System.out.println("  BAD: the progress number went down"); bad++; }
+            if (!idle || last < 0.95) { System.out.println("  BAD: the whole book was not linked (idle " + idle + ", " + last * 100 + "%)"); bad++; }
+        }
+
         // ---- 1c. press play on an unsynced book and listen: how soon is the highlight there, and is it right? ----
         SyncPlanner.DENSE_NEAR = Double.parseDouble(System.getProperty("dn", "20"));
         SyncPlanner.NEAR_AHEAD = Double.parseDouble(System.getProperty("na", "150"));

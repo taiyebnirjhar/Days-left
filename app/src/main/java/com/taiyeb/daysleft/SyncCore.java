@@ -35,7 +35,7 @@ final class SyncCore {
     static final int WORKED = 0, IDLE = 1, LOST = 2;
 
     /** First a ring around the playhead (usable quickly), then the wide window. */
-    static final double[] STAGES = {150, 600};
+    static final double[] STAGES = {150, 600, Double.POSITIVE_INFINITY};   // around the playhead first, then outward until the whole book is done
 
     final SyncPlanner pl;
     final Aligner al;
@@ -46,6 +46,8 @@ final class SyncCore {
     volatile double doneSec, totalSec;
     volatile int anchorCount;
     volatile boolean ready;
+    volatile double coverage;         // 0..1 of the whole audio linked to the book: the user's progress number
+    volatile boolean complete;        // nothing left to do anywhere (the whole book is done)
     volatile int hereWord = -1;
     volatile double goalTime = -1;
     double startedFrom;
@@ -90,10 +92,12 @@ final class SyncCore {
             if (pl.lost) return LOST;
             if (stage < STAGES.length - 1) {
                 stage++; pl.widen(STAGES[stage]); pl.dense = true; widening = true;
-                sink.log("zone ready around " + (int) pl.focus + " s after " + probes + " probes; widening to +-" + (int) STAGES[stage] + " s");
+                sink.log("zone ready around " + (int) pl.focus + " s after " + probes + " probes; widening to " + (Double.isInfinite(STAGES[stage]) ? "the whole book" : "+-" + (int) STAGES[stage] + " s"));
                 return WORKED;
             }
             widening = false;
+            coverage = pl.coverage();
+            complete = !pl.lost;   // the planner has nothing left to do anywhere
             return IDLE;
         }
 
@@ -134,6 +138,8 @@ final class SyncCore {
         totalSec = zp[1];
         doneSec = Math.max(0, Math.min(zp[1], zp[0]));
         anchorCount = pl.anchorCount();
+        coverage = pl.coverage();
+        if (known) complete = false;   // new work turned up (the playhead moved to a place that needs refining)
         if (known) hereWord = pl.wordNear(playhead);
     }
 

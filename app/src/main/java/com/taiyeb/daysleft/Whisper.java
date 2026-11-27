@@ -17,8 +17,9 @@ class Whisper {
     static final String[] SIZES = {"about 60 MB", "about 32 MB"};
     static final String BASE_URL = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/";
 
-    static int which(Context c) { return Store.num(c, "wModel", 1) == 1 ? 1 : 0; }   // unset = the fast model (about 3x quicker)
-    static void setWhich(Context c, int m) { if (m != which(c)) release(); Store.setNum(c, "wModel", m); }
+    /** One model for everybody: the fast one (about 3x quicker, and the end-to-end test shows it is accurate enough). The user is never asked. */
+    static int which(Context c) { return 1; }
+    static void setWhich(Context c, int m) { /* no choice any more */ }
 
     static native long nInit(String path);
     static native String nRun(long ctx, float[] pcm, int threads);
@@ -47,7 +48,7 @@ class Whisper {
         File tmp = new File(c.getFilesDir(), MODELS[wm] + ".part");
         Exception last = null;
         for (int attempt = 1; attempt <= 6; attempt++) {
-            if (cancel[0]) { tmp.delete(); throw new Exception("cancelled"); }
+            if (cancel[0]) throw new Exception("cancelled");   // the partial file stays: the next download carries on from it
             try {
                 long have = tmp.exists() ? tmp.length() : 0;
                 HttpURLConnection con = (HttpURLConnection) new URL(BASE_URL + MODELS[wm]).openConnection();
@@ -67,7 +68,7 @@ class Whisper {
                     long got = have;
                     int r, lastPc = -1;
                     while ((r = in.read(buf)) > 0) {
-                        if (cancel[0]) { tmp.delete(); throw new Exception("cancelled"); }
+                        if (cancel[0]) throw new Exception("cancelled");   // the partial file stays: the next download carries on from it
                         out.write(buf, 0, r);
                         got += r;
                         int pc = total > 0 ? (int) (got * 100 / total) : 0;

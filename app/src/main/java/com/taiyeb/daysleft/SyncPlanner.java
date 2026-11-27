@@ -168,6 +168,34 @@ final class SyncPlanner {
 
     int anchorCount() { return anchors.size(); }
 
+    private boolean edgeLoDone, edgeHiDone;   // sticky: once the whole-book walk has reached an end of the audio it stays reached
+
+    /**
+     * The share (0..1) of the WHOLE audio that is linked to the book well enough: stretches between probes at most DENSE_GAP apart, stretches that were
+     * listened to and held nothing (settled), and the two ends once the walk over the whole book has reached them. It does not depend on where the
+     * playhead is or how far the window reaches, and it only ever grows (anchors and settled stretches are only added, the ends are sticky): this is
+     * the ONE progress number the user sees.
+     */
+    double coverage() {
+        if (anchors.isEmpty() || total <= 0) return 0;
+        boolean whole = Double.isInfinite(reach);
+        if (whole && bwdDone) edgeLoDone = true;
+        if (whole && fwdDone) edgeHiDone = true;
+        List<double[]> iv = new ArrayList<>();
+        double pt = -1;
+        for (Double t : anchors.keySet()) { if (pt >= 0 && t - pt <= DENSE_GAP) iv.add(new double[]{pt, t}); pt = t; }
+        iv.addAll(voids);
+        if (edgeLoDone) iv.add(new double[]{0, anchors.firstKey()});
+        if (edgeHiDone) iv.add(new double[]{anchors.lastKey(), total});
+        iv.sort((x, y) -> Double.compare(x[0], y[0]));
+        double covered = 0, curEnd = 0;
+        for (double[] v : iv) {
+            double a2 = Math.max(Math.max(v[0], 0), curEnd), b2 = Math.min(v[1], total);
+            if (b2 > a2) { covered += b2 - a2; curEnd = b2; } else if (b2 > curEnd) curEnd = b2;
+        }
+        return Math.max(0, Math.min(1, covered / total));
+    }
+
     /** The narrator's usual words per second, from probes that are close together; 0 when unknown. */
     double typicalWps() { return typicalRate(); }
 
@@ -228,6 +256,11 @@ final class SyncPlanner {
         if (!seeded) {
             for (int i = 0; i < max; i++) { Req r = seed(); if (r == null) break; out.add(r); }
             return out;
+        }
+        // dense mode: gaps in the zone around the playhead come before the far walkers (a whole-book walk must never delay the marker the user is looking at)
+        if (dense && Double.isInfinite(reach)) {
+            while (out.size() < max) { Req g = gap(NEAR_AHEAD + 20); if (g == null) break; out.add(g); }
+            if (!out.isEmpty()) return out;
         }
         // dense mode: fill the zone in front of the playhead first (two of the three slots while the zone behind it needs work too)
         boolean fz = dense && !fwdDone && inFwdZone(), bz = dense && !bwdDone && inBwdZone();
@@ -444,7 +477,10 @@ final class SyncPlanner {
         return typCache;
     }
 
-    private Req gap() {
+    private Req gap() { return gap(Double.MAX_VALUE); }
+
+    /** The gap that most needs a probe, nearest to the playhead first; only gaps whose middle is within maxDist seconds of it. */
+    private Req gap(double maxDist) {
         double bestD = Double.MAX_VALUE, lt = 0, rt = 0;
         int lw = 0, rw = 0;
         double pt = -1; int pw = 0;
@@ -455,7 +491,7 @@ final class SyncPlanner {
             boolean pauseGap = dense && pt >= 0 && t - pt > 7 && typ > 0 && (rr < 0.55 * typ || (e.getValue() - pw >= 5 && rr > Alignment.FAST_GAP * typ));   // a pause, music or unread text sits in here: look inside
             if (pt >= 0 && t - pt <= GAP_MAX && (t - pt > gapLimit((pt + t) / 2) || pauseGap) && !badGaps.contains(Math.round(pt * 10)) && !inFlightGaps.contains(Math.round(pt * 10)) && pt < startSec + reach && t > startSec - reach) {
                 double d = Math.abs((pt + t) / 2 - focus);
-                if (d < bestD) { bestD = d; lt = pt; rt = t; lw = pw; rw = e.getValue(); }
+                if (d < bestD && d <= maxDist) { bestD = d; lt = pt; rt = t; lw = pw; rw = e.getValue(); }
             }
             pt = t; pw = e.getValue();
         }
