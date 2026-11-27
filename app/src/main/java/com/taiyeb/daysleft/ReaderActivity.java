@@ -1683,18 +1683,6 @@ public class ReaderActivity extends Activity {
         br.setTag("seek");
         settings.addView(br, lpm(-1, -2, 0, 2, 0, 0));
 
-        LinearLayout tr = new LinearLayout(this);
-        tr.setGravity(Gravity.CENTER_VERTICAL);
-        TextView tt = new TextView(this);
-        tt.setText("Trim empty margins");
-        tt.setTextSize(15);
-        tt.setTag("txt");
-        tr.addView(tt, new LinearLayout.LayoutParams(0, -2, 1f));
-        Switch s = new Switch(this);
-        s.setChecked(trim);
-        s.setOnCheckedChangeListener((b, on) -> { trim = on; Store.setFlag(this, "rdTrim", on); computeCrop(); });
-        tr.addView(s);
-        settings.addView(tr, lpm(-1, -2, 0, 12, 0, 0));
         // how pages change: one choice for both positions, two options side by side
         LinearLayout pc = new LinearLayout(this);
         pc.setGravity(Gravity.CENTER_VERTICAL);
@@ -1713,6 +1701,19 @@ public class ReaderActivity extends Activity {
         pc.addView(seg);
         settings.addView(pc, lpm(-1, -2, 0, 14, 0, 0));
         refreshPageChangeSeg();
+
+        LinearLayout tr = new LinearLayout(this);
+        tr.setGravity(Gravity.CENTER_VERTICAL);
+        TextView tt = new TextView(this);
+        tt.setText("Trim empty margins");
+        tt.setTextSize(15);
+        tt.setTag("txt");
+        tr.addView(tt, new LinearLayout.LayoutParams(0, -2, 1f));
+        Switch s = new Switch(this);
+        s.setChecked(trim);
+        s.setOnCheckedChangeListener((b, on) -> { trim = on; Store.setFlag(this, "rdTrim", on); computeCrop(); });
+        tr.addView(s);
+        settings.addView(tr, lpm(-1, -2, 0, 12, 0, 0));
         if (ui) {
             settings.addView(switchRow("Highlight the spoken sentence", hlOn, on -> { hlOn = on; Store.setFlag(this, "rdHl", on); if (pv != null) pv.invalidate(); }), lpm(-1, -2, 0, 12, 0, 0));
             settings.addView(switchRow("Turn pages with the audio", followOn, on -> { followOn = on; Store.setFlag(this, "rdFollow", on); }), lpm(-1, -2, 0, 12, 0, 0));
