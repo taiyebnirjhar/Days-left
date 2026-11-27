@@ -6,7 +6,7 @@ Plain Java, no androidx, all views built in code. Keep it that way. Package `com
 ## Build
 - `gradle assembleDebug --no-daemon -q` (AGP 8.10.1, compileSdk 36, minSdk 26, NDK 27.2.12479018, cmake 3.22.1, abi arm64-v8a only)
 - Set `ANDROID_HOME` first. APK: `app/build/outputs/apk/debug/app-debug.apk`
-- Bump `versionCode`/`versionName` in `app/build.gradle` and the "Days Left X.Y" label in MainActivity.java each delivery. Current: 3.50 (64).
+- Bump `versionCode`/`versionName` in `app/build.gradle` and the "Days Left X.Y" label in MainActivity.java each delivery. Current: 3.51 (65).
 - Dependency: `com.tom-roush:pdfbox-android:2.0.27.0`. whisper.cpp is vendored in `app/src/main/cpp/whisper` (CPU only), wrapped by `cpp/jni.cpp`.
 
 ## Features
@@ -42,6 +42,8 @@ Countdowns (status bar, notification, overlay) + Library: eye-friendly PDF reade
 - v3.49 top bar (user: 'rotate icon beside the lock; all top icons the same size, a bit smaller'): back, rotate, lock and 'Aa' are all a 40 dp box with an 18 dp drawing and one stroke weight (`Glyph` types 0 back, 4 rotate, 3 lock; Aa 15 sp). Rotate button (`rotateBtn`, setting `rdOrient`: 0 follows the phone, 1 fixed upright, 2 fixed on its side): tap turns the screen the other way and keeps it (`toggleOrient`, `setRequestedOrientation` PORTRAIT / SENSOR_LANDSCAPE), long-press = follow the phone again; the icon shows the phone as it is now (upright/on its side) and is filled while the turning is fixed. Rotation is handled by the activity itself (`configChanges`), `updateMode` switches between the page view and `ScrollPages`. Icon geometry was checked by rendering the same drawing math on the host. NOT verified on device.
 
 - v3.50 touch lock lets you SCROLL (user: 'rotated, scrolled down, the page did not change while locked, unlocked it does'): v3.37-v3.49 swallowed EVERY touch while locked, so a locked page could not be moved at all. Now `dispatchTouchEvent` only intercepts the unlock padlock; scrolling (`ScrollPages`) and swiping (`PageView`) pass through, while single taps only reveal the padlock (`revealUnlock`), double-tap and pinch zoom are ignored (`if (locked)` in `PageView`/`ScrollPages` gesture listeners), Back reveals the padlock, the controls stay hidden. Audio follow is unchanged. NOT verified on device.
+
+- v3.51 page change is the reader's choice (user: 'on portrait I flip left-right, rotated top-bottom; let the user decide, a switch with the written value, default as now'): Settings (Aa) -> PAGE CHANGE has two switches written with their value, 'Upright: left-right | up-down' (`rdPortScroll`, default left-right) and 'Rotated: left-right | up-down' (`rdLandSwipe`, default up-down), built by `valueRow`. `wantScroll(land)` decides per orientation; `updateMode` (also on every toggle and on every turn of the phone) shows `ScrollPages` (up-down, continuous) or the page view (left-right swipes, pinch/double-tap zoom). The picture width (`renderW`) follows the orientation only, not the mode. Up-down has no pinch zoom (the page already fills the width). NOT verified on device.
 
 ## Open problems (as of v3.17)
 1. NATIVE CRASH in `Whisper.nRun` (no_timestamps + single_segment, 12 s clip) ~1.7 s after model load on the device. Removing `audio_ctx` did not fix it. v3.17 routes `Whisper.transcribe` through `nRunSegs` instead (the path the sync used successfully). UNVERIFIED on device. Real fix needs a repro: build the JNI/whisper for x86_64 on the host, run both paths with the real model (ggml-base.en-q5_1.bin from huggingface) on a 12 s clip, use gdb/ASan.

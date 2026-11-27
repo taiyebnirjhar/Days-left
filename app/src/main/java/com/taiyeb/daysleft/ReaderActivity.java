@@ -229,19 +229,27 @@ public class ReaderActivity extends Activity {
     /** Phone on its side: pages stacked and scrolled as one; upright: the page view with swipes. */
     int upRenderW;   // the picture width used with the phone upright
 
+    /** How pages change in each position (Settings): upright default = swipe left-right, rotated default = scroll up-down. */
+    boolean wantScroll(boolean land) { return land ? !Store.flag(this, "rdLandSwipe", false) : Store.flag(this, "rdPortScroll", false); }
+
+    int lastLand = -1;
+
     void updateMode() {
         if (pv == null || root == null || item == null) return;
         boolean land = getResources().getConfiguration().orientation == android.content.res.Configuration.ORIENTATION_LANDSCAPE;
-        if (land == scrollMode) return;
-        scrollMode = land;
-        refreshRotateIcon(Store.num(this, "rdOrient", 0));
         if (upRenderW == 0) upRenderW = renderW;
-        // pictures are shown across the whole (wide) screen: render them that wide (up to the size the renderer allows) and take new ones
-        int wide = Math.max(root.getWidth(), root.getHeight());
-        renderW = land ? Math.min(2560, Math.max(upRenderW, (int) (wide * 1.1f))) : upRenderW;
-        cache.evictAll(); inflight.clear();
-        for (int k = -1; k <= 2; k++) ensure(cur + k);
-        if (land) {
+        if ((land ? 1 : 0) != lastLand) {   // the phone was turned (or this is the first look)
+            lastLand = land ? 1 : 0;
+            refreshRotateIcon(Store.num(this, "rdOrient", 0));
+            // pictures are shown across the whole (wide) screen: render them that wide (up to the size the renderer allows) and take new ones
+            int wide = Math.max(root.getWidth(), root.getHeight());
+            int nw = land ? Math.min(2560, Math.max(upRenderW, (int) (wide * 1.1f))) : upRenderW;
+            if (nw != renderW) { renderW = nw; cache.evictAll(); inflight.clear(); for (int k = -1; k <= 2; k++) ensure(cur + k); }
+        }
+        boolean want = wantScroll(land);
+        if (want == scrollMode) return;
+        scrollMode = want;
+        if (want) {
             if (sp == null) { sp = new ScrollPages(this); root.addView(sp, 1, new FrameLayout.LayoutParams(-1, -1)); }
             sp.setBackgroundColor(DESK[theme]);
             sp.setVisibility(View.VISIBLE);
@@ -251,6 +259,15 @@ public class ReaderActivity extends Activity {
             sp.setVisibility(View.GONE);
             goTo(p, false);
         }
+    }
+
+    /** A switch with the choice written on it: "Upright: left–right" / "Upright: up–down". */
+    LinearLayout valueRow(String prefix, String offText, String onText, boolean on, java.util.function.Consumer<Boolean> cb) {
+        LinearLayout r = switchRow(prefix + (on ? onText : offText), on, v -> {});
+        TextView t = (TextView) r.getChildAt(0);
+        Switch sw = (Switch) r.getChildAt(1);
+        sw.setOnCheckedChangeListener((b, v) -> { t.setText(prefix + (v ? onText : offText)); cb.accept(v); });
+        return r;
     }
 
     void setLocked(boolean on) {
@@ -1657,6 +1674,15 @@ public class ReaderActivity extends Activity {
         s.setOnCheckedChangeListener((b, on) -> { trim = on; Store.setFlag(this, "rdTrim", on); computeCrop(); });
         tr.addView(s);
         settings.addView(tr, lpm(-1, -2, 0, 12, 0, 0));
+        // how pages change, per position: a switch with the choice written on it (defaults = how it always was)
+        TextView l4 = new TextView(this);
+        l4.setText("PAGE CHANGE");
+        l4.setTextSize(11);
+        l4.setLetterSpacing(0.1f);
+        l4.setTag("sub");
+        settings.addView(l4, lpm(-2, -2, 0, 16, 0, 0));
+        settings.addView(valueRow("Upright: ", "left–right", "up–down", Store.flag(this, "rdPortScroll", false), on -> { Store.setFlag(this, "rdPortScroll", on); updateMode(); }), lpm(-1, -2, 0, 8, 0, 0));
+        settings.addView(valueRow("Rotated: ", "left–right", "up–down", !Store.flag(this, "rdLandSwipe", false), on -> { Store.setFlag(this, "rdLandSwipe", !on); updateMode(); }), lpm(-1, -2, 0, 8, 0, 0));
         if (ui) {
             settings.addView(switchRow("Highlight the spoken sentence", hlOn, on -> { hlOn = on; Store.setFlag(this, "rdHl", on); if (pv != null) pv.invalidate(); }), lpm(-1, -2, 0, 12, 0, 0));
             settings.addView(switchRow("Turn pages with the audio", followOn, on -> { followOn = on; Store.setFlag(this, "rdFollow", on); }), lpm(-1, -2, 0, 12, 0, 0));
