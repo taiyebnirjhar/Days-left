@@ -229,8 +229,36 @@ public class ReaderActivity extends Activity {
     /** Phone on its side: pages stacked and scrolled as one; upright: the page view with swipes. */
     int upRenderW;   // the picture width used with the phone upright
 
-    /** How pages change in each position (Settings): upright default = swipe left-right, rotated default = scroll up-down. */
-    boolean wantScroll(boolean land) { return land ? !Store.flag(this, "rdLandSwipe", false) : Store.flag(this, "rdPortScroll", false); }
+    /**
+     * How pages change (Settings -> Change page): "swipe" or "scroll", the same upright and rotated. Never chosen = how it always was: swipe upright, scroll rotated.
+     */
+    boolean wantScroll(boolean land) {
+        int m = Store.num(this, "rdPageChange", 0);   // 0 never chosen, 1 swipe, 2 scroll
+        return m == 2 || m == 0 && land;
+    }
+
+    TextView segSwipe, segScroll;
+
+    /** Shows which of Swipe / Scroll is in force (when never chosen: the one that applies to the way the phone is held now). */
+    void refreshPageChangeSeg() {
+        if (segSwipe == null || segScroll == null) return;
+        boolean land = getResources().getConfiguration().orientation == android.content.res.Configuration.ORIENTATION_LANDSCAPE;
+        boolean scroll = wantScroll(land);
+        int ink = INK[theme], paper = PAPER[theme];
+        segSwipe.setBackground(scroll ? null : rr(ink, 12)); segSwipe.setTextColor(scroll ? ink : paper);
+        segScroll.setBackground(scroll ? rr(ink, 12) : null); segScroll.setTextColor(scroll ? paper : ink);
+    }
+
+    TextView segment(String label, int mode) {
+        TextView t = new TextView(this);
+        t.setText(label);
+        t.setTextSize(14);
+        t.setTag("pill");   // tintAll leaves it alone: refreshPageChangeSeg colours it
+        t.setGravity(Gravity.CENTER);
+        t.setPadding(dp(16), dp(7), dp(16), dp(7));
+        t.setOnClickListener(v -> { Store.setNum(this, "rdPageChange", mode); refreshPageChangeSeg(); updateMode(); });
+        return t;
+    }
 
     int lastLand = -1;
 
@@ -246,6 +274,7 @@ public class ReaderActivity extends Activity {
             int nw = land ? Math.min(2560, Math.max(upRenderW, (int) (wide * 1.1f))) : upRenderW;
             if (nw != renderW) { renderW = nw; cache.evictAll(); inflight.clear(); for (int k = -1; k <= 2; k++) ensure(cur + k); }
         }
+        refreshPageChangeSeg();
         boolean want = wantScroll(land);
         if (want == scrollMode) return;
         scrollMode = want;
@@ -261,14 +290,6 @@ public class ReaderActivity extends Activity {
         }
     }
 
-    /** A switch with the choice written on it: "Upright: left–right" / "Upright: up–down". */
-    LinearLayout valueRow(String prefix, String offText, String onText, boolean on, java.util.function.Consumer<Boolean> cb) {
-        LinearLayout r = switchRow(prefix + (on ? onText : offText), on, v -> {});
-        TextView t = (TextView) r.getChildAt(0);
-        Switch sw = (Switch) r.getChildAt(1);
-        sw.setOnCheckedChangeListener((b, v) -> { t.setText(prefix + (v ? onText : offText)); cb.accept(v); });
-        return r;
-    }
 
     void setLocked(boolean on) {
         locked = on;
@@ -1674,15 +1695,24 @@ public class ReaderActivity extends Activity {
         s.setOnCheckedChangeListener((b, on) -> { trim = on; Store.setFlag(this, "rdTrim", on); computeCrop(); });
         tr.addView(s);
         settings.addView(tr, lpm(-1, -2, 0, 12, 0, 0));
-        // how pages change, per position: a switch with the choice written on it (defaults = how it always was)
-        TextView l4 = new TextView(this);
-        l4.setText("PAGE CHANGE");
-        l4.setTextSize(11);
-        l4.setLetterSpacing(0.1f);
-        l4.setTag("sub");
-        settings.addView(l4, lpm(-2, -2, 0, 16, 0, 0));
-        settings.addView(valueRow("Upright: ", "left–right", "up–down", Store.flag(this, "rdPortScroll", false), on -> { Store.setFlag(this, "rdPortScroll", on); updateMode(); }), lpm(-1, -2, 0, 8, 0, 0));
-        settings.addView(valueRow("Rotated: ", "left–right", "up–down", !Store.flag(this, "rdLandSwipe", false), on -> { Store.setFlag(this, "rdLandSwipe", !on); updateMode(); }), lpm(-1, -2, 0, 8, 0, 0));
+        // how pages change: one choice for both positions, two options side by side
+        LinearLayout pc = new LinearLayout(this);
+        pc.setGravity(Gravity.CENTER_VERTICAL);
+        TextView pct = new TextView(this);
+        pct.setText("Change page");
+        pct.setTextSize(15);
+        pct.setTag("txt");
+        pc.addView(pct, new LinearLayout.LayoutParams(0, -2, 1f));
+        LinearLayout seg = new LinearLayout(this);
+        seg.setTag("segbox");
+        seg.setBackground(rr((INK[theme] & 0x00FFFFFF) | 0x1F000000, 12));
+        segSwipe = segment("Swipe", 1);
+        segScroll = segment("Scroll", 2);
+        seg.addView(segSwipe);
+        seg.addView(segScroll);
+        pc.addView(seg);
+        settings.addView(pc, lpm(-1, -2, 0, 14, 0, 0));
+        refreshPageChangeSeg();
         if (ui) {
             settings.addView(switchRow("Highlight the spoken sentence", hlOn, on -> { hlOn = on; Store.setFlag(this, "rdHl", on); if (pv != null) pv.invalidate(); }), lpm(-1, -2, 0, 12, 0, 0));
             settings.addView(switchRow("Turn pages with the audio", followOn, on -> { followOn = on; Store.setFlag(this, "rdFollow", on); }), lpm(-1, -2, 0, 12, 0, 0));
@@ -1752,7 +1782,12 @@ public class ReaderActivity extends Activity {
         return g;
     }
 
-    void skinSettings() { tintAll(settings, INK[theme]); }
+    void skinSettings() {
+        tintAll(settings, INK[theme]);
+        View sb = settings.findViewWithTag("segbox");
+        if (sb != null) sb.setBackground(rr((INK[theme] & 0x00FFFFFF) | 0x1F000000, 12));
+        refreshPageChangeSeg();
+    }
 
     void skin() {
         int ink = INK[theme], paper = PAPER[theme], desk = DESK[theme];
