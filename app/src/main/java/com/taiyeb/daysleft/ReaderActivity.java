@@ -945,6 +945,17 @@ public class ReaderActivity extends Activity {
                 return;
             }
         }
+        // real time first: an estimate from the coarse map exists, so go there NOW and let the sync check it behind the scenes (a small correction if it was off)
+        if (bi != null && al.size() > 0) {
+            double es = al.timeOfWord(bi.pageStart[target]);
+            if (es >= 0 && SyncService.goalTimeOut < 0) {
+                lastManual = System.currentTimeMillis();
+                Dbg.i("Play", "page " + (target + 1) + " estimate -> " + fmtT(es) + ", checking in the background");
+                seekAbs(Math.max(0, es - 0.3), true);
+                refineQuietly(target, es);
+                return;
+            }
+        }
         Dbg.i("Play", "page " + (target + 1) + " has no pin and is not in the sync data" + (syncing() ? " (sync running)" : "") + ", " + (syncing() ? "telling user" : "will search"));
         // a page the background prefetch already located
         if (bi != null && SyncService.goalWordReq == bi.pageStart[target] && SyncService.goalTimeOut >= 0) {
@@ -956,6 +967,27 @@ public class ReaderActivity extends Activity {
             return;
         }
         whenReady(() -> runLocate(target));   // no dialog: a pill says it is looking, the answer is a pill you tap
+    }
+
+    /** After an instant jump to an estimated page start: ask the sync for the exact time and nudge the playhead once if it was off (never if the user moved it). */
+    void refineQuietly(final int target, final double est) {
+        final long stamp = lastManual;
+        final long t0 = System.currentTimeMillis();
+        SyncService.goalTimeOut = -1;
+        SyncService.goalWordReq = bi.pageStart[target];
+        if (!SyncService.running) SyncService.start(this, item.id);
+        h.postDelayed(new Runnable() {
+            @Override public void run() {
+                if (isFinishing() || lastManual != stamp || System.currentTimeMillis() - t0 > 60000) { SyncService.goalWordReq = -1; return; }
+                double gt = SyncService.goalTimeOut;
+                if (gt >= 0) {
+                    SyncService.goalWordReq = -1;
+                    loadSyncData();
+                    if (Math.abs(gt - est) > 1.0 && aT - est < 40) { Dbg.i("Play", "page " + (target + 1) + " corrected " + fmtT(est) + " -> " + fmtT(gt)); seekAbs(Math.max(0, gt - 0.3 + Math.max(0, aT - (est - 0.3))), true); }
+                } else if (gt == -2) SyncService.goalWordReq = -1;
+                else h.postDelayed(this, 600);
+            }
+        }, 600);
     }
 
     /**
