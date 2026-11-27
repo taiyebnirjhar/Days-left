@@ -78,6 +78,7 @@ def main():
     ap.add_argument("--numbers", type=float, default=0.03)  # share of sentences replaced by number/abbreviation sentences
     ap.add_argument("--skip", type=float, default=0.015)    # share of sentences the narrator skips
     ap.add_argument("--footnotes", type=float, default=0.06)
+    ap.add_argument("--skip-runs", type=float, default=0.0)   # chance per sentence that the narrator starts skipping a RUN of 5-40 sentences (an abridged recording)
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
     rnd = random.Random(a.seed)
@@ -86,7 +87,7 @@ def main():
     # ---- the book: elements in order ----
     elements = []        # dict(text, spoken_text, kind, spoken, para_end, chapter_start)
     paras = load_text(a.source, a.words)
-    words_since_page = 0; page = 11
+    words_since_page = 0; page = 11; skip_left = 0
     for p in paras:
         sents = sentences(p)
         for si, s in enumerate(sents):
@@ -95,6 +96,8 @@ def main():
             if kind == "sentence" and rnd.random() < a.numbers:
                 text, said = rnd.choice(TEMPLATES)
             spoken = not (kind == "sentence" and rnd.random() < a.skip)
+            if skip_left > 0 and kind == "sentence": spoken = False; skip_left -= 1
+            elif kind == "sentence" and a.skip_runs > 0 and rnd.random() < a.skip_runs: skip_left = rnd.randint(5, 40); spoken = False
             if kind == "sentence" and rnd.random() < a.footnotes:
                 text = text + str(rnd.randint(2, 140))        # a footnote number glued on, never spoken
             elements.append(dict(text=text, said=said, kind=kind, spoken=spoken, para_end=(si == len(sents) - 1), chapter=(kind == "heading")))

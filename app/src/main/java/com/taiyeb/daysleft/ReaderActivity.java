@@ -935,7 +935,9 @@ public class ReaderActivity extends Activity {
         if (bi != null && al.size() > 0) {
             double ts = al.timeOfWord(bi.pageStart[target]);
             if (ts < 0 && target + 1 < bi.pages) ts = al.timeOfWord(bi.pageStart[target] + 12);
-            if (ts >= 0) {
+            // instant only where the probes around are close (then it is right to well under a second); between far-apart probes (the coarse map of the
+            // whole book) the pace drifts and the answer can be several seconds off, so listen right there instead: a few seconds, exact
+            if (ts >= 0 && al.gapAt(ts) <= SyncPlanner.GOAL_GAP) {
                 lastManual = System.currentTimeMillis();
                 Dbg.i("Play", "page " + (target + 1) + " from sync data -> " + fmtT(ts));
                 seekAbs(Math.max(0, ts - 0.3), true);
@@ -1067,7 +1069,11 @@ public class ReaderActivity extends Activity {
             if (isFinishing() || fdlg != null || bi == null || item == null || !mpReady || !fileMode) return;
             if (!SyncService.wanted(this, item.id) || !Whisper.hasModel(this) || pinFor(cur) != null) return;
             if (SyncService.running && !SyncService.ready) return;   // still mapping around the playhead: don't compete with it
-            if (al.size() > 0 && al.timeOfWord(bi.pageStart[cur]) >= 0) return;
+            if (al.size() > 0) {   // already exact here? (a rough time from a coarse stretch is not exact: locate the page start so Play page is instant AND right)
+                double ts = al.timeOfWord(bi.pageStart[cur]);
+                if (ts >= 0 && al.gapAt(ts) <= SyncPlanner.GOAL_GAP) return;
+            }
+            if (!SyncService.running && SyncService.fullFor(this, item.id)) return;   // a finished sync is not woken for every page you rest on: Play page then listens on demand (one call)
             if (SyncService.goalWordReq == bi.pageStart[cur]) return;
             Dbg.i("Prefetch", "locating page " + (cur + 1) + " in the background");
             SyncService.goalTimeOut = -1;
@@ -1293,7 +1299,7 @@ public class ReaderActivity extends Activity {
     void findMyPage() {
         if (mpReady && bi != null && al.size() > 0) {
             int j = al.wordAtTime(aT);
-            if (j >= 0) {
+            if (j >= 0 && al.gapAt(aT) <= SyncPlanner.GOAL_GAP) {   // far-apart probes can be a page off near a page boundary: then listen right here instead
                 final int pg = bi.pageOf(j);
                 final double t0 = aT;
                 Dbg.i("Find", "instant from sync: " + fmtT(t0) + " -> page " + (pg + 1));

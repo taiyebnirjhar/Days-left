@@ -315,9 +315,12 @@ public class SyncSim {
         while (step(p, al)) if (calls > 3000) break;
         int nearW = trueWordAt(here + 100), farW = trueWordAt(here + 420);
         p.setGoal(nearW);
-        boolean instant = p.goalTime >= 0;
-        double nearErr = instant ? Math.abs(p.goalTime - tw[nearW]) : -1;
-        System.out.printf("play page 100 s ahead of the playhead: %s%n", instant ? "instant, error " + String.format("%.2f s", nearErr) : "NOT instant");
+        // since v3.56 an answer is only given when the probes around the word are <= GOAL_GAP (10 s) apart: instant where they are, else one short listen
+        int cNear = calls;
+        while (p.goalTime == -1 && step(p, al)) if (calls - cNear > 8) break;
+        boolean instant = p.goalTime >= 0 && calls - cNear <= 2;
+        double nearErr = p.goalTime >= 0 ? Math.abs(p.goalTime - tw[nearW]) : 99;
+        System.out.printf("play page 100 s ahead of the playhead: %s%n", p.goalTime >= 0 ? (calls == cNear ? "instant" : "after " + (calls - cNear) + " call(s)") + ", error " + String.format("%.2f s", nearErr) : "NO ANSWER");
         p.clearGoal();
         p.setGoal(farW);
         int c0 = calls;

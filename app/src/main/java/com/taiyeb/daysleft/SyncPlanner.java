@@ -17,8 +17,8 @@ import java.util.*;
 final class SyncPlanner {
     static double PROBE = 9, LONG_PROBE = 9, DENSE_GAP = 90, MAX_STRIDE = 150, MIN_STRIDE = 20;
     /** Highlighting a sentence needs probes close together right around the playhead: 20 s apart from 40 s behind to 150 s ahead of it (swept in tests/host/simrun.sh: 20 s keeps 0 wrong highlights and shows the first one a call sooner than 12 s), 30 s apart within 5 min, else DENSE_GAP. */
-    /** A page start is only answered when the two probes around it are this close (seconds): then it is right to well under a second. */
-    static final double GOAL_GAP = 25;
+    /** A page start is only answered (and an instant Play page / Find my page is only trusted) when the probes around it are this close (seconds). */
+    static final double GOAL_GAP = 10;   // was 25: a pause (a paragraph, a chapter) inside a 25 s stretch made interpolated page starts up to 4 s off (found by tests/e2e 'book'); 10 s keeps it to a fraction of a second
     static double NEAR_BEHIND = 40, NEAR_AHEAD = 150, DENSE_NEAR = 14, DENSE_MID = 30;
     static final int EXT_FAILS_WIDE = 4, EXT_FAILS_GIVE_UP = 8, SEED_TRIES = 12, GAP_TRIES = 2;
 
@@ -388,11 +388,25 @@ final class SyncPlanner {
         return r;
     }
 
+    private boolean endProbed, startProbed;
+
     private Req forward() {
         skipMappedAhead();
         Map.Entry<Double, Integer> ref = anchors.floorEntry(fwdCursor);
         if (ref == null) ref = anchors.firstEntry();
-        if (fwdCursor >= total - 8 || fwdCursor > startSec + reach) { fwdDone = true; return null; }
+        if (fwdCursor >= total - 8) {
+            // The walk stops when a whole stride would pass the end, which left up to MAX_STRIDE (2.5 minutes) of the end of the book without a single
+            // probe (found by tests/e2e 'book': the last 110 s of a book were unmapped, and counted as done). One probe at the very end closes it.
+            Map.Entry<Double, Integer> last = anchors.lastEntry();
+            if (!endProbed && last != null && total > 40 && total - last.getKey() > 20) {
+                endProbed = true;
+                Req r = fwdAt(Math.max(last.getKey() + 1, total - PROBE - 2), last.getKey(), last.getValue());
+                r.why = "the end of the book";
+                return r;
+            }
+            fwdDone = true; return null;
+        }
+        if (fwdCursor > startSec + reach) { fwdDone = true; return null; }
         return fwdAt(fwdCursor, ref.getKey(), ref.getValue());
     }
 
@@ -432,7 +446,17 @@ final class SyncPlanner {
         skipMappedBehind();
         Map.Entry<Double, Integer> ref = anchors.ceilingEntry(bwdEnd);
         if (ref == null) ref = anchors.lastEntry();
-        if (bwdEnd <= 8 || bwdEnd < startSec - reach) { bwdDone = true; return null; }
+        if (bwdEnd <= 8) {
+            Map.Entry<Double, Integer> first = anchors.firstEntry();
+            if (!startProbed && first != null && total > 40 && first.getKey() > 40) {   // the first seconds of the audio: the narrator may start right away
+                startProbed = true;
+                Req r = bwdAt(PROBE + 2, first.getKey(), first.getValue());
+                r.why = "the start of the book";
+                return r;
+            }
+            bwdDone = true; return null;
+        }
+        if (bwdEnd < startSec - reach) { bwdDone = true; return null; }
         return bwdAt(bwdEnd, ref.getKey(), ref.getValue());
     }
 

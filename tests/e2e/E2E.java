@@ -376,6 +376,97 @@ public class E2E {
         check(pct(lat, 0.9) <= 30, String.format("coming back is ready in %.0f s (90th percentile, limit 30 s)", pct(lat, 0.9)));
     }
 
+    /**
+     * The whole-book link, judged everywhere (this is what Play page, Find page and the page turns rely on after "Synced"):
+     * link the whole book with the playhead paused, then compare the finished alignment with the truth at EVERY page start and at random moments,
+     * then jump into the linked book at random places and listen (what the marker does in a book that is already synced).
+     */
+    static double nearest(Alignment al, double t, int dir) { double[] ts = al.times(); double best = -1; for (double x : ts) { if (dir < 0 && x <= t) best = x; if (dir > 0 && x >= t) return x; } return dir < 0 ? best : -1; }
+
+    static void wholeBook(Random r, int jumpsAfter) throws Exception {
+        System.out.println("\n== 6. Link the WHOLE book, then judge the link everywhere");
+        Session s = new Session(3, new ArrayList<>(), new ArrayList<>());
+        s.playing = false;
+        int rounds = 0;
+        while (!s.core.complete && !s.pl.lost && s.simTime < 6 * 3600 && rounds < 20000) { s.round(false); rounds++; }
+        Alignment fin = s.snapshot();
+        System.out.printf("   %s after %d speech calls (~%.0f min on the phone), %d anchors, coverage %.1f%%%s%n", s.core.complete ? "COMPLETE" : "NOT complete", s.calls, s.simTime / 60, fin.size(), s.core.coverage * 100, s.pl.lost ? ", LOST the place" : "");
+        check(s.core.complete, "the whole book gets linked (complete)");
+        check(s.core.coverage >= 0.97, String.format("coverage ends at %.1f%% (limit 97%%)", s.core.coverage * 100));
+        // (a) every page start
+        List<Double> errs = new ArrayList<>(); int judged = 0, unmapped = 0, over3 = 0; double worst = 0; int worstPg = -1;
+        for (int pg = 1; pg < pageStart.length - 2; pg++) {
+            int firstEl = wordEl[pageStart[pg]];
+            if (!(spoken[firstEl] && (kind[firstEl].equals("sentence") || kind[firstEl].equals("heading")))) continue;   // the narrator skipped it: no truth
+            judged++;
+            double ts = fin.timeOfWord(pageStart[pg]);
+            if (ts < 0 && pg + 1 < bi.pages) ts = fin.timeOfWord(pageStart[pg] + 12);
+            if (ts < 0) { unmapped++; continue; }
+            double e = Math.abs(ts - st[firstEl]);
+            errs.add(e); if (e > 3) over3++; if (e > worst) { worst = e; worstPg = pg; }
+        }
+        System.out.printf("   page starts: %d judged, %d unmapped; error median %.2f s, 95th %.2f s, worst %.1f s (page %d); %d off by more than 3 s%n", judged, unmapped, pct(errs, .5), pct(errs, .95), worst, worstPg + 1, over3);
+        check(unmapped * 100.0 / Math.max(1, judged) <= 1, String.format("%.1f%% of the pages have no start time (limit 1%%)", unmapped * 100.0 / Math.max(1, judged)));
+        check(pct(errs, 0.5) <= 1.5, String.format("page start accurate to %.2f s at the median (limit 1.5 s)", pct(errs, 0.5)));
+        check(pct(errs, 0.95) <= 4.0, String.format("page start accurate to %.2f s at the 95th percentile (limit 4 s)", pct(errs, 0.95)));
+        // (b) which page is the narrator on, at random moments
+        int n = 600, ok = 0, near = 0, wrongPg = 0, nomap = 0, listen = 0;
+        for (int k = 0; k < n; k++) {
+            int e = r.nextInt(st.length);
+            if (!(spoken[e] && kind[e].equals("sentence"))) { k--; continue; }
+            double t = st[e] + r.nextDouble() * (en[e] - st[e]);
+            int tp = pageOfWord(elStartW[e]);
+            int j = fin.wordAtTime(t);
+            if (j >= 0 && fin.gapAt(t) > Alignment.FLIP_GAP) { listen++; continue; }   // the app does not trust probes this far apart (it listens right there instead)
+            if (j < 0) { nomap++; if (verbose || nomap <= 25) System.out.printf("      unmapped at %.1f s (anchors cover %.1f..%.1f s, %d anchors; nearest before %.1f after %.1f)%n", t, fin.firstTime(), fin.times()[fin.size() - 1], fin.size(), nearest(fin, t, -1), nearest(fin, t, 1)); continue; }
+
+            int pp = pageOfWord(j);
+            if (pp == tp) { ok++; continue; }
+            // a page boundary is a place where the answer may differ by a page for a moment: tolerate 3 s around it
+            double bd = Math.min(Math.abs(t - st[wordEl[pageStart[tp]]]), tp + 1 < pageStart.length - 1 ? Math.abs(t - st[wordEl[pageStart[tp + 1]]]) : 1e9);
+            if (bd <= 3) near++; else { wrongPg++; System.out.printf("      WRONG PAGE at %.1f s: truth page %d, alignment says page %d (word %d); gap here %.1f s%n", t, tp + 1, pp + 1, j, fin.gapAt(t)); }
+        }
+        System.out.printf("   which page at %d random moments: %d right, %d near a page boundary (tolerated), %d WRONG, %d unmapped, %d where the app listens instead (probes > %.0f s apart)%n", n, ok, near, wrongPg, nomap, listen, Alignment.FLIP_GAP);
+        check(wrongPg == 0, "no random moment is placed on the wrong page (" + wrongPg + " wrong)");
+        check(nomap * 100.0 / n <= 1, String.format("%.1f%% of the moments are unmapped (limit 1%%)", nomap * 100.0 / n));
+        // (c) jump into the linked book and listen: the marker
+        List<Double> first = new ArrayList<>(); int never = 0, jSamples = 0, jShown = 0, jCorrect = 0;
+        for (int i = 0; i < jumpsAfter; i++) {
+            double p = randomSpeechTime(r, 60, duration - 200);
+            Session s2 = new Session(p, s.aPos, s.aTime);
+            s2.runFor(90, true);
+            jSamples += s2.samples; jShown += s2.shown; jCorrect += s2.correct;
+            if (s2.firstShownAt < 0) never++; else first.add(Math.max(0, s2.firstShownAt - s2.speechDelay));
+            System.out.printf("   jump to %7.1f s in the linked book: first highlight %s, shown %d%% of speech, wrong %d%n", p,
+                    s2.firstShownAt < 0 ? "NEVER" : String.format("after %.0f s", Math.max(0, s2.firstShownAt - s2.speechDelay)), s2.samples == 0 ? 0 : s2.shown * 100 / s2.samples, s2.wrong);
+        }
+        check(never == 0, "after a jump into the linked book a highlight appears every time (" + never + " never)");
+        System.out.printf("   all jumps: highlight shown %.0f%% of 90 s windows, correct %.2f%% of those%n", 100.0 * jShown / Math.max(1, jSamples), 100.0 * jCorrect / Math.max(1, jShown));
+        check(jShown == 0 || 100.0 * jCorrect / jShown >= 98.5, String.format("after jumps the shown highlights are right %.2f%% of the time (limit 98.5%%)", jShown == 0 ? 0 : 100.0 * jCorrect / jShown));
+        // (d) Play page in a linked book: how fast and how exact
+        List<Double> perr = new ArrayList<>(), pt = new ArrayList<>(); int instant = 0, unans = 0;
+        for (int i = 0; i < 10; i++) {
+            int pg = 1 + r.nextInt(pageStart.length - 3);
+            int firstEl = wordEl[pageStart[pg]]; int tgtEl = nextSpoken(firstEl);
+            int goalW = tgtEl != firstEl ? elStartW[tgtEl] : pageStart[pg];
+            double ts0 = fin.timeOfWord(goalW);
+            if (ts0 >= 0 && fin.gapAt(ts0) <= SyncPlanner.GOAL_GAP) { instant++; perr.add(Math.abs(ts0 - st[tgtEl])); pt.add(0.0); continue; }   // the app answers at once
+            Session s3 = new Session(randomSpeechTime(r, 60, duration - 200), s.aPos, s.aTime);
+            s3.playing = false;
+            s3.goal = goalW;
+            double t0 = s3.simTime;
+            for (int k = 0; k < 25 && s3.core.goalTime == -1; k++) s3.round(false);
+            double ans = s3.core.goalTime;
+            if (ans < 0) { unans++; continue; }
+            perr.add(Math.abs(ans - st[tgtEl])); pt.add(s3.simTime - t0);
+        }
+        System.out.printf("   Play page in the linked book (10 random pages): %d answered at once, %d by a short listen, %d unanswered; error median %.2f s, 95th %.2f s; time median %.0f s, 95th %.0f s%n", instant, 10 - instant - unans, unans, pct(perr, .5), pct(perr, .95), pct(pt, .5), pct(pt, .95));
+        check(unans == 0, "every page is found in the linked book (" + unans + " unanswered)");
+        check(pct(perr, 0.95) <= 2.0, String.format("Play page in the linked book is right to %.2f s at the 95th percentile (limit 2 s)", pct(perr, 0.95)));
+        check(pct(pt, 0.95) <= 30, String.format("Play page in the linked book takes %.0f s at the 95th percentile (limit 30 s, phone time)", pct(pt, 0.95)));
+        check(pct(first, 0.9) <= 45, String.format("after a jump into the linked book the highlight is there in %.0f s (90th percentile, limit 45 s)", pct(first, 0.9)));
+    }
+
     // ---------------------------------------------------------------- main
     public static void main(String[] a) throws Exception {
         String dir = a[0], model = a[1], driver = a[2];
@@ -394,6 +485,7 @@ public class E2E {
         if (only.equals("all") || only.contains("page")) playPage(r, 10 * scale);
         if (only.equals("all") || only.contains("find")) findPage(r, 8 * scale);
         if (only.equals("all") || only.contains("resume")) resume(r, 3 * scale);
+        if (only.equals("all") || only.contains("book")) wholeBook(r, 4 * scale);
         if (totSamples > 0) {
             System.out.println("\n== Overall while listening: " + totSamples + " seconds of speech scored");
             System.out.printf("   highlight shown %.1f%% of the time; correct %.2f%% of those; wrong (more than 0.9 s off) %d%n", 100.0 * totShown / totSamples, totShown == 0 ? 0 : 100.0 * totCorrect / totShown, totWrong);
