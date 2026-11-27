@@ -273,6 +273,7 @@ public class ReaderActivity extends Activity {
             int wide = Math.max(root.getWidth(), root.getHeight());
             int nw = land ? Math.min(2560, Math.max(upRenderW, (int) (wide * 1.1f))) : upRenderW;
             if (nw != renderW) { renderW = nw; cache.evictAll(); inflight.clear(); for (int k = -1; k <= 2; k++) ensure(cur + k); }
+            if (sp != null) sp.loadZoom();
         }
         refreshPageChangeSeg();
         boolean want = wantScroll(land);
@@ -282,6 +283,7 @@ public class ReaderActivity extends Activity {
             if (sp == null) { sp = new ScrollPages(this); root.addView(sp, 1, new FrameLayout.LayoutParams(-1, -1)); }
             sp.setBackgroundColor(DESK[theme]);
             sp.setVisibility(View.VISIBLE);
+            sp.loadZoom();
             sp.showPage(cur);
         } else if (sp != null) {
             int p = sp.pageAtTop();
@@ -1978,6 +1980,11 @@ public class ReaderActivity extends Activity {
         final BaseAdapter ad;
         int lastP = -1;
         boolean auto;   // the scroll in progress is ours (following the marker), not the reader's finger
+        // Zoom: 1 = the page fits the width (the default). Below 1 the page is narrower than the screen (a whole page fits on one screen), above 1 it is wider
+        // and is moved sideways with a drag. Remembered separately for upright and rotated.
+        float z = 1, panX;
+        final ScaleGestureDetector zsd;
+        static final float MIN_Z = 0.25f, MAX_Z = 3f;
 
         ScrollPages(Context c) {
             super(c);
@@ -2002,11 +2009,25 @@ public class ReaderActivity extends Activity {
                 }
             };
             setAdapter(ad);
+            zsd = new ScaleGestureDetector(c, new ScaleGestureDetector.SimpleOnScaleGestureListener() {
+                @Override public boolean onScale(ScaleGestureDetector d) { setZoomAround(z * d.getScaleFactor(), d.getFocusX()); return true; }
+                @Override public void onScaleEnd(ScaleGestureDetector d) { saveZoom(); }
+            });
             sgd2 = new GestureDetector(c, new GestureDetector.SimpleOnGestureListener() {
                 @Override public boolean onSingleTapConfirmed(MotionEvent e) {
                     if (locked) { revealUnlock(); return true; }
                     if (settings.getVisibility() == View.VISIBLE) settings.setVisibility(View.GONE); else showChrome(!chrome);
                     return true;
+                }
+                @Override public boolean onDoubleTap(MotionEvent e) {
+                    if (locked) return true;
+                    setZoomAround(Math.abs(z - 1) > 0.05f ? 1f : 2f, e.getX());   // back to "fits the width", or a closer look
+                    saveZoom();
+                    return true;
+                }
+                @Override public boolean onScroll(MotionEvent a, MotionEvent b, float dx, float dy) {
+                    if (z > 1.001f && !zsd.isInProgress()) { moveSideways(dx); }   // the list itself takes the up-down part
+                    return false;
                 }
             });
             setOnScrollListener(new OnScrollListener() {
@@ -2029,8 +2050,48 @@ public class ReaderActivity extends Activity {
         }
 
         @Override public boolean onTouchEvent(MotionEvent e) {
+            if (!locked) zsd.onTouchEvent(e);   // no zoom by accident while locked
             sgd2.onTouchEvent(e);
+            if (zsd.isInProgress()) return true;
             return super.onTouchEvent(e);
+        }
+
+        // ---- zoom ----
+        void moveSideways(float dx) {
+            float max = Math.max(0, getWidth() * z - getWidth());
+            float np = Math.max(0, Math.min(max, panX + dx));
+            if (np == panX) return;
+            panX = np;
+            pictureReady();
+        }
+
+        /** Sets the zoom keeping the place on screen: the same spot of the same page stays under the finger, left-right and up-down. */
+        void setZoomAround(float nz, float fx) {
+            nz = Math.max(MIN_Z, Math.min(MAX_Z, nz));
+            if (Math.abs(nz - z) < 0.002f) return;
+            float ratio = nz / z;
+            int pos = getFirstVisiblePosition();
+            View c0 = getChildAt(0);
+            int top = c0 == null ? 0 : c0.getTop();
+            z = nz;
+            float W = getWidth();
+            float max = Math.max(0, W * z - W);
+            panX = Math.max(0, Math.min(max, (panX + fx) * ratio - fx));
+            ad.notifyDataSetChanged();
+            setSelectionFromTop(pos, (int) (top * ratio));
+            pictureReady();
+        }
+
+        String zoomKey() { return "rdSZ" + (getResources().getConfiguration().orientation == android.content.res.Configuration.ORIENTATION_LANDSCAPE ? "L" : "P"); }
+
+        void saveZoom() { Store.setNum(ReaderActivity.this, zoomKey(), Math.round(z * 100)); }
+
+        /** The zoom last used in this position (turning the phone brings the other one). */
+        void loadZoom() {
+            float nz = Store.num(ReaderActivity.this, zoomKey(), 100) / 100f;
+            z = Math.max(MIN_Z, Math.min(MAX_Z, nz));
+            panX = 0;
+            ad.notifyDataSetChanged();
         }
 
         int pageAtTop() {
@@ -2083,19 +2144,23 @@ public class ReaderActivity extends Activity {
 
             @Override protected void onMeasure(int wms, int hms) {
                 int W = MeasureSpec.getSize(wms);
-                float hgt;
+                float hgt;   // at zoom 1; the row is z times that tall
                 if (b != null && pv != null) {
                     src = pv.cropOf(b, page);
-                    sc = W / Math.max(1f, src.width());
-                    hgt = src.height() * sc + gap;
+                    sc = W * z / Math.max(1f, src.width());
+                    hgt = src.height() * W / Math.max(1f, src.width());
                     rowH[page] = hgt; lastKnownH = hgt;
                 } else hgt = rowH[page] > 0 ? rowH[page] : lastKnownH > 0 ? lastKnownH : W * 1.35f;
-                setMeasuredDimension(W, (int) Math.ceil(hgt));
+                setMeasuredDimension(W, (int) Math.ceil(hgt * z) + gap);
             }
+
+            /** Left edge of the page inside the row: centred when it is narrower than the screen, moved by the drag when it is wider. */
+            float left() { int W = getWidth(); return z <= 1 ? (W - W * z) / 2f : -panX; }
 
             /** y of a word inside this row, or -1 while the picture is missing. */
             float yOfWord(int word) {
                 if (b == null || bi == null || word < 0 || word >= bi.count()) return -1;
+                sc = getWidth() * z / Math.max(1f, src.width());
                 return (bi.box[word * 4 + 1] * b.getHeight() - src.top) * sc;
             }
 
@@ -2104,10 +2169,12 @@ public class ReaderActivity extends Activity {
                 Bitmap bm = cache.get(page);
                 if (bm == null) { ensure(page); bm = b; }
                 if (bm == null || pv == null) return;
-                if (bm != b) { b = bm; src = pv.cropOf(b, page); sc = getWidth() / Math.max(1f, src.width()); }
-                dst.set(0, 0, getWidth(), src.height() * sc);
+                if (bm != b) { b = bm; src = pv.cropOf(b, page); }
+                sc = getWidth() * z / Math.max(1f, src.width());
+                float l = left();
+                dst.set(l, 0, l + src.width() * sc, src.height() * sc);
                 c.drawBitmap(bm, new Rect((int) src.left, (int) src.top, (int) src.right, (int) src.bottom), dst, pv.bmpP);
-                if (hlOn && bi != null && hlFrom >= 0) pv.drawHighlight(c, page, bm, src, 0, 0, sc);
+                if (hlOn && bi != null && hlFrom >= 0) pv.drawHighlight(c, page, bm, src, l, 0, sc);
             }
         }
     }
