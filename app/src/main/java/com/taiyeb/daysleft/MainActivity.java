@@ -1098,7 +1098,7 @@ public class MainActivity extends Activity {
     // ====================== in-app update ======================
     /** The natural reading voice: download once (about 145 MB), then on/off. Books the phone reads aloud use it when it is on. */
     LinearLayout voiceRow() {
-        LinearLayout r = row("Natural voice", null, null, null);
+        LinearLayout r = row("Natural voice", " ", null, null);
         TextView sub = (TextView) ((LinearLayout) r.getChildAt(0)).getChildAt(1);
         boolean[][] cancel = {null};
         Runnable[] draw = new Runnable[1];
