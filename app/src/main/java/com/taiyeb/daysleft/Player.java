@@ -34,7 +34,7 @@ class Player {
 
     // ---- read aloud: a book the phone reads itself. Same player for the rest of the app: time, seek, speed, notification, pins, marker. ----
     static boolean virtual;
-    private static Speaker spk;
+    private static Narrator spk;
     private static Timeline tl;
     private static double vT;                    // where the player is (nominal seconds) when no sentence is running
     private static double vSentStart, vSentEnd;  // nominal bounds of the sentence being spoken
@@ -87,13 +87,13 @@ class Player {
     }
 
     static boolean isPlaying() {
-        if (virtual) return ready && spk != null && spk.playing;
+        if (virtual) return ready && spk != null && spk.playing();
         try { return mp != null && ready && mp.isPlaying(); } catch (Exception e) { return false; }
     }
     static double pos() {
         if (virtual) {
             if (!ready || tl == null) return 0;
-            if (vSpeaking && spk != null && spk.playing) lastPos = Math.min(vSentEnd, vSentStart + (System.currentTimeMillis() - vWall) / 1000.0 * speed);
+            if (vSpeaking && spk != null && spk.playing()) lastPos = Math.min(vSentEnd, vSentStart + (System.currentTimeMillis() - vWall) / 1000.0 * speed);
             else lastPos = vT;
             return lastPos;
         }
@@ -117,19 +117,8 @@ class Player {
                 main.post(() -> {
                     if (itemId != id || !virtual) return;
                     tl = t;
-                    spk = new Speaker(app, new Speaker.Listener() {
-                        @Override public void onSentence(int from, int to) {
-                            if (tl == null) return;
-                            int s = tl.sentenceOf(from);
-                            vSentStart = tl.start[s]; vSentEnd = tl.end[s]; vWall = System.currentTimeMillis(); vSpeaking = true; vT = vSentStart;
-                        }
-                        @Override public void onEnd() { vSpeaking = false; vT = tl == null ? 0 : tl.total; PlaybackService.sync(app); }
-                        @Override public void onState() {
-                            if (vPending && spk != null && spk.ready()) { vPending = false; startAt(app); }
-                            if (spk != null && spk.failed() && vPending) { vPending = false; main.post(() -> android.widget.Toast.makeText(app, "No speech engine found. Install \"Speech Services by Google\" from the Play Store.", android.widget.Toast.LENGTH_LONG).show()); }
-                            PlaybackService.sync(app);
-                        }
-                    });
+                    vBook = b;
+                    spk = makeNarrator(app, id);
                     spk.setBook(b, id);
                     spk.setRate(speed);
                     if (vT > tl.total) vT = 0;
@@ -143,6 +132,67 @@ class Player {
                 main.post(() -> { if (itemId == id) { virtual = false; itemId = -1; android.widget.Toast.makeText(app, "Couldn't read this PDF's text.", android.widget.Toast.LENGTH_LONG).show(); } });
             }
         }, "read-aloud-open").start();
+    }
+
+    private static BookIndex vBook;
+    private static boolean neural;
+
+    private static Narrator makeNarrator(Context app, int id) {
+        NaturalVoice.checkCrash(app);
+        Narrator.Listener l = new Narrator.Listener() {
+            @Override public void onSentence(int from, int to) {
+                if (tl == null) return;
+                int s = tl.sentenceOf(from);
+                vSentStart = tl.start[s]; vSentEnd = tl.end[s]; vWall = System.currentTimeMillis(); vSpeaking = true; vT = vSentStart;
+            }
+            @Override public void onEnd() { vSpeaking = false; vT = tl == null ? 0 : tl.total; PlaybackService.sync(app); }
+            @Override public void onSlow() {
+                Dbg.e("Voice", "the natural voice cannot keep up on this phone: switching to the phone's own voice", null);
+                Store.setFlag(app, "nvSlow", true);
+                main.post(() -> { android.widget.Toast.makeText(app, "The natural voice is too slow on this phone. Using the phone's own voice.", android.widget.Toast.LENGTH_LONG).show(); useSystemVoice(app, id); });
+            }
+            @Override public void onState() {
+                if (spk != null && spk.failed() && neural) { main.post(() -> useSystemVoice(app, id)); return; }
+                if (vPending && spk != null && spk.ready()) { vPending = false; startAt(app); }
+                if (spk != null && spk.failed() && vPending) { vPending = false; main.post(() -> android.widget.Toast.makeText(app, "No speech engine found. Install \"Speech Services by Google\" from the Play Store.", android.widget.Toast.LENGTH_LONG).show()); }
+                PlaybackService.sync(app);
+            }
+        };
+        neural = NaturalVoice.usable(app);
+        Narrator n = neural ? new NeuralSpeaker(app, l) : new Speaker(app, l);
+        Dbg.i("Player", "reading with the " + (neural ? "natural voice" : "phone's own voice"));
+        return n;
+    }
+
+    /** The natural voice failed or is too slow: carry on with the phone's own engine from the same place. */
+    private static void useSystemVoice(Context app, int id) {
+        if (!virtual || itemId != id || !neural) return;
+        boolean was = spk != null && spk.playing();
+        double at = pos();
+        if (spk != null) spk.shutdown();
+        neural = false;
+        vT = at; vSpeaking = false;
+        Narrator n = makeSystem(app, id);
+        spk = n;
+        n.setBook(vBook, id); n.setRate(speed);
+        if (was || vPending) { vPending = true; if (n.ready()) { vPending = false; startAt(app); } }
+    }
+
+    private static Narrator makeSystem(Context app, int id) {
+        Narrator.Listener l = new Narrator.Listener() {
+            @Override public void onSentence(int from, int to) {
+                if (tl == null) return;
+                int s = tl.sentenceOf(from);
+                vSentStart = tl.start[s]; vSentEnd = tl.end[s]; vWall = System.currentTimeMillis(); vSpeaking = true; vT = vSentStart;
+            }
+            @Override public void onEnd() { vSpeaking = false; vT = tl == null ? 0 : tl.total; PlaybackService.sync(app); }
+            @Override public void onState() {
+                if (vPending && spk != null && spk.ready()) { vPending = false; startAt(app); }
+                if (spk != null && spk.failed() && vPending) { vPending = false; main.post(() -> android.widget.Toast.makeText(app, "No speech engine found. Install \"Speech Services by Google\" from the Play Store.", android.widget.Toast.LENGTH_LONG).show()); }
+                PlaybackService.sync(app);
+            }
+        };
+        return new Speaker(app, l);
     }
 
     private static void startAt(Context app) {
@@ -232,7 +282,7 @@ class Player {
         Context app = c.getApplicationContext();
         if (virtual) {
             vPending = false; playWhenReady = false;
-            if (spk != null && spk.playing) { vT = pos(); vSpeaking = false; spk.pause(); }
+            if (spk != null && spk.playing()) { vT = pos(); vSpeaking = false; spk.pause(); }
             saveNow(app);
             PlaybackService.sync(app);
             return;
@@ -250,7 +300,7 @@ class Player {
             vT = Math.max(0, Math.min(tl.total, ms / 1000.0));
             int s = tl.sentenceAt(vT);
             vSentStart = tl.start[s]; vSentEnd = tl.end[s]; vWall = System.currentTimeMillis();
-            if (spk != null && spk.playing) { vSpeaking = false; spk.playFrom(tl.wordAt(vT)); }
+            if (spk != null && spk.playing()) { vSpeaking = false; spk.playFrom(tl.wordAt(vT)); }
             return;
         }
         try { if (mp != null && ready) mp.seekTo(Math.max(0, ms)); } catch (Exception ignored) {}
@@ -275,7 +325,7 @@ class Player {
         if (virtual) {
             saveNow(c);
             if (spk != null) { spk.shutdown(); spk = null; }
-            tl = null; virtual = false; vSpeaking = false; vPending = false;
+            tl = null; virtual = false; vSpeaking = false; vPending = false; vBook = null;
         }
         if (mp != null) {
             saveNow(c);

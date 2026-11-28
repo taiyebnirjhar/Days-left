@@ -20,12 +20,7 @@ import java.util.Set;
  * exactly which sentence is being spoken (no sync needed: the engine tells us). The pitch and pace shift a little for dialogue, questions and
  * exclamations so it does not sound flat. Lives as long as the reader that started it.
  */
-class Speaker {
-    interface Listener {
-        void onSentence(int from, int to);   // this sentence has started (main thread)
-        void onEnd();                        // the book is finished
-        void onState();                      // playing / paused / ready changed
-    }
+class Speaker implements Narrator {
 
     private static final int AHEAD = 3;
 
@@ -33,7 +28,7 @@ class Speaker {
     private final Handler main = new Handler(Looper.getMainLooper());
     private TextToSpeech tts;
     private volatile boolean ready, failed;
-    private Listener lis;
+    private Narrator.Listener lis;
     private BookIndex bi;
     private String[] tok;
     volatile boolean playing;
@@ -45,7 +40,7 @@ class Speaker {
     private List<Voice> voices = new ArrayList<>();
     String voiceName = "";
 
-    Speaker(Context c, Listener l) {
+    Speaker(Context c, Narrator.Listener l) {
         app = c.getApplicationContext();
         lis = l;
         try {
@@ -53,9 +48,11 @@ class Speaker {
         } catch (Throwable e) { failed = true; Dbg.e("Speak", "no speech engine", e); }
     }
 
-    boolean ready() { return ready; }
+    @Override public boolean ready() { return ready; }
 
-    boolean failed() { return failed; }
+    @Override public boolean failed() { return failed; }
+
+    @Override public boolean playing() { return playing; }
 
     private void init(int status) {
         if (status != TextToSpeech.SUCCESS || tts == null) { failed = true; Dbg.e("Speak", "speech engine failed to start, status " + status, null); notifyState(); return; }
@@ -120,9 +117,9 @@ class Speaker {
         return n.length() > 28 ? n.substring(0, 28) : n;
     }
 
-    void setRate(float r) { baseRate = r; }
+    @Override public void setRate(float r) { baseRate = r; }
 
-    void setBook(BookIndex b, int itemId) {
+    @Override public void setBook(BookIndex b, int itemId) {
         bi = b;
         tok = new String[b.count()];
         BookText.Disp d = null;
@@ -132,10 +129,10 @@ class Speaker {
 
     boolean hasBook() { return bi != null; }
 
-    int position() { return pos; }
+    @Override public int position() { return pos; }
 
     /** Speak from this word (the start of its sentence). */
-    void playFrom(int word) {
+    @Override public void playFrom(int word) {
         if (!ready || bi == null) return;
         stopQueue();
         pos = bi.sentenceAround(Math.max(0, Math.min(bi.count() - 1, word)))[0];
@@ -145,7 +142,7 @@ class Speaker {
         notifyState();
     }
 
-    void pause() {
+    @Override public void pause() {
         if (!playing) return;
         playing = false;
         stopQueue();     // pos stays on the sentence that was being spoken: resume starts there
@@ -156,7 +153,7 @@ class Speaker {
 
     private void restart() { if (pos >= 0) playFrom(pos); }
 
-    void shutdown() {
+    @Override public void shutdown() {
         playing = false;
         gen++;
         lis = null;
@@ -170,7 +167,7 @@ class Speaker {
         try { if (tts != null) tts.stop(); } catch (Throwable ignored) {}
     }
 
-    private void notifyState() { Listener l = lis; if (l != null) l.onState(); }
+    private void notifyState() { Narrator.Listener l = lis; if (l != null) l.onState(); }
 
     /** Keeps AHEAD sentences queued. */
     private void fill() {
@@ -183,7 +180,7 @@ class Speaker {
             speak(from, to, text);
             queued++;
         }
-        if (playing && queued == 0 && queuedTo >= bi.count()) { playing = false; notifyState(); Listener l = lis; if (l != null) l.onEnd(); }
+        if (playing && queued == 0 && queuedTo >= bi.count()) { playing = false; notifyState(); Narrator.Listener l = lis; if (l != null) l.onEnd(); }
     }
 
     private String textOf(int from, int to) {
@@ -220,7 +217,7 @@ class Speaker {
         int[] r = parse(id);
         if (r == null || r[2] != gen || !playing) return;
         pos = r[0];
-        Listener l = lis;
+        Narrator.Listener l = lis;
         if (l != null) l.onSentence(r[0], r[1]);
     }
 

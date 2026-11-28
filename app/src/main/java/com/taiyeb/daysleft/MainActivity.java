@@ -1074,6 +1074,7 @@ public class MainActivity extends Activity {
             if (!NudgeReceiver.post(this)) Toast.makeText(this, "Add something to a plan or the inbox first", Toast.LENGTH_SHORT).show();
         }), lp(-1, -2, 0, 0, 0, 10));
 
+        c.addView(voiceRow(), lp(-1, -2, 0, 0, 0, 10));
         c.addView(label("System"));
         c.addView(row("Notification settings", "Allow, sound, show in status bar", null, v ->
                 startActivity(new Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(Settings.EXTRA_APP_PACKAGE, getPackageName()))), lp(-1, -2, 0, 0, 0, 10));
@@ -1095,6 +1096,41 @@ public class MainActivity extends Activity {
     }
 
     // ====================== in-app update ======================
+    /** The natural reading voice: download once (about 145 MB), then on/off. Books the phone reads aloud use it when it is on. */
+    LinearLayout voiceRow() {
+        LinearLayout r = row("Natural voice", null, null, null);
+        TextView sub = (TextView) ((LinearLayout) r.getChildAt(0)).getChildAt(1);
+        boolean[][] cancel = {null};
+        Runnable[] draw = new Runnable[1];
+        draw[0] = () -> {
+            if (NaturalVoice.downloading) sub.setText("Downloading… " + Math.max(0, NaturalVoice.dlPct) + "%. Tap to stop");
+            else if (!NaturalVoice.installed(this)) sub.setText(NaturalVoice.error.isEmpty() ? "A natural voice for books the phone reads aloud. 145 MB, downloaded once" : NaturalVoice.error);
+            else if (Store.flag(this, "nvCrashed", false) || Store.flag(this, "nvSlow", false)) sub.setText("Off: it did not work well on this phone. Tap to try again");
+            else sub.setText(Store.flag(this, "nvOn", true) ? "On. Used when the phone reads a book aloud. Tap to switch off" : "Off. The phone's own voice is used. Tap to switch on");
+        };
+        r.setOnClickListener(v -> {
+            if (NaturalVoice.downloading) { if (cancel[0] != null) cancel[0][0] = true; draw[0].run(); return; }
+            if (!NaturalVoice.installed(this)) { cancel[0] = NaturalVoice.startDownload(this); draw[0].run(); return; }
+            if (Store.flag(this, "nvCrashed", false) || Store.flag(this, "nvSlow", false)) { NaturalVoice.reset(this); Store.setFlag(this, "nvOn", true); }
+            else Store.setFlag(this, "nvOn", !Store.flag(this, "nvOn", true));
+            draw[0].run();
+        });
+        draw[0].run();
+        Runnable poll = new Runnable() {
+            @Override public void run() {
+                if (screen != 2 || sub.getParent() == null) return;
+                draw[0].run();
+                if (NaturalVoice.downloading) h.postDelayed(this, 500);
+            }
+        };
+        h.postDelayed(poll, 500);
+        r.addOnAttachStateChangeListener(new View.OnAttachStateChangeListener() {
+            @Override public void onViewAttachedToWindow(View v) { if (NaturalVoice.downloading) h.postDelayed(poll, 500); }
+            @Override public void onViewDetachedFromWindow(View v) {}
+        });
+        return r;
+    }
+
     LinearLayout updateRow() {
         LinearLayout r = row("Check for update", "Installed: " + Updater.installedVersion(this), null, null);
         TextView sub = (TextView) ((LinearLayout) r.getChildAt(0)).getChildAt(1);
