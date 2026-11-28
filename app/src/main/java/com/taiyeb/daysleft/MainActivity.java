@@ -415,7 +415,18 @@ public class MainActivity extends Activity {
         root = new FrameLayout(this);
         root.setBackgroundColor(BG);
         root.setOnApplyWindowInsetsListener((v, ins) -> {
-            v.setPadding(0, ins.getSystemWindowInsetTop(), 0, ins.getSystemWindowInsetBottom());
+            // only the real bars: the status bar on top, the navigation bar (or the keyboard while it is open) at the bottom.
+            // A stale or odd inset (a keyboard that closed, a split screen) must never push the whole screen into the middle.
+            int top, bottom;
+            if (android.os.Build.VERSION.SDK_INT >= 30) {
+                android.graphics.Insets bars = ins.getInsets(WindowInsets.Type.systemBars() | WindowInsets.Type.displayCutout());
+                top = bars.top;
+                bottom = bars.bottom;
+                if (ins.isVisible(WindowInsets.Type.ime())) bottom = Math.max(bottom, ins.getInsets(WindowInsets.Type.ime()).bottom);
+            } else { top = ins.getSystemWindowInsetTop(); bottom = ins.getSystemWindowInsetBottom(); }
+            top = Math.min(top, dp(90));
+            if (bottom > dp(120) && getResources().getDisplayMetrics().heightPixels > 0 && bottom > getResources().getDisplayMetrics().heightPixels * 0.6f) bottom = dp(48);
+            v.setPadding(0, top, 0, bottom);
             return ins;
         });
         setContentView(root);
@@ -462,6 +473,7 @@ public class MainActivity extends Activity {
 
     @Override protected void onResume() {
         super.onResume();
+        if (root != null) root.requestApplyInsets();
         h.postDelayed(refresher, 30000);
         for (Cd d : Store.load(this)) if (d.active) { sync(); break; }
         if (screen == 0 && listBox != null) renderList();

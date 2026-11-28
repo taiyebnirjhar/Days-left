@@ -68,6 +68,9 @@ public class ReaderActivity extends Activity {
     BookIndex bi;
     Alignment al = new Alignment();
     int hlFrom = -1, hlTo = -1;
+    Speaker spk;               // read aloud (books without audio)
+    boolean wantSpeak, readingForSpeech;
+    TextView voiceBtn;
     boolean hlOn, followOn;
     int hlStyle;   // 0 marker, 1 underline
     long lastManual, alReloaded;
@@ -155,6 +158,7 @@ public class ReaderActivity extends Activity {
     @Override protected void onDestroy() {
         super.onDestroy();
         h.removeCallbacksAndMessages(null);
+        if (spk != null) { spk.shutdown(); spk = null; }
         closePanel();
         if (!SyncService.running) new Thread(Whisper::release).start();
         Player.onReady = null;
@@ -523,7 +527,8 @@ public class ReaderActivity extends Activity {
      * Find/Play-page job, an answer to tap, or why the sync stopped. The steady progress lives on the nav icon, not here.
      */
     void updateBanner() {
-        if (bannerWrap == null || item == null || !fileMode) return;
+        if (bannerWrap == null || item == null) return;
+        if (!fileMode && jobText == null) { if (bannerWrap.getVisibility() != View.GONE) bannerWrap.setVisibility(View.GONE); return; }
         long now = System.currentTimeMillis();
         boolean mine = SyncService.running && SyncService.itemId == item.id;
         String t = null;
@@ -550,6 +555,7 @@ public class ReaderActivity extends Activity {
 
     void refreshPlay() {
         if (playGlyph == null || am == null) return;
+        if (!fileMode) { refreshSpeakUi(); return; }
         int t = am.isMusicActive() ? 2 : 1;
         if (playGlyph.type != t) { playGlyph.type = t; playGlyph.invalidate(); }
     }
@@ -574,13 +580,90 @@ public class ReaderActivity extends Activity {
             Player.toggle(this);
             return;
         }
-        // Not an in-app video: only pause/resume something that is really playing, never start a random track.
-        if (am.isMusicActive()) {
-            long now = SystemClock.uptimeMillis();
-            am.dispatchMediaKeyEvent(new KeyEvent(now, now, KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE, 0));
-            am.dispatchMediaKeyEvent(new KeyEvent(now, now, KeyEvent.ACTION_UP, KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE, 0));
-            h.postDelayed(this::refreshPlay, 500);
-        } else Toast.makeText(this, "Attach an audio file to this book first", Toast.LENGTH_SHORT).show();
+        toggleSpeak();   // no audiobook: the phone reads the book aloud
+    }
+
+    // ====================== read aloud ======================
+    final Speaker.Listener speakListener = new Speaker.Listener() {
+        @Override public void onSentence(int from, int to) {
+            if (bi == null || isFinishing()) return;
+            hlFrom = from; hlTo = to;
+            if (hlOn && pv != null) pv.invalidate();
+            if (sp != null) sp.pictureReady();
+            long now = System.currentTimeMillis();
+            if (!followOn || now - lastManual < 5000 || settings.getVisibility() == View.VISIBLE) return;
+            if (scrollMode && sp != null) sp.follow(from);
+            else if (pv != null && !pv.dragging && pv.zoom <= 1.01f) { int pg = bi.pageOf(from); if (pg != cur) goTo(pg, false); }
+        }
+        @Override public void onEnd() { if (!isFinishing()) Toast.makeText(ReaderActivity.this, "Finished the book", Toast.LENGTH_SHORT).show(); refreshSpeakUi(); }
+        @Override public void onState() { refreshSpeakUi(); trySpeak(); }
+    };
+
+    void refreshSpeakUi() {
+        if (playGlyph != null && spk != null) { int g = spk.playing ? 2 : 1; if (playGlyph.type != g) { playGlyph.type = g; playGlyph.invalidate(); } }
+        if (speedBtn != null && spk != null) speedBtn.setText(spk.rateLabel());
+    }
+
+    void toggleSpeak() {
+        if (spk == null) { spk = new Speaker(this, speakListener); refreshSpeakUi(); }
+        if (spk.failed()) { Toast.makeText(this, "No speech engine found. Install \"Speech Services by Google\" from the Play Store.", Toast.LENGTH_LONG).show(); return; }
+        if (spk.playing) { spk.pause(); wantSpeak = false; return; }
+        wantSpeak = true;
+        ensureSpeechText();
+        trySpeak();
+    }
+
+    /** Starts as soon as both the speech engine and the book's text are ready; whichever comes last triggers it. */
+    void trySpeak() {
+        if (!wantSpeak || spk == null || bi == null || !spk.ready() || !spk.hasBook()) return;
+        wantSpeak = false;
+        int w = bi.pageStart[Math.max(0, Math.min(bi.pages - 1, cur))];
+        int resume = spk.position();
+        if (resume >= 0 && resume < bi.count() && bi.pageOf(resume) == cur) w = resume;       // paused on this page: carry on where it stopped
+        else { int[] s = bi.sentenceAround(w); if (s[0] < w) w = Math.min(bi.count() - 1, s[1] + 1); }   // else the first sentence that starts on this page
+        spk.playFrom(w);
+    }
+
+    /** The book's words and their printed form: read once per book (saved), then it is instant. */
+    void ensureSpeechText() {
+        if (bi != null && spk != null && spk.hasBook()) return;
+        if (bi != null) { spk.setBook(bi, item.id); return; }
+        if (readingForSpeech) return;
+        readingForSpeech = true;
+        final int id = item.id;
+        new Thread(() -> {
+            try {
+                BookIndex b;
+                if (BookText.ready(this, id)) b = BookText.index(this, id);
+                else {
+                    ui(() -> { jobText = "Getting the book ready to read aloud…"; updateBanner(); });
+                    b = BookText.extract(this, item, pc -> ui(() -> { jobText = "Getting the book ready to read aloud… " + pc + "%"; updateBanner(); }), new boolean[1]);
+                }
+                final BookIndex fb = b;
+                if (BookText.looksScanned(fb)) {
+                    ui(() -> { jobText = null; updateBanner(); wantSpeak = false; Toast.makeText(this, "This PDF is made of page pictures, so there is no text to read aloud.", Toast.LENGTH_LONG).show(); });
+                    return;
+                }
+                ui(() -> {
+                    jobText = null; updateBanner();
+                    if (bi == null) { bi = fb; computePageBounds(); computeCrop(); if (pv != null) pv.invalidate(); }
+                    if (spk != null) spk.setBook(bi, id);
+                    trySpeak();
+                });
+            } catch (Throwable e) {
+                Dbg.e("Speak", "could not read the book text", e);
+                ui(() -> { jobText = null; updateBanner(); wantSpeak = false; Toast.makeText(this, "Couldn't read this PDF's text.", Toast.LENGTH_LONG).show(); });
+            } finally { readingForSpeech = false; }
+        }, "speech-text").start();
+    }
+
+    void cycleSpeakRate() { if (spk == null) return; spk.cycleRate(); refreshSpeakUi(); }
+
+    void nextSpeakVoice() {
+        if (spk == null) { spk = new Speaker(this, speakListener); }
+        if (!spk.ready()) { Toast.makeText(this, "Starting the voice…", Toast.LENGTH_SHORT).show(); return; }
+        String n = spk.nextVoice();
+        Toast.makeText(this, n == null ? "Only one voice is installed on this phone" : "Voice: " + n, Toast.LENGTH_SHORT).show();
     }
 
     String fmtT(double s) {
@@ -1527,9 +1610,15 @@ public class ReaderActivity extends Activity {
             controlsCol.addView(navBar, new LinearLayout.LayoutParams(-1, -2));
             bottom.addView(controlsCol, new LinearLayout.LayoutParams(-1, -2));
         } else {
-            FrameLayout ctl = new FrameLayout(this);
+            // no audiobook: the phone reads aloud. Pace on the left, play in the middle, voice on the right
+            LinearLayout ctl = new LinearLayout(this);
+            ctl.setGravity(Gravity.CENTER);
+            speedBtn = pill("1x", this::cycleSpeakRate);
+            voiceBtn = pill("Voice", this::nextSpeakVoice);
             playBtn.addView(playGlyph, new FrameLayout.LayoutParams(dp(30), dp(30), Gravity.CENTER));
-            ctl.addView(playBtn, new FrameLayout.LayoutParams(dp(60), dp(60), Gravity.CENTER));
+            ctl.addView(speedBtn, new LinearLayout.LayoutParams(dp(64), -2));
+            ctl.addView(playBtn, lpm(dp(60), dp(60), 18, 0, 18, 0));
+            ctl.addView(voiceBtn, new LinearLayout.LayoutParams(dp(64), -2));
             bottom.addView(ctl, new LinearLayout.LayoutParams(-1, -2));
         }
         stack.addView(bottom, new LinearLayout.LayoutParams(-1, -2));
