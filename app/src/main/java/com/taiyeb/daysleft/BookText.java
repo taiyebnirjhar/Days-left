@@ -265,6 +265,14 @@ class BookText {
         Store.sp(c).edit().remove("syncDone_" + itemId).remove("syncFull_" + itemId).remove("syncPct_" + itemId).remove("syncWin_" + itemId).apply();
     }
 
+    /** Moves a book text prepared under a temporary id (the sheet was still open) to the item's own id. */
+    static synchronized void adopt(Context c, int from, int to) {
+        forget(c, to);
+        file(c, from).renameTo(file(c, to));
+        dispFile(c, from).renameTo(dispFile(c, to));
+        if (cachedId == from || cachedId == to) { cached = null; cachedMatcher = null; cachedId = -1; }
+    }
+
     /** Forget everything derived from the PDF (a new PDF was attached). */
     static synchronized void forget(Context c, int itemId) {
         file(c, itemId).delete();

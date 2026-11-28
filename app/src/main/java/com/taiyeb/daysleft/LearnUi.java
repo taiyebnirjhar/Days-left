@@ -544,6 +544,7 @@ final class LearnUi {
         drawMins[0].run();
 
         String[] pdf = {it.pdf}, pdfName = {it.pdfName};
+        Runnable[] afterPdf = new Runnable[1];   // the audio section reacts when the PDF changes (read aloud needs it)
         LinearLayout pbox = a.col();
         Runnable[] drawPdf = new Runnable[1];
         drawPdf[0] = () -> {
@@ -555,13 +556,14 @@ final class LearnUi {
                 pdfName[0] = name;
                 if (title.getText().toString().trim().isEmpty()) title.setText(name.replaceFirst("(?i)\\.pdf$", "").replace('_', ' '));
                 drawPdf[0].run();
+                if (afterPdf[0] != null) afterPdf[0].run();
             }));
             row.setBackground(a.rr(MainActivity.CARD2, 18));
             pbox.addView(row);
             if (has) {
                 TextView rm = a.tv("Remove PDF", 13, 0xFFFF7A7A, true);
                 rm.setPadding(a.dp(4), a.dp(10), a.dp(4), a.dp(2));
-                rm.setOnClickListener(v -> { pdf[0] = ""; pdfName[0] = ""; drawPdf[0].run(); });
+                rm.setOnClickListener(v -> { pdf[0] = ""; pdfName[0] = ""; drawPdf[0].run(); if (afterPdf[0] != null) afterPdf[0].run(); });
                 pbox.addView(rm);
             }
         };
@@ -569,8 +571,75 @@ final class LearnUi {
         b.addView(pbox, a.lp(-1, -2, 0, 14, 0, 0));
 
         String[] aud = {it.audio}, audName = {it.audioName};
-        LinearLayout abox = a.col();
+        // read aloud: preparing the book's text. A changed or new PDF is prepared under a temporary id and moved to the item's id on Save.
+        boolean[] speak = {it.speak && it.audio.isEmpty()}, prepping = {false}, swGuard = {false};
+        boolean[][] prepCancel = {null};
+        String[] prepFor = {speak[0] && !it.pdf.isEmpty() ? it.pdf : ""};
+        int[] prepId = {0};
+        TextView[] speakSub = {null};
+        android.widget.Switch[] speakSw = {null};
+        TextView[] saveBtn = {null};
         Runnable[] drawAud = new Runnable[1];
+        Runnable[] startPrepR = new Runnable[1];
+        Runnable startPrep = () -> startPrepR[0].run();
+        Runnable[] cancelPrepR = new Runnable[1];
+        Runnable[] saveState = new Runnable[1];   // Save is greyed out and says 'Preparing N%' while the book is being read
+        int[] prepPct = {0};
+        cancelPrepR[0] = () -> {
+            if (prepCancel[0] != null) prepCancel[0][0] = true;
+            prepCancel[0] = null;
+            if (prepping[0]) { prepping[0] = false; saveState[0].run(); }
+        };
+        startPrepR[0] = () -> {
+            final String uri = pdf[0];
+            final boolean samePdf = !isNew && uri.equals(it.pdf);
+            if (samePdf && BookText.ready(a, it.id)) { prepFor[0] = ""; prepId[0] = 0; if (speakSub[0] != null) speakSub[0].setText("Ready. The phone reads this book in a natural voice."); return; }
+            if (prepFor[0].equals(uri) && prepId[0] > 0 && BookText.ready(a, prepId[0])) { if (speakSub[0] != null) speakSub[0].setText("Ready. The phone reads this book in a natural voice."); return; }
+            if (prepId[0] == 0) prepId[0] = samePdf ? it.id : 900000 + (int) (System.currentTimeMillis() % 90000);
+            final int fid = prepId[0];
+            final boolean[] cancel = {false};
+            prepCancel[0] = cancel;
+            prepping[0] = true; prepPct[0] = 0;
+            if (speakSub[0] != null) speakSub[0].setText("Getting the book ready… 0%");
+            saveState[0].run();
+            new Thread(() -> {
+                try {
+                    Item tmp = new Item();
+                    tmp.id = fid; tmp.pdf = uri;
+                    BookIndex bi = BookText.extract(a, tmp, pc -> a.runOnUiThread(() -> {
+                        if (cancel[0]) return;
+                        prepPct[0] = pc;
+                        if (speakSub[0] != null) speakSub[0].setText("Getting the book ready… " + pc + "%");
+                        saveState[0].run();
+                    }), cancel);
+                    final boolean scanned = BookText.looksScanned(bi);
+                    a.runOnUiThread(() -> {
+                        if (cancel[0]) return;
+                        prepping[0] = false; prepCancel[0] = null;
+                        if (scanned) {
+                            Toast.makeText(a, "This PDF is made of page pictures, so there is no text to read aloud.", Toast.LENGTH_LONG).show();
+                            speak[0] = false;
+                            if (speakSw[0] != null) { swGuard[0] = true; speakSw[0].setChecked(false); swGuard[0] = false; }
+                            if (speakSub[0] != null) speakSub[0].setText("No audio file? The phone reads the book to you");
+                        } else {
+                            prepFor[0] = uri;
+                            if (speakSub[0] != null) speakSub[0].setText("Ready. The phone reads this book in a natural voice.");
+                        }
+                        saveState[0].run();
+                    });
+                } catch (Exception e) {
+                    a.runOnUiThread(() -> {
+                        if (cancel[0]) return;
+                        prepping[0] = false; prepCancel[0] = null; speak[0] = false;
+                        Toast.makeText(a, "Couldn't read this PDF's text.", Toast.LENGTH_LONG).show();
+                        if (speakSw[0] != null) { swGuard[0] = true; speakSw[0].setChecked(false); swGuard[0] = false; }
+                        if (speakSub[0] != null) speakSub[0].setText("No audio file? The phone reads the book to you");
+                        saveState[0].run();
+                    });
+                }
+            }, "prepare-book").start();
+        };
+        LinearLayout abox = a.col();
         drawAud[0] = () -> {
             abox.removeAllViews();
             boolean has = !aud[0].isEmpty();
@@ -583,11 +652,41 @@ final class LearnUi {
             row.setBackground(a.rr(MainActivity.CARD2, 18));
             abox.addView(row);
             if (has) {
+                speak[0] = false;
+                cancelPrepR[0].run();
                 TextView rm = a.tv("Remove audio file", 13, 0xFFFF7A7A, true);
                 rm.setPadding(a.dp(4), a.dp(10), a.dp(4), a.dp(2));
                 rm.setOnClickListener(v -> { aud[0] = ""; audName[0] = ""; drawAud[0].run(); });
                 abox.addView(rm);
+            } else {
+                // no audio file: the phone can read the book aloud instead. Turning it on prepares the book (its text), with a counter; Save waits for it.
+                android.widget.Switch sw = new android.widget.Switch(a);
+                a.tint(sw);
+                sw.setChecked(speak[0]);
+                LinearLayout srow = a.row("Read it aloud for me", speak[0] && !prepping[0] ? "Ready. The phone reads this book in a natural voice." : prepping[0] ? "Getting the book ready…" : "No audio file? The phone reads the book to you", sw, v -> sw.toggle());
+                srow.setBackground(a.rr(MainActivity.CARD2, 18));
+                speakSub[0] = (TextView) ((LinearLayout) srow.getChildAt(0)).getChildAt(1);
+                sw.setOnCheckedChangeListener((cb, on) -> {
+                    if (swGuard[0]) return;
+                    if (on) {
+                        if (pdf[0].isEmpty()) { Toast.makeText(a, "Attach the PDF first", Toast.LENGTH_SHORT).show(); swGuard[0] = true; sw.setChecked(false); swGuard[0] = false; return; }
+                        speak[0] = true;
+                        startPrep.run();
+                    } else {
+                        speak[0] = false;
+                        cancelPrepR[0].run();
+                        speakSub[0].setText("No audio file? The phone reads the book to you");
+                    }
+                });
+                speakSw[0] = sw;
+                abox.addView(srow, a.lp(-1, -2, 0, 8, 0, 0));
             }
+        };
+        afterPdf[0] = () -> {
+            cancelPrepR[0].run();
+            if (pdf[0].isEmpty()) speak[0] = false;
+            else if (speak[0] && aud[0].isEmpty()) startPrep.run();
+            drawAud[0].run();
         };
         drawAud[0].run();
         b.addView(abox, a.lp(-1, -2, 0, 10, 0, 0));
@@ -607,7 +706,14 @@ final class LearnUi {
         boolean[] saved = {false};
         LinearLayout btns = a.hrow();
         TextView save = a.button(isNew ? "Save" : "Save changes", ACC[0], MainActivity.DARK);
+        saveBtn[0] = save;
+        saveState[0] = () -> {
+            save.setEnabled(!prepping[0]);
+            save.setAlpha(prepping[0] ? 0.55f : 1f);
+            save.setText(prepping[0] ? "Preparing " + prepPct[0] + "%" : isNew ? "Save" : "Save changes");
+        };
         save.setOnClickListener(v -> {
+            if (prepping[0]) return;
             String ti = title.getText().toString().trim(), u = fixUrl(url.getText().toString());
             if (ti.isEmpty() && !u.isEmpty()) ti = host(u);
             if (ti.isEmpty()) { Toast.makeText(a, "Add a title", Toast.LENGTH_SHORT).show(); return; }
@@ -616,13 +722,18 @@ final class LearnUi {
             it.type = type[0];
             it.mins = mins[0];
             it.planId = pid[0];
-            if (!pdf[0].equals(it.pdf)) { it.page = 0; it.pages = 0; it.sync = ""; BookText.forget(a, it.id); }
+            boolean changedPdf = !pdf[0].equals(it.pdf);
+            boolean prepared = speak[0] && aud[0].isEmpty() && prepFor[0].equals(pdf[0]) && prepId[0] > 0;
+            if (changedPdf) { it.page = 0; it.pages = 0; it.sync = ""; if (!isNew) BookText.forget(a, it.id); }
             it.pdf = pdf[0];
             it.pdfName = pdfName[0];
             if (!aud[0].equals(it.audio)) { it.apos = 0; it.sync = ""; BookText.clearAudioData(a, it.id); }
             it.audio = aud[0];
             it.audioName = audName[0];
+            it.speak = speak[0] && aud[0].isEmpty() && !pdf[0].isEmpty();
             if (isNew) { it.id = Learn.nextItemId(Learn.items(a)); it.added = System.currentTimeMillis(); }
+            if (prepared && prepId[0] != it.id) { BookText.adopt(a, prepId[0], it.id); prepId[0] = 0; }   // the prepared text now belongs to this item
+            else if (it.speak && prepId[0] > 0 && prepId[0] == it.id) prepId[0] = 0;
             Learn.upsert(a, it);
             saved[0] = true;
             d[0].dismiss();
@@ -643,7 +754,11 @@ final class LearnUi {
         } else btns.addView(save, a.wt(0, 0, 0, 0));
         b.addView(btns, a.lp(-1, -2, 0, 18, 0, 0));
         d[0] = a.sheet(!isNew ? "Edit item" : it.pdf.isEmpty() ? "Save for later" : "New book", b);
-        if (fromShare) d[0].setOnDismissListener(x -> { if (!saved[0]) a.finish(); });
+        d[0].setOnDismissListener(x -> {
+            cancelPrepR[0].run();
+            if (prepId[0] >= 900000 && prepId[0] != it.id) BookText.forget(a, prepId[0]);   // prepared under a temporary id and never saved
+            if (fromShare && !saved[0]) a.finish();
+        });
         d[0].show();
     }
 

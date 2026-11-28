@@ -27,13 +27,13 @@ final class Plan {
 final class Item {
     int id, planId, type, mins, page, pages, apos;
     String title = "", url = "", pdf = "", pdfName = "", sync = "", audio = "", audioName = "";
-    boolean done;
+    boolean done, speak;   // speak: no audio file, the phone reads the book aloud (its text was prepared when the item was saved)
     long added, doneAt;
 
     JSONObject toJson() throws JSONException {
         return new JSONObject().put("id", id).put("plan", planId).put("type", type).put("mins", mins).put("title", title)
                 .put("url", url).put("done", done).put("added", added).put("doneAt", doneAt)
-                .put("pdf", pdf).put("pdfName", pdfName).put("page", page).put("pages", pages).put("apos", apos).put("sync", sync).put("audio", audio).put("audioName", audioName);
+                .put("pdf", pdf).put("pdfName", pdfName).put("page", page).put("pages", pages).put("apos", apos).put("sync", sync).put("audio", audio).put("audioName", audioName).put("speak", speak);
     }
 
     static Item from(JSONObject o) {
@@ -41,7 +41,7 @@ final class Item {
         i.id = o.optInt("id"); i.planId = o.optInt("plan"); i.type = o.optInt("type"); i.mins = o.optInt("mins");
         i.title = o.optString("title"); i.url = o.optString("url"); i.done = o.optBoolean("done");
         i.added = o.optLong("added"); i.doneAt = o.optLong("doneAt");
-        i.pdf = o.optString("pdf"); i.pdfName = o.optString("pdfName"); i.page = o.optInt("page"); i.pages = o.optInt("pages"); i.apos = o.optInt("apos"); i.sync = o.optString("sync"); i.audio = o.optString("audio"); i.audioName = o.optString("audioName");
+        i.pdf = o.optString("pdf"); i.pdfName = o.optString("pdfName"); i.page = o.optInt("page"); i.pages = o.optInt("pages"); i.apos = o.optInt("apos"); i.sync = o.optString("sync"); i.audio = o.optString("audio"); i.audioName = o.optString("audioName"); i.speak = o.optBoolean("speak");
         return i;
     }
 }
