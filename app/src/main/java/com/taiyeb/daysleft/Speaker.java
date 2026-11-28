@@ -27,7 +27,6 @@ class Speaker {
         void onState();                      // playing / paused / ready changed
     }
 
-    static final float[] RATES = {1f, 1.15f, 1.3f, 1.5f, 0.85f};
     private static final int AHEAD = 3;
 
     private final Context app;
@@ -38,7 +37,7 @@ class Speaker {
     private BookIndex bi;
     private String[] tok;
     volatile boolean playing;
-    int rateIdx;
+    private volatile float baseRate = 1f;
     private int pos = -1;            // first word of the sentence to speak next / being spoken (where a resume starts)
     private int queuedTo = -1;       // first word AFTER the last queued sentence
     private int queued;              // sentences queued and not yet finished
@@ -49,7 +48,6 @@ class Speaker {
     Speaker(Context c, Listener l) {
         app = c.getApplicationContext();
         lis = l;
-        rateIdx = Math.max(0, Math.min(RATES.length - 1, Store.num(app, "ttsRate", 0)));
         try {
             tts = new TextToSpeech(app, status -> main.post(() -> init(status)));
         } catch (Throwable e) { failed = true; Dbg.e("Speak", "no speech engine", e); }
@@ -122,15 +120,7 @@ class Speaker {
         return n.length() > 28 ? n.substring(0, 28) : n;
     }
 
-    float rate() { return RATES[rateIdx]; }
-
-    String rateLabel() { float r = RATES[rateIdx]; return (r == (int) r ? String.valueOf((int) r) : String.valueOf(r)) + "x"; }
-
-    void cycleRate() {
-        rateIdx = (rateIdx + 1) % RATES.length;
-        Store.setNum(app, "ttsRate", rateIdx);
-        if (playing) restart();   // heard at once from the start of the sentence
-    }
+    void setRate(float r) { baseRate = r; }
 
     void setBook(BookIndex b, int itemId) {
         bi = b;
@@ -212,7 +202,7 @@ class Speaker {
 
     private void speak(int from, int to, String text) {
         // a little life: dialogue a touch warmer and slower, questions lifted, exclamations brighter and quicker
-        float pitch = 1f, rate = RATES[rateIdx];
+        float pitch = 1f, rate = baseRate;
         char first = text.charAt(0), last = text.charAt(text.length() - 1);
         boolean quote = "\"“‘'".indexOf(first) >= 0;
         if (quote) { pitch += 0.05f; rate *= 0.97f; }

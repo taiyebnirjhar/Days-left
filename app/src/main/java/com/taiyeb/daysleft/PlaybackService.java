@@ -29,7 +29,7 @@ public class PlaybackService extends Service {
     /** Call after anything changes in the player. */
     static void sync(Context c) {
         Context app = c.getApplicationContext();
-        if (Player.mp == null) { if (up) app.stopService(new Intent(app, PlaybackService.class)); return; }
+        if (!Player.active()) { if (up) app.stopService(new Intent(app, PlaybackService.class)); return; }
         try { app.startForegroundService(new Intent(app, PlaybackService.class).setAction("sync")); } catch (Exception ignored) {}
     }
 
@@ -97,7 +97,7 @@ public class PlaybackService extends Service {
     };
 
     private void refresh() {
-        if (Player.mp == null) { stopForeground(true); fg = false; cur = null; stopSelf(); return; }
+        if (!Player.active()) { stopForeground(true); fg = false; cur = null; stopSelf(); return; }
         Item it = Learn.item(this, Player.itemId);
         boolean playing = Player.isPlaying();
         long pos = (long) (Player.pos() * 1000), dur = (long) (Player.dur() * 1000);

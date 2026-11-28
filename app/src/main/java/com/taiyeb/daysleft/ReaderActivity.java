@@ -68,9 +68,6 @@ public class ReaderActivity extends Activity {
     BookIndex bi;
     Alignment al = new Alignment();
     int hlFrom = -1, hlTo = -1;
-    Speaker spk;               // read aloud (books without audio)
-    boolean wantSpeak, readingForSpeech;
-    TextView voiceBtn;
     boolean hlOn, followOn;
     int hlStyle;   // 0 marker, 1 underline
     long lastManual, alReloaded;
@@ -90,7 +87,7 @@ public class ReaderActivity extends Activity {
         super.onCreate(b);
         item = Learn.item(this, getIntent().getIntExtra("id", -1));
         if (item == null || item.pdf.isEmpty()) { Dbg.w("Reader", "opened without a book"); finish(); return; }
-        Dbg.i("Reader", "open \"" + item.title + "\", audio " + (item.audio.isEmpty() ? "none" : "attached"));
+        Dbg.i("Reader", "open \"" + item.title + "\", audio " + (item.audio.isEmpty() ? (item.speak ? "read aloud" : "none") : "attached"));
         try {
             pfd = getContentResolver().openFileDescriptor(Uri.parse(item.pdf), "r");
             pr = new PdfRenderer(pfd);
@@ -103,7 +100,7 @@ public class ReaderActivity extends Activity {
         }
         if (n == 0) { finish(); return; }
         am = getSystemService(AudioManager.class);
-        fileMode = !item.audio.isEmpty();
+        fileMode = !item.audio.isEmpty() || item.speak;   // an audio file, or the phone reads the book (Player's read-aloud mode)
         ui = fileMode;
         bottomInset = 0;
         loadAnchors();
@@ -144,7 +141,7 @@ public class ReaderActivity extends Activity {
     /** Back on screen: pick up what the background service did meanwhile, and wake it if the playhead is outside the mapped area. */
     void resumeSync() {
         try {
-            if (item == null || !fileMode || bi == null) return;
+            if (item == null || !fileMode || bi == null || Player.virtual) return;
             if (BookText.alignFile(this, item.id).lastModified() > alReloaded) loadSyncData();
             double t = Player.pos();
             if (!SyncService.running && SyncService.wanted(this, item.id) && Whisper.hasModel(this)
@@ -158,7 +155,6 @@ public class ReaderActivity extends Activity {
     @Override protected void onDestroy() {
         super.onDestroy();
         h.removeCallbacksAndMessages(null);
-        if (spk != null) { spk.shutdown(); spk = null; }
         closePanel();
         if (!SyncService.running) new Thread(Whisper::release).start();
         Player.onReady = null;
@@ -555,7 +551,6 @@ public class ReaderActivity extends Activity {
 
     void refreshPlay() {
         if (playGlyph == null || am == null) return;
-        if (!fileMode) { refreshSpeakUi(); return; }
         int t = am.isMusicActive() ? 2 : 1;
         if (playGlyph.type != t) { playGlyph.type = t; playGlyph.invalidate(); }
     }
@@ -580,90 +575,7 @@ public class ReaderActivity extends Activity {
             Player.toggle(this);
             return;
         }
-        toggleSpeak();   // no audiobook: the phone reads the book aloud
-    }
-
-    // ====================== read aloud ======================
-    final Speaker.Listener speakListener = new Speaker.Listener() {
-        @Override public void onSentence(int from, int to) {
-            if (bi == null || isFinishing()) return;
-            hlFrom = from; hlTo = to;
-            if (hlOn && pv != null) pv.invalidate();
-            if (sp != null) sp.pictureReady();
-            long now = System.currentTimeMillis();
-            if (!followOn || now - lastManual < 5000 || settings.getVisibility() == View.VISIBLE) return;
-            if (scrollMode && sp != null) sp.follow(from);
-            else if (pv != null && !pv.dragging && pv.zoom <= 1.01f) { int pg = bi.pageOf(from); if (pg != cur) goTo(pg, false); }
-        }
-        @Override public void onEnd() { if (!isFinishing()) Toast.makeText(ReaderActivity.this, "Finished the book", Toast.LENGTH_SHORT).show(); refreshSpeakUi(); }
-        @Override public void onState() { refreshSpeakUi(); trySpeak(); }
-    };
-
-    void refreshSpeakUi() {
-        if (playGlyph != null && spk != null) { int g = spk.playing ? 2 : 1; if (playGlyph.type != g) { playGlyph.type = g; playGlyph.invalidate(); } }
-        if (speedBtn != null && spk != null) speedBtn.setText(spk.rateLabel());
-    }
-
-    void toggleSpeak() {
-        if (spk == null) { spk = new Speaker(this, speakListener); refreshSpeakUi(); }
-        if (spk.failed()) { Toast.makeText(this, "No speech engine found. Install \"Speech Services by Google\" from the Play Store.", Toast.LENGTH_LONG).show(); return; }
-        if (spk.playing) { spk.pause(); wantSpeak = false; return; }
-        wantSpeak = true;
-        ensureSpeechText();
-        trySpeak();
-    }
-
-    /** Starts as soon as both the speech engine and the book's text are ready; whichever comes last triggers it. */
-    void trySpeak() {
-        if (!wantSpeak || spk == null || bi == null || !spk.ready() || !spk.hasBook()) return;
-        wantSpeak = false;
-        int w = bi.pageStart[Math.max(0, Math.min(bi.pages - 1, cur))];
-        int resume = spk.position();
-        if (resume >= 0 && resume < bi.count() && bi.pageOf(resume) == cur) w = resume;       // paused on this page: carry on where it stopped
-        else { int[] s = bi.sentenceAround(w); if (s[0] < w) w = Math.min(bi.count() - 1, s[1] + 1); }   // else the first sentence that starts on this page
-        spk.playFrom(w);
-    }
-
-    /** The book's words and their printed form: read once per book (saved), then it is instant. */
-    void ensureSpeechText() {
-        if (bi != null && spk != null && spk.hasBook()) return;
-        if (bi != null) { spk.setBook(bi, item.id); return; }
-        if (readingForSpeech) return;
-        readingForSpeech = true;
-        final int id = item.id;
-        new Thread(() -> {
-            try {
-                BookIndex b;
-                if (BookText.ready(this, id)) b = BookText.index(this, id);
-                else {
-                    ui(() -> { jobText = "Getting the book ready to read aloud…"; updateBanner(); });
-                    b = BookText.extract(this, item, pc -> ui(() -> { jobText = "Getting the book ready to read aloud… " + pc + "%"; updateBanner(); }), new boolean[1]);
-                }
-                final BookIndex fb = b;
-                if (BookText.looksScanned(fb)) {
-                    ui(() -> { jobText = null; updateBanner(); wantSpeak = false; Toast.makeText(this, "This PDF is made of page pictures, so there is no text to read aloud.", Toast.LENGTH_LONG).show(); });
-                    return;
-                }
-                ui(() -> {
-                    jobText = null; updateBanner();
-                    if (bi == null) { bi = fb; computePageBounds(); computeCrop(); if (pv != null) pv.invalidate(); }
-                    if (spk != null) spk.setBook(bi, id);
-                    trySpeak();
-                });
-            } catch (Throwable e) {
-                Dbg.e("Speak", "could not read the book text", e);
-                ui(() -> { jobText = null; updateBanner(); wantSpeak = false; Toast.makeText(this, "Couldn't read this PDF's text.", Toast.LENGTH_LONG).show(); });
-            } finally { readingForSpeech = false; }
-        }, "speech-text").start();
-    }
-
-    void cycleSpeakRate() { if (spk == null) return; spk.cycleRate(); refreshSpeakUi(); }
-
-    void nextSpeakVoice() {
-        if (spk == null) { spk = new Speaker(this, speakListener); }
-        if (!spk.ready()) { Toast.makeText(this, "Starting the voice…", Toast.LENGTH_SHORT).show(); return; }
-        String n = spk.nextVoice();
-        Toast.makeText(this, n == null ? "Only one voice is installed on this phone" : "Voice: " + n, Toast.LENGTH_SHORT).show();
+        Toast.makeText(this, "No audio yet. In Edit item, attach an audio file or turn on \"Read it aloud for me\".", Toast.LENGTH_LONG).show();
     }
 
     String fmtT(double s) {
@@ -743,11 +655,12 @@ public class ReaderActivity extends Activity {
             aDur = Player.dur();
             aT = Player.pos();
             if (timeLbl != null) timeLbl.setText(fmtT(aT) + " / " + fmtT(aDur));
+            if (Player.virtual && (bi == null || al.size() == 0)) loadSyncData();   // the read-aloud timeline was just written
             if (jumpToAudio) jumpToAudioPage();
             updatePin();
         };
         Player.onReady = ready;
-        if (Player.mp == null) Toast.makeText(this, "Can't open that audio file. Attach it again from the item.", Toast.LENGTH_LONG).show();
+        if (!Player.active()) Toast.makeText(this, "Can't open that audio file. Attach it again from the item.", Toast.LENGTH_LONG).show();
         else if (Player.ready) ready.run();
         h.postDelayed(fileTick, 250);
     }
@@ -769,7 +682,7 @@ public class ReaderActivity extends Activity {
     final Runnable fileTick = new Runnable() {
         @Override public void run() {
             try {
-                if (mpReady && Player.mp != null) onTick(Player.pos(), Player.dur(), Player.isPlaying() ? 1 : 2);
+                if (mpReady && Player.active()) onTick(Player.pos(), Player.dur(), Player.isPlaying() ? 1 : 2);
             } catch (Exception ignored) {}
             h.postDelayed(this, 100);   // the marker follows the audio within a tenth of a second
         }
@@ -898,6 +811,7 @@ public class ReaderActivity extends Activity {
 
     void onSyncTap() {
         if (item == null || !fileMode) return;
+        if (Player.virtual) { Toast.makeText(this, "Always in sync: the app reads the book itself.", Toast.LENGTH_SHORT).show(); return; }
         if (SyncService.running && SyncService.itemId != item.id) { Toast.makeText(this, "Another book is syncing. Pause it there first.", Toast.LENGTH_SHORT).show(); return; }
         if (stopping()) return;
         if (syncing()) {   // pause
@@ -913,7 +827,7 @@ public class ReaderActivity extends Activity {
 
     /** Starts (or continues) the sync in the background service; it downloads the model and reads the book first when that is needed. */
     void startSyncNow(boolean tell) {
-        if (item == null || !fileMode) return;
+        if (item == null || !fileMode || Player.virtual) return;
         if (SyncService.running) return;
         Store.sp(this).edit().putBoolean("syncPaused_" + item.id, false).apply();
         if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission("android.permission.POST_NOTIFICATIONS") != android.content.pm.PackageManager.PERMISSION_GRANTED)
@@ -931,6 +845,7 @@ public class ReaderActivity extends Activity {
     /** Hold the icon: forget what is linked and start again (the one place that asks, because it throws work away). */
     void confirmStartOver() {
         if (item == null || !fileMode) return;
+        if (Player.virtual) { Toast.makeText(this, "Always in sync: the app reads the book itself.", Toast.LENGTH_SHORT).show(); return; }
         if (SyncService.running && SyncService.itemId != item.id) { Toast.makeText(this, "Another book is syncing. Pause it there first.", Toast.LENGTH_SHORT).show(); return; }
         openDialog("Start the sync over?");
         setMsg("This forgets what was linked for this book and links it again, starting from where you are. Your pins stay.", -1);
@@ -1020,7 +935,7 @@ public class ReaderActivity extends Activity {
             if (ts < 0 && target + 1 < bi.pages) ts = al.timeOfWord(bi.pageStart[target] + 12);
             // instant only where the probes around are close (then it is right to well under a second); between far-apart probes (the coarse map of the
             // whole book) the pace drifts and the answer can be several seconds off, so listen right there instead: a few seconds, exact
-            if (ts >= 0 && al.gapAt(ts) <= SyncPlanner.GOAL_GAP) {
+            if (ts >= 0 && (Player.virtual || al.gapAt(ts) <= SyncPlanner.GOAL_GAP)) {
                 lastManual = System.currentTimeMillis();
                 Dbg.i("Play", "page " + (target + 1) + " from sync data -> " + fmtT(ts));
                 seekAbs(Math.max(0, ts - 0.3), true);
@@ -1181,7 +1096,7 @@ public class ReaderActivity extends Activity {
 
     void prefetchNow() {
         try {
-            if (isFinishing() || fdlg != null || bi == null || item == null || !mpReady || !fileMode) return;
+            if (isFinishing() || fdlg != null || bi == null || item == null || !mpReady || !fileMode || Player.virtual) return;
             if (!SyncService.wanted(this, item.id) || !Whisper.hasModel(this) || pinFor(cur) != null) return;
             if (SyncService.running && !SyncService.ready) return;   // still mapping around the playhead: don't compete with it
             if (al.size() > 0) {   // already exact here? (a rough time from a coarse stretch is not exact: locate the page start so Play page is instant AND right)
@@ -1391,7 +1306,7 @@ public class ReaderActivity extends Activity {
      */
     void whenReady(Runnable go) {
         if (item == null) return;
-        if (Whisper.hasModel(this) && BookText.ready(this, item.id)) { go.run(); return; }
+        if (Player.virtual || Whisper.hasModel(this) && BookText.ready(this, item.id)) { go.run(); return; }
         jobText = "Getting ready…";
         jobCancel = () -> { jobText = null; jobCancel = null; updateBanner(); };
         updateBanner();
@@ -1414,7 +1329,7 @@ public class ReaderActivity extends Activity {
     void findMyPage() {
         if (mpReady && bi != null && al.size() > 0) {
             int j = al.wordAtTime(aT);
-            if (j >= 0 && al.gapAt(aT) <= SyncPlanner.GOAL_GAP) {   // far-apart probes can be a page off near a page boundary: then listen right here instead
+            if (j >= 0 && (Player.virtual || al.gapAt(aT) <= SyncPlanner.GOAL_GAP)) {   // far-apart probes can be a page off near a page boundary: then listen right here instead
                 final int pg = bi.pageOf(j);
                 final double t0 = aT;
                 Dbg.i("Find", "instant from sync: " + fmtT(t0) + " -> page " + (pg + 1));
@@ -1610,15 +1525,9 @@ public class ReaderActivity extends Activity {
             controlsCol.addView(navBar, new LinearLayout.LayoutParams(-1, -2));
             bottom.addView(controlsCol, new LinearLayout.LayoutParams(-1, -2));
         } else {
-            // no audiobook: the phone reads aloud. Pace on the left, play in the middle, voice on the right
-            LinearLayout ctl = new LinearLayout(this);
-            ctl.setGravity(Gravity.CENTER);
-            speedBtn = pill("1x", this::cycleSpeakRate);
-            voiceBtn = pill("Voice", this::nextSpeakVoice);
+            FrameLayout ctl = new FrameLayout(this);
             playBtn.addView(playGlyph, new FrameLayout.LayoutParams(dp(30), dp(30), Gravity.CENTER));
-            ctl.addView(speedBtn, new LinearLayout.LayoutParams(dp(64), -2));
-            ctl.addView(playBtn, lpm(dp(60), dp(60), 18, 0, 18, 0));
-            ctl.addView(voiceBtn, new LinearLayout.LayoutParams(dp(64), -2));
+            ctl.addView(playBtn, new FrameLayout.LayoutParams(dp(60), dp(60), Gravity.CENTER));
             bottom.addView(ctl, new LinearLayout.LayoutParams(-1, -2));
         }
         stack.addView(bottom, new LinearLayout.LayoutParams(-1, -2));

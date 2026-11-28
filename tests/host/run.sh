@@ -9,4 +9,6 @@ javac -cp "$AJ" -d "$OUT" $SRC/Calc.java $SRC/Store.java $SRC/PageMatcher.java $
 java -cp "$OUT:$AJ" com.taiyeb.daysleft.HostTests
 javac -cp "$OUT:$AJ" -d "$OUT" $SRC/Highlight.java $SRC/MarkerTrack.java tests/host/MarkerCheck.java
 java -cp "$OUT:$AJ" com.taiyeb.daysleft.MarkerCheck
+javac -cp "$OUT:$AJ" -d "$OUT" $SRC/Timeline.java tests/host/TimelineCheck.java
+java -cp "$OUT:$AJ" com.taiyeb.daysleft.TimelineCheck
 python3 tests/host/check_services.py

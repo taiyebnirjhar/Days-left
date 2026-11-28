@@ -32,13 +32,26 @@ class Player {
     private static long lastRecover;
     private static int recoverCount;
 
-    static boolean has(Item it) { return mp != null && itemId == it.id && uri.equals(it.audio); }
+    // ---- read aloud: a book the phone reads itself. Same player for the rest of the app: time, seek, speed, notification, pins, marker. ----
+    static boolean virtual;
+    private static Speaker spk;
+    private static Timeline tl;
+    private static double vT;                    // where the player is (nominal seconds) when no sentence is running
+    private static double vSentStart, vSentEnd;  // nominal bounds of the sentence being spoken
+    private static long vWall;                   // wall clock when that sentence began
+    private static boolean vSpeaking, vPending;  // a sentence is running / Play is waiting for the speech engine
+
+    /** True while a player (a file or a read-aloud book) is open. */
+    static boolean active() { return mp != null || virtual; }
+
+    static boolean has(Item it) { return virtual ? itemId == it.id && it.audio.isEmpty() : mp != null && itemId == it.id && uri.equals(it.audio); }
 
     /** Makes sure a player for this item exists (keeps the current one when it already matches). */
     static synchronized void open(Context c, Item it) {
         Context app = c.getApplicationContext();
         if (has(it)) return;
         release(app);
+        if (it.audio.isEmpty() && it.speak) { openVirtual(app, it); return; }
         itemId = it.id; uri = it.audio; title = it.title; ready = false;
         try {
             mp = new MediaPlayer();
@@ -73,9 +86,70 @@ class Player {
         }
     }
 
-    static boolean isPlaying() { try { return mp != null && ready && mp.isPlaying(); } catch (Exception e) { return false; } }
-    static double pos() { try { if (mp != null && ready) { lastPos = mp.getCurrentPosition() / 1000.0; return lastPos; } return 0; } catch (Exception e) { return 0; } }
-    static double dur() { try { return mp != null && ready ? mp.getDuration() / 1000.0 : 0; } catch (Exception e) { return 0; } }
+    static boolean isPlaying() {
+        if (virtual) return ready && spk != null && spk.playing;
+        try { return mp != null && ready && mp.isPlaying(); } catch (Exception e) { return false; }
+    }
+    static double pos() {
+        if (virtual) {
+            if (!ready || tl == null) return 0;
+            if (vSpeaking && spk != null && spk.playing) lastPos = Math.min(vSentEnd, vSentStart + (System.currentTimeMillis() - vWall) / 1000.0 * speed);
+            else lastPos = vT;
+            return lastPos;
+        }
+        try { if (mp != null && ready) { lastPos = mp.getCurrentPosition() / 1000.0; return lastPos; } return 0; } catch (Exception e) { return 0; }
+    }
+    static double dur() {
+        if (virtual) return ready && tl != null ? tl.total : 0;
+        try { return mp != null && ready ? mp.getDuration() / 1000.0 : 0; } catch (Exception e) { return 0; }
+    }
+
+    private static void openVirtual(Context app, Item it) {
+        final int id = it.id;
+        itemId = id; uri = ""; title = it.title; ready = false; virtual = true; vSpeaking = false; vPending = false; vT = Math.max(0, it.apos);
+        Dbg.i("Player", "opening read-aloud book " + id);
+        new Thread(() -> {
+            try {
+                BookIndex b = BookText.ready(app, id) ? BookText.index(app, id) : BookText.extract(app, it, pc -> {}, new boolean[1]);
+                final Timeline t = new Timeline(b);
+                t.writeAlignment(BookText.alignFile(app, id));
+                Store.sp(app).edit().putBoolean("syncFull_" + id, true).putInt("syncPct_" + id, 100).remove("syncWant_" + id).remove("syncPaused_" + id).apply();
+                main.post(() -> {
+                    if (itemId != id || !virtual) return;
+                    tl = t;
+                    spk = new Speaker(app, new Speaker.Listener() {
+                        @Override public void onSentence(int from, int to) {
+                            if (tl == null) return;
+                            int s = tl.sentenceOf(from);
+                            vSentStart = tl.start[s]; vSentEnd = tl.end[s]; vWall = System.currentTimeMillis(); vSpeaking = true; vT = vSentStart;
+                        }
+                        @Override public void onEnd() { vSpeaking = false; vT = tl == null ? 0 : tl.total; PlaybackService.sync(app); }
+                        @Override public void onState() {
+                            if (vPending && spk != null && spk.ready()) { vPending = false; startAt(app); }
+                            if (spk != null && spk.failed() && vPending) { vPending = false; main.post(() -> android.widget.Toast.makeText(app, "No speech engine found. Install \"Speech Services by Google\" from the Play Store.", android.widget.Toast.LENGTH_LONG).show()); }
+                            PlaybackService.sync(app);
+                        }
+                    });
+                    spk.setBook(b, id);
+                    spk.setRate(speed);
+                    if (vT > tl.total) vT = 0;
+                    ready = true;
+                    Dbg.i("Player", "read-aloud ready, " + (int) tl.total + " s nominal");
+                    if (onReady != null) onReady.run();
+                    if (playWhenReady) { playWhenReady = false; play(app); }
+                });
+            } catch (Throwable e) {
+                Dbg.e("Player", "could not prepare the read-aloud book", e);
+                main.post(() -> { if (itemId == id) { virtual = false; itemId = -1; android.widget.Toast.makeText(app, "Couldn't read this PDF's text.", android.widget.Toast.LENGTH_LONG).show(); } });
+            }
+        }, "read-aloud-open").start();
+    }
+
+    private static void startAt(Context app) {
+        if (spk == null || tl == null) return;
+        vSpeaking = false;
+        spk.playFrom(tl.wordAt(vT));
+    }
 
     private static Context appRef;
 
@@ -104,6 +178,14 @@ class Player {
 
     static void play(Context c) {
         Context app = c.getApplicationContext();
+        if (virtual) {
+            if (!ready || spk == null) { playWhenReady = true; return; }
+            getFocus(app);
+            spk.setRate(speed);
+            if (spk.ready()) startAt(app); else vPending = true;
+            PlaybackService.sync(app);
+            return;
+        }
         if (mp == null) { Dbg.w("Player", "play ignored: no player"); return; }
         if (!ready) {
             Dbg.w("Player", "play asked but the player is not ready (error or still loading): reopening and playing from " + (int) lastPos + " s");
@@ -148,6 +230,13 @@ class Player {
 
     static void pause(Context c) {
         Context app = c.getApplicationContext();
+        if (virtual) {
+            vPending = false; playWhenReady = false;
+            if (spk != null && spk.playing) { vT = pos(); vSpeaking = false; spk.pause(); }
+            saveNow(app);
+            PlaybackService.sync(app);
+            return;
+        }
         try { if (mp != null && ready && mp.isPlaying()) mp.pause(); } catch (Exception ignored) {}
         saveNow(app);
         PlaybackService.sync(app);
@@ -155,7 +244,17 @@ class Player {
 
     static void toggle(Context c) { if (isPlaying()) pause(c); else play(c); }
 
-    static void seekMs(int ms) { try { if (mp != null && ready) mp.seekTo(Math.max(0, ms)); } catch (Exception ignored) {} }
+    static void seekMs(int ms) {
+        if (virtual) {
+            if (!ready || tl == null) return;
+            vT = Math.max(0, Math.min(tl.total, ms / 1000.0));
+            int s = tl.sentenceAt(vT);
+            vSentStart = tl.start[s]; vSentEnd = tl.end[s]; vWall = System.currentTimeMillis();
+            if (spk != null && spk.playing) { vSpeaking = false; spk.playFrom(tl.wordAt(vT)); }
+            return;
+        }
+        try { if (mp != null && ready) mp.seekTo(Math.max(0, ms)); } catch (Exception ignored) {}
+    }
 
     static void seekBy(Context c, double sec) {
         double d = dur();
@@ -164,14 +263,20 @@ class Player {
     }
 
     static void applySpeed() {
+        if (virtual) { if (spk != null) spk.setRate(speed); return; }
         try { if (mp != null && ready && mp.isPlaying()) mp.setPlaybackParams(mp.getPlaybackParams().setSpeed(speed)); } catch (Exception ignored) {}
     }
 
     static void saveNow(Context c) {
-        if (mp != null && ready && itemId >= 0) { int s = (int) pos(); if (s > 1) Learn.setAudio(c, itemId, s, null); }
+        if ((mp != null || virtual) && ready && itemId >= 0) { int s = (int) pos(); if (s > 1) Learn.setAudio(c, itemId, s, null); }
     }
 
     static synchronized void release(Context c) {
+        if (virtual) {
+            saveNow(c);
+            if (spk != null) { spk.shutdown(); spk = null; }
+            tl = null; virtual = false; vSpeaking = false; vPending = false;
+        }
         if (mp != null) {
             saveNow(c);
             try { mp.release(); } catch (Exception ignored) {}
